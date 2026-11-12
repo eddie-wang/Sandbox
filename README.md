@@ -2,7 +2,49 @@
 
 A minimal, container-native sandbox service for stateful tool execution.
 
-**Status: initial development. No runtime, isolation, capacity, or checkpoint portability claim is qualified yet.**
+**Status: first foundation milestone. Async controller/worker HTTP services run; no sandbox runtime is implemented. No isolation, capacity, or checkpoint portability claim is qualified.**
+
+## Run the nonprivileged foundation
+
+Requires a Rust toolchain compatible with the lockfile and Python 3 for the smoke.
+No runtime binaries, containers, mounts, host networking changes or root access are
+needed for this milestone.
+
+```sh
+cargo build --locked
+python3 scripts/smoke.py --binary target/debug/sandboxd
+```
+
+For manual startup, securely provision `SANDBOX_CONTROLLER_TOKEN` and
+`SANDBOX_WORKER_TOKEN` in the environment (independent unpredictable values of at
+least 32 ASCII characters), then in separate terminals:
+
+```sh
+target/debug/sandboxd worker --config config/worker.example.toml
+target/debug/sandboxd controller --config config/controller.example.toml
+```
+
+Do not put token values in CLI arguments or tracked configuration. A configured
+secret file is also supported; see the [native API](docs/api.md) for limits and
+trust boundaries. Example binds are loopback. Supply TLS and network restrictions
+before use beyond a trusted host/network; this is not production-ready ingress.
+
+Implemented: liveness, authenticated status and strict management input validation;
+bounded parsed requests/bodies/deadlines; static worker polling with a pooled HTTP
+client, bounded fanout and stale-node exclusion; advisory capacity/load/runtime
+selection. All worker runtime capabilities remain **not ready**. Create/exec/capture
+fail closed without creating state or executing a process. Configured budgets are
+not measurements or enforcement.
+
+The process-level smoke starts real local worker/controller processes with ephemeral
+credentials, exercises authentication, invalid configuration/input, request bounds,
+status freshness, concurrent health/control traffic and unavailable operations.
+It creates no sandboxes and is not a capacity or security qualification. There are
+no unit tests, network-fetching CI jobs, or workload images.
+
+Planned lifecycle/storage/network boundaries and backend-specific checkpoint
+manifest requirements are in [contracts](docs/contracts.md). No license has been
+selected yet.
 
 ## Direction
 

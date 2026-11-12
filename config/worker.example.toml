@@ -1,0 +1,22 @@
+node_id = "node-a"
+# Candidates, NOT ready capabilities. Neither backend is implemented.
+runtimes = ["runc_criu", "runsc_native"]
+
+[server]
+listen = "127.0.0.1:8081"
+max_in_flight = 64
+request_timeout_ms = 5000
+max_body_bytes = 16384
+
+[auth]
+env = "SANDBOX_WORKER_TOKEN"
+# Alternatively use file = "secrets/worker-token" instead of env.
+# Secret files are operator-managed and must not be committed.
+
+# Illustrative admission budgets only: not detected, reserved or enforced resources.
+# These numbers are unrelated to the unresolved capacity qualification budget.
+[capacity]
+memory_mib = 8192
+vcpus = 4
+max_sandboxes = 32
+max_concurrent_restores = 2

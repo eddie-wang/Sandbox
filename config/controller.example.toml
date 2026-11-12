@@ -1,0 +1,22 @@
+# Static administrator-controlled origins only. Plain HTTP requires a trusted network.
+[server]
+listen = "127.0.0.1:8080"
+max_in_flight = 64
+request_timeout_ms = 5000
+max_body_bytes = 16384
+
+[auth]
+env = "SANDBOX_CONTROLLER_TOKEN"
+
+[worker_auth]
+env = "SANDBOX_WORKER_TOKEN"
+
+[poll]
+interval_ms = 1000
+timeout_ms = 1000
+freshness_ms = 5000
+fanout = 8
+
+[[workers]]
+node_id = "node-a"
+url = "http://127.0.0.1:8081"
