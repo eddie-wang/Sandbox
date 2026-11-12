@@ -1,79 +1,103 @@
 # Sandbox
 
-A minimal, container-native sandbox service for stateful tool execution.
+A small Rust controller/scheduler and Linux node worker for stateful tool execution.
 
-**Status: first foundation milestone. Async controller/worker HTTP services run; no sandbox runtime is implemented. No isolation, capacity, or checkpoint portability claim is qualified.**
+**Status: experimental real-runtime implementation; the bounded native lifecycle
+smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This includes
+cold create, capture/source recovery, independent warm restore, overlapping commands,
+private writes/whiteouts, idempotent retry, TTL/delete and crash/restart cleanup.
+This is a targeted functional result, **not production isolation, general workload
+readiness, cross-node portability or capacity qualification**. The validation host's
+indirect system-library/shell trust was not established; see the operator recipe.
+Compilation and the nonprivileged HTTP smoke are separate checks.
 
-## Run the nonprivileged foundation
+## Safe default
 
-Requires a Rust toolchain compatible with the lockfile and Python 3 for the smoke.
-No runtime binaries, containers, mounts, host networking changes or root access are
-needed for this milestone.
+Without an explicitly enabled `[native]` configuration, the worker creates no
+sandboxes, mounts, cgroups or namespaces. Missing preflight requirements likewise
+fail closed. Read-only preflight does not install packages, load modules, enable
+controllers, modify sysctls or repair the host.
 
 ```sh
 cargo build --locked
 python3 scripts/smoke.py --binary target/debug/sandboxd
+# Informational, read-only; nonzero when prerequisites/enablement are absent:
+target/debug/sandboxd preflight --config config/worker.example.toml
 ```
 
-For manual startup, securely provision `SANDBOX_CONTROLLER_TOKEN` and
-`SANDBOX_WORKER_TOKEN` in the environment (independent unpredictable values of at
-least 32 ASCII characters), then in separate terminals:
+Provision independent unpredictable `SANDBOX_CONTROLLER_TOKEN` and
+`SANDBOX_WORKER_TOKEN` values in the environment (at least 32 printable ASCII
+characters), then start:
 
 ```sh
 target/debug/sandboxd worker --config config/worker.example.toml
 target/debug/sandboxd controller --config config/controller.example.toml
 ```
 
-Do not put token values in CLI arguments or tracked configuration. A configured
-secret file is also supported; see the [native API](docs/api.md) for limits and
-trust boundaries. Example binds are loopback. Supply TLS and network restrictions
-before use beyond a trusted host/network; this is not production-ready ingress.
+Tokens never belong in CLI arguments or tracked configuration. Management routes
+require authentication; `/healthz` is liveness only. Bind to loopback or a trusted
+network with an operator-managed TLS/auth/ingress boundary. There is no tenancy,
+RBAC, built-in TLS or Internet-facing connection defense.
 
-Implemented: liveness, authenticated status and strict management input validation;
-bounded parsed requests/bodies/deadlines; static worker polling with a pooled HTTP
-client, bounded fanout and stale-node exclusion; advisory capacity/load/runtime
-selection. All worker runtime capabilities remain **not ready**. Create/exec/capture
-fail closed without creating state or executing a process. Configured budgets are
-not measurements or enforcement.
+## Real-runtime design
 
-The process-level smoke starts real local worker/controller processes with ephemeral
-credentials, exercises authentication, invalid configuration/input, request bounds,
-status freshness, concurrent health/control traffic and unavailable operations.
-It creates no sandboxes and is not a capacity or security qualification. There are
-no unit tests, network-fetching CI jobs, or workload images.
+- Administrator-provisioned immutable EROFS images; shared read-only lower mounts,
+  **ordinary private OverlayFS upper/work directories**, no per-container block
+  devices or storage daemon. Only the shared EROFS mount uses a loop device.
+- Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
+  65534, empty capabilities, `no_new_privs`, a default-deny seccomp syscall profile
+  and cgroup-v2 memory/swap/CPU/pids limits installed before launch.
+- Only **fully isolated, deny-all networking** is implemented: no veth, route,
+  external interface, host networking or network socket syscall. No host firewall
+  or sysctl changes. CRIU uses temporary nftables locks only in the owned netns.
+  Destination/port egress allowlists are **not implemented**;
+  requests cannot enable them. This is deliberately narrower than a general
+  container application profile.
+- One durable admission/state coordinator per worker, a fixed bounded pool for
+  parallel runtime I/O across sandboxes, per-sandbox exclusion, separate restore
+  slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic records,
+  caller-chosen idempotency IDs, short asynchronous HTTP acceptance and separate
+  operation polling. Worker admission is final; stale controller capacity cannot
+  reserve memory or start a workload. CPU quota admission has an explicit bounded
+  operator overcommit factor, rather than assuming each idle quota consumes a
+  physical CPU.
+- Capture stops the source, archives the unchanged upper layout with ownership,
+  xattrs and whiteouts, pairs it with CRIU images, recovers the source, then
+  atomically publishes a manifest and digests. It never promotes upper files into
+  a new lower. Directory-copy file identity and independent restore are explicit
+  qualification gates, exercised by open upper/lower descriptors and mappings in
+  the real fixture. That fixture passed; arbitrary open-file/application states
+  and other host configurations are **not assumed compatible**.
+- Local immutable template repository with bounded artifact verification and
+  exact kernel/CPU/architecture/runc/CRIU/config compatibility. All published
+  templates/layers are retained; automatic cache eviction/GC and S3 transfer are
+  not implemented.
+- `runc exec` with argv, bounded output/deadline and durable results. A bound
+  violation conservatively terminates the **whole sandbox**, not just its runc
+  client. Each exec uses an owned child cgroup and cleans descendants even after
+  a successful parent exit. Application HTTP is a distinct, **unimplemented** interface; there is
+  no arbitrary upstream proxy.
+- Deletion kills the owned cgroup, deletes runc state, unmounts only the private
+  overlay and removes private files. Failed cleanup remains reserved and
+  retryable. Restart terminates/reconciles prior workloads rather than adopting
+  unverified running state. Shared layers outlive individual sandboxes.
 
-Planned lifecycle/storage/network boundaries and CRIU checkpoint manifest
-requirements are in [contracts](docs/contracts.md). No license has been selected yet.
+See [API](docs/api.md), [serialized contracts](docs/contracts.md) and the
+[explicitly privileged qualification recipe](docs/runtime.md). The latter builds
+an original tiny static C fixture locally; it downloads no rootfs and never runs
+from the nonprivileged smoke. No unit tests are added. No license has been selected.
 
-## Direction
+## Deferred qualification and features
 
-- Rust controller with an integrated scheduler, plus one Rust worker per compute node.
-- A small native HTTP API suitable for a `SandboxProvider` adapter; no E2B compatibility requirement.
-- Shared immutable EROFS filesystem layers with private OverlayFS writable uppers. No OverlayBD or per-sandbox block-device daemon.
-- Native Linux containers only: runc for execution and CRIU for warmed process capture/restore. No alternate runtime or runtime-comparison work.
-- Warmed template capture/publication, restore on compatible workers, command execution/application HTTP access, expiration, and explicit deletion.
-- Default-deny network policy enforced outside the sandbox, with explicit destination/port allowances.
-- Local artifact caching backed by an S3-compatible template repository.
+No two-node, S3, application HTTP, egress allowlist, broad application compatibility
+or performance result is claimed. Fork and user-facing pause/resume remain out of
+scope. The worker root needs operator-controlled disk capacity/quota; sandbox disk
+quotas and an automatic artifact retention policy are not implemented.
 
-```text
-SandboxProvider
-      |
-controller + scheduler
-      |
-per-node worker
-      +-- shared EROFS mounts / private OverlayFS uppers
-      +-- runc + CRIU
-      +-- network isolation / resource admission / cleanup
-```
+Capacity qualification remains **two nodes, 10% active and 90% resident idle, under
+a 512 GB budget**. Per-node versus total scope, exact byte count and acceptable
+latency regression must be agreed before any run. Measure full-service memory
+including page cache, p50/p95/p99 end-to-end latency, queueing, failures and teardown;
+functional/isolation/leak gates come first. Example budgets are not capacity claims.
 
-Fork and user-facing pause/resume APIs are deferred. Kernel modules, cluster jobs, and host configuration changes require separate operator approval.
-
-## Performance contract
-
-Rust is an implementation choice, not evidence of capacity. Bound request concurrency, memory-intensive restores, subprocess output, and admission on each worker. Avoid blocking the async executor and do not hold shared state locks over network or process I/O.
-
-Qualification uses two nodes with 10% of live sandboxes actively executing tools and 90% resident but idle. Find the maximum sustainable population under a 512 GB memory budget and an agreed latency-regression limit. The budget scope (per node or whole cluster), exact byte count, and latency acceptance threshold must be specified before a run; none is assumed yet.
-
-Measure end-to-end latency including queueing, p50/p95/p99, actual active concurrency, throughput, full service memory including file cache, failures, and teardown. Exercise varied trajectories and compare loaded performance against a low-contention baseline for the same environment. Report restore/first-call performance separately from steady state. Functional correctness, network isolation, resource containment, and leak-free cleanup are prerequisite gates.
-
-Do not put private workloads, deployment recipes, credentials, organization endpoints, or benchmark traces in this repository.
+Keep tracked examples, workloads and traces generic and public-safe.

@@ -1,5 +1,5 @@
 node_id = "node-a"
-# Declared runtime, NOT a ready capability. The backend is not implemented.
+# Safe foundation mode: no [native] enablement, so runtime admission stays disabled.
 runtimes = ["runc_criu"]
 
 [server]
@@ -13,7 +13,8 @@ env = "SANDBOX_WORKER_TOKEN"
 # Alternatively use file = "secrets/worker-token" instead of env.
 # Secret files are operator-managed and must not be committed.
 
-# Illustrative admission budgets only: not detected, reserved or enforced resources.
+# In this disabled configuration these are illustrative budgets, not measured usage.
+# Native mode performs worker reservation and kernel enforcement; see the separate example.
 # These numbers are unrelated to the unresolved capacity qualification budget.
 [capacity]
 memory_mib = 8192

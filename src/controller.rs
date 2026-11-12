@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::{Duration, Instant}};
 
-use axum::{Json, Router, extract::{State, rejection::JsonRejection}, http::StatusCode, routing::{get, post}};
+use axum::{Json, Router, extract::{Path, State, rejection::{JsonRejection, PathRejection}}, http::StatusCode, routing::{get, post}};
+use serde_json::Value;
 use serde::Serialize;
 use tokio::{sync::RwLock, task::JoinSet};
 
@@ -8,7 +9,7 @@ use crate::{
     config::{ControllerConfig, WorkerEndpoint},
     http::{self, ApiError},
     lifecycle,
-    model::{CreateRequest, WorkerStatus},
+    model::{CaptureRequest, CreateRequest, ExecRequest, WorkerStatus, sandbox_owner, valid_id},
     scheduler,
 };
 
@@ -35,6 +36,9 @@ pub struct NodeView {
 struct Controller {
     nodes: Arc<RwLock<Vec<CachedNode>>>,
     freshness: Duration,
+    endpoints: Arc<Vec<WorkerEndpoint>>,
+    client: reqwest::Client,
+    worker_token: Arc<String>,
 }
 
 impl Controller {
@@ -66,7 +70,7 @@ struct ControllerStatus {
 async fn status(State(controller): State<Controller>) -> Json<ControllerStatus> {
     Json(ControllerStatus {
         service: "controller",
-        lifecycle_implemented: false,
+        lifecycle_implemented: true,
         nodes: controller.snapshot().await,
     })
 }
@@ -74,18 +78,70 @@ async fn status(State(controller): State<Controller>) -> Json<ControllerStatus> 
 async fn create(
     State(controller): State<Controller>,
     input: Result<Json<CreateRequest>, JsonRejection>,
-) -> Result<(), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let request = http::json(input)?;
-    if !request.valid() {
-        return Err(http::invalid_input());
-    }
-    let nodes = controller.snapshot().await;
+    if !request.valid() { return Err(http::invalid_input()); }
+    let owner = sandbox_owner(&request.sandbox_id).ok_or_else(http::invalid_input)?;
+    let nodes: Vec<_> = controller.snapshot().await.into_iter().filter(|n| n.node_id == owner).collect();
     if scheduler::choose(&nodes, &request).is_none() {
-        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "no_ready_runtime", "No fresh compatible worker has ready runtime admission and capacity"));
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "no_ready_runtime", "Owner worker is not fresh, compatible and ready with advisory capacity"));
     }
-    // A future/foreign worker advertising readiness cannot enable this controller's lifecycle.
-    // No reservation, dispatch, or sandbox state is created by this informational selection.
-    Err(http::not_implemented())
+    forward(&controller, owner, reqwest::Method::POST, "/v1/sandboxes", Some(serde_json::to_value(&request).map_err(|_| http::invalid_input())?)).await
+}
+
+fn path_id(path: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
+    let Path(id) = path.map_err(|_| http::invalid_input())?;
+    if sandbox_owner(&id).is_none() { return Err(http::invalid_input()); }
+    Ok(id)
+}
+async fn get_sandbox(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = path_id(path)?;
+    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::GET, &format!("/v1/sandboxes/{id}"), None).await
+}
+async fn delete(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = path_id(path)?;
+    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"), None).await
+}
+async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = path_id(path)?;
+    let request = http::json(input)?;
+    if !request.valid() { return Err(http::invalid_input()); }
+    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
+}
+async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = path_id(path)?;
+    let request = http::json(input)?;
+    if !valid_id(&request.template_id) || !valid_id(&request.operation_id) { return Err(http::invalid_input()); }
+    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/capture"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
+}
+async fn operation(State(c): State<Controller>, path: Result<Path<(String, String)>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let Path((id, op)) = path.map_err(|_| http::invalid_input())?;
+    let owner = sandbox_owner(&id).ok_or_else(http::invalid_input)?;
+    if !valid_id(&op) { return Err(http::invalid_input()); }
+    forward(&c, owner, reqwest::Method::GET, &format!("/v1/sandboxes/{id}/operations/{op}"), None).await
+}
+async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or(http::invalid_input())?;
+    let nodes = c.snapshot().await;
+    if !nodes.iter().any(|n| n.node_id == owner && n.fresh) {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable", "Owner identity has no fresh validated observation"));
+    }
+    let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| http::invalid_input())?;
+    url.set_path(path);
+    let mut request = c.client.request(method, url).bearer_auth(c.worker_token.as_str());
+    if let Some(body) = body { request = request.header("content-type", "application/json").body(serde_json::to_vec(&body).map_err(|_| http::invalid_input())?); }
+    let uncertain = || ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_response_unavailable", "Read state or retry the identical identifiers; an operation may already be accepted");
+    let mut response = request.send().await.map_err(|_| uncertain())?;
+    let status = response.status();
+    const MAX_RESPONSE: usize = 8388608;
+    if response.content_length().is_some_and(|n| n > MAX_RESPONSE as u64) { return Err(uncertain()); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
+        if bytes.len() + chunk.len() > MAX_RESPONSE { return Err(uncertain()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value = serde_json::from_slice(&bytes).map_err(|_| uncertain())?;
+    Ok((status, Json(value)))
 }
 
 pub async fn run(config: ControllerConfig, token: String, worker_token: String) -> Result<(), &'static str> {
@@ -102,19 +158,23 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
             node_id: worker.node_id.clone(), status: None, observed: None, error: Some("not_polled"),
         }).collect())),
         freshness: Duration::from_millis(config.poll.freshness_ms),
+        endpoints: Arc::new(config.workers.clone()), client: client.clone(), worker_token: Arc::new(worker_token),
     };
     let router = Router::new()
         .route("/healthz", get(|| async { Json(lifecycle::Health { service: "controller", live: true }) }))
         .route("/v1/status", get(status))
         .route("/v1/sandboxes", post(create))
-        .route("/v1/sandboxes/{id}/exec", post(lifecycle::exec))
-        .route("/v1/sandboxes/{id}/capture", post(lifecycle::capture))
+        .route("/v1/sandboxes/{id}", get(get_sandbox).delete(delete))
+        .route("/v1/sandboxes/{id}/exec", post(exec))
+        .route("/v1/sandboxes/{id}/capture", post(capture))
+        .route("/v1/sandboxes/{id}/operations/{op}", get(operation))
         .with_state(controller.clone());
     let app = http::protect(router, &config.server, token);
     let listener = tokio::net::TcpListener::bind(config.server.address(8080)).await
         .map_err(|_| "cannot bind controller listener")?;
-    let poller = tokio::spawn(poll(controller, config, client, Arc::new(worker_token)));
-    println!("controller listening; sandbox lifecycle unavailable");
+    let worker_token = controller.worker_token.clone();
+    let poller = tokio::spawn(poll(controller, config, client, worker_token));
+    println!("controller listening; stable owner routing enabled");
     let result = axum::serve(listener, app).with_graceful_shutdown(http::shutdown()).await;
     poller.abort();
     let _ = poller.await;

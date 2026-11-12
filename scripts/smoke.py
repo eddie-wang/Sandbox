@@ -156,7 +156,7 @@ url = "http://127.0.0.1:{second_port}"
                 assert token.encode() not in result.stdout + result.stderr, "credential leaked in diagnostics"
 
         create = {
-            "template_id": "example-template", "runtime": "runc_criu",
+            "sandbox_id": "node-a.example", "template_id": "example-template", "runtime": "runc_criu",
             "architecture": "x86_64", "memory_mib": 256, "vcpus": 1, "ttl_seconds": 300,
         }
         try:
@@ -195,28 +195,28 @@ url = "http://127.0.0.1:{second_port}"
             worker_status = expect(request(worker_port, "/v1/status", worker_token), 200)
             assert worker_status["usage"] is None and not worker_status["admission_ready"]
             assert worker_status["runtimes"] == [
-                {"runtime": "runc_criu", "ready": False, "reason": "not_implemented"},
+                {"runtime": "runc_criu", "ready": False, "reason": "runtime_disabled"},
             ]
 
             def nodes():
                 status = expect(request(controller_port, "/v1/status", controller_token), 200)
-                assert not status["lifecycle_implemented"]
+                assert status["lifecycle_implemented"]
                 return {node["node_id"]: node for node in status["nodes"]}
 
             eventually(lambda: len(nodes()) == 2 and all(node["fresh"] for node in nodes().values()))
             for number, token, code in ((worker_port, worker_token, "runtime_unavailable"), (controller_port, controller_token, "no_ready_runtime")):
                 expect(request(number, "/v1/sandboxes", token, create, "POST"), 503, code)
-                for change in ({"memory_mib": 0}, {"ttl_seconds": 0}, {"runtime": "other"}, {"unexpected": True}, {"vcpus": -1}):
+                for change in ({"memory_mib": 0}, {"ttl_seconds": 0}, {"runtime": "other"}, {"unexpected": True}, {"vcpus": -1}, {"sandbox_id": "../escape"}, {"template_id": "../escape"}, {"egress": []}, {"rootfs": "/tmp/untrusted"}):
                     expect(request(number, "/v1/sandboxes", token, dict(create, **change), "POST"), 400, "invalid_input")
                 expect(request(number, "/v1/sandboxes", token, b"{", "POST"), 400, "invalid_input")
                 expect(request(number, "/v1/sandboxes", token, b"x" * 2049, "POST"), 413, "body_too_large")
                 expect(request(number, "/v1/sandboxes", token, iter([b"x" * 1024] * 3), "POST", True), 413, "body_too_large")
-                execution = {"argv": ["echo", "hello"], "timeout_ms": 1000, "max_output_bytes": 1024}
-                expect(request(number, "/v1/sandboxes/example/exec", token, execution, "POST"), 501, "lifecycle_not_implemented")
-                expect(request(number, "/v1/sandboxes/example/exec", token, dict(execution, argv=[]), "POST"), 400, "invalid_input")
-                capture = {"template_id": "example", "runtime": "runc_criu"}
-                expect(request(number, "/v1/sandboxes/example/capture", token, capture, "POST"), 501, "lifecycle_not_implemented")
-                expect(request(number, "/v1/sandboxes/example/capture", token, dict(capture, runtime="other"), "POST"), 400, "invalid_input")
+                execution = {"operation_id": "exec-1", "argv": ["echo", "hello"], "timeout_ms": 1000, "max_output_bytes": 1024}
+                expect(request(number, "/v1/sandboxes/node-a.example/exec", token, execution, "POST"), 503, "runtime_unavailable")
+                expect(request(number, "/v1/sandboxes/node-a.example/exec", token, dict(execution, argv=[]), "POST"), 400, "invalid_input")
+                capture = {"operation_id": "capture-1", "template_id": "example", "runtime": "runc_criu"}
+                expect(request(number, "/v1/sandboxes/node-a.example/capture", token, capture, "POST"), 503, "runtime_unavailable")
+                expect(request(number, "/v1/sandboxes/node-a.example/capture", token, dict(capture, runtime="other"), "POST"), 400, "invalid_input")
                 for identifier in ("%FF", "bad%2Fid"):
                     expect(request(number, f"/v1/sandboxes/{identifier}/exec", token, execution, "POST"), 400, "invalid_input")
                     expect(request(number, f"/v1/sandboxes/{identifier}/capture", token, capture, "POST"), 400, "invalid_input")
@@ -250,6 +250,36 @@ url = "http://127.0.0.1:{second_port}"
             worker = start("worker", worker_config(worker_port))
             eventually(lambda: nodes()["node-a"]["fresh"])
             print("PASS stale exclusion, node identity validation and worker restart recovery")
+
+            # Explicit runtime enablement cannot bypass missing privilege/capability checks.
+            native_root = root / "native-runtime"
+            native_root.mkdir()
+            blocked_port = port()
+            native_text = worker_config(blocked_port, "blocked") + f'''[native]
+enabled = true
+root = {json.dumps(str(native_root))}
+cgroup_parent = "/sys/fs/cgroup/sandbox-smoke-unavailable"
+cpu_overcommit = 2
+pids_max = 64
+max_records = 8
+max_operations_per_sandbox = 4
+max_artifact_bytes = 1048576
+command_timeout_seconds = 10
+'''
+            invalid_config("worker", native_text.replace("cpu_overcommit = 2", "cpu_overcommit = 17"))
+            invalid_config("worker", native_text.replace("cpu_overcommit = 2", "cpu_overcommit = 0"))
+            blocked = start("worker", native_text)
+            eventually(lambda: request(blocked_port, "/healthz")[0] == 200)
+            blocked_status = expect(request(blocked_port, "/v1/status", worker_token), 200)
+            assert not blocked_status["admission_ready"] and blocked_status["usage"] is None
+            assert blocked_status["runtimes"][0]["reason"] == "preflight_failed"
+            preflight = expect(request(blocked_port, "/v1/preflight", worker_token), 200)
+            assert not preflight["ready"] and preflight["qualification"] == "unvalidated"
+            expect(request(blocked_port, "/v1/preflight"), 401, "unauthorized")
+            expect(request(blocked_port, "/v1/sandboxes", worker_token, dict(create, sandbox_id="blocked.example"), "POST"), 503, "runtime_unavailable")
+            assert not list(native_root.iterdir()), "preflight mutated the runtime root"
+            stop(blocked)
+            print("PASS explicit-enable fail-closed preflight, CPU overcommit bounds, no runtime-root mutation")
 
             # Isolated one-permit server makes saturation deterministic without loading the host.
             limited_port = port()

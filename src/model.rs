@@ -53,6 +53,8 @@ pub struct WorkerStatus {
     pub usage: Option<Usage>,
     pub admission_ready: bool,
     pub runtimes: Vec<RuntimeCapability>,
+    pub cpu_overcommit: u32,
+    pub qualification: String,
 }
 
 impl WorkerStatus {
@@ -60,19 +62,21 @@ impl WorkerStatus {
         self.schema_version == 1 && self.node_id == node_id
             && self.architecture.len() <= 32 && self.os.len() <= 32
             && self.capacity.valid() && self.runtimes.len() == 1
+            && (1..=16).contains(&self.cpu_overcommit) && self.qualification.len() <= 64
             && self.runtimes[0].reason.len() <= 128
             && self.usage.as_ref().is_none_or(|usage| {
                 usage.memory_mib <= self.capacity.memory_mib
-                    && usage.vcpus <= self.capacity.vcpus
+                    && usage.vcpus <= self.capacity.vcpus.saturating_mul(self.cpu_overcommit)
                     && usage.sandboxes <= self.capacity.max_sandboxes
                     && usage.restores <= self.capacity.max_concurrent_restores
             })
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
+    pub sandbox_id: String,
     pub template_id: String,
     pub runtime: Runtime,
     pub architecture: String,
@@ -83,7 +87,7 @@ pub struct CreateRequest {
 
 impl CreateRequest {
     pub fn valid(&self) -> bool {
-        valid_id(&self.template_id)
+        sandbox_owner(&self.sandbox_id).is_some() && valid_id(&self.template_id)
             && matches!(self.architecture.as_str(), "x86_64" | "aarch64")
             && (1..=1_048_576).contains(&self.memory_mib)
             && (1..=4_096).contains(&self.vcpus)
@@ -91,9 +95,10 @@ impl CreateRequest {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecRequest {
+    pub operation_id: String,
     pub argv: Vec<String>,
     pub timeout_ms: u64,
     pub max_output_bytes: u64,
@@ -101,16 +106,17 @@ pub struct ExecRequest {
 
 impl ExecRequest {
     pub fn valid(&self) -> bool {
-        !self.argv.is_empty() && self.argv.len() <= 64 && !self.argv[0].is_empty()
+        valid_id(&self.operation_id) && !self.argv.is_empty() && self.argv.len() <= 64 && !self.argv[0].is_empty()
             && self.argv.iter().all(|arg| arg.len() <= 4_096 && !arg.contains('\0'))
             && (1..=60_000).contains(&self.timeout_ms)
             && (1..=1_048_576).contains(&self.max_output_bytes)
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRequest {
+    pub operation_id: String,
     pub template_id: String,
     pub runtime: Runtime,
 }
@@ -118,4 +124,11 @@ pub struct CaptureRequest {
 pub fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+// Ownership is part of the caller-chosen id, so retries and controller restarts
+// cannot route a possibly accepted create to a different worker.
+pub fn sandbox_owner(value: &str) -> Option<&str> {
+    let (node, local) = value.split_once('.')?;
+    (valid_id(node) && valid_id(local)).then_some(node)
 }

@@ -1,0 +1,37 @@
+# EXPERIMENTAL: explicit administrator enablement; no qualification claim.
+# Provision root and an exclusive empty delegated cgroup-v2 parent first.
+# No service action installs tools, loads modules, enables controllers or changes sysctls.
+node_id = "node-a"
+runtimes = ["runc_criu"]
+
+[server]
+listen = "127.0.0.1:8081"
+max_in_flight = 64
+request_timeout_ms = 5000
+max_body_bytes = 16384
+
+[auth]
+env = "SANDBOX_WORKER_TOKEN"
+
+[capacity]
+memory_mib = 192
+vcpus = 1
+max_sandboxes = 3
+max_concurrent_restores = 1
+
+[native]
+enabled = true
+root = "/var/lib/sandbox"
+cgroup_parent = "/sys/fs/cgroup/sandbox"
+# Optional existing administrator-staged tools; fixed basenames, never API paths.
+# tools_dir = "/var/lib/sandbox-tools"
+# Total admitted CPU quota <= capacity.vcpus * cpu_overcommit (1..16).
+# This is a scheduling policy, not measured physical CPU use or a capacity result.
+cpu_overcommit = 3
+pids_max = 64                    # 16..65536, fixed across compatible templates
+max_records = 128               # 1..100000, includes durable tombstones
+max_operations_per_sandbox = 32 # 1..64, retained for idempotency
+max_concurrent_operations = 4  # 1..64 fixed threads; restore slots must fit
+max_retained_output_bytes = 16777216 # 1 MiB..256 MiB; excludes fixed metadata
+max_artifact_bytes = 67108864   # 1 MiB..1 TiB per artifact, NOT a disk quota
+command_timeout_seconds = 30   # 10..300, each host tool invocation

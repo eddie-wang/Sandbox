@@ -158,6 +158,56 @@ pub struct WorkerConfig {
     pub node_id: String,
     pub capacity: Capacity,
     pub runtimes: Vec<Runtime>,
+    #[serde(default)]
+    pub native: Option<NativeConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeConfig {
+    pub enabled: bool,
+    pub root: String,
+    pub cgroup_parent: String,
+    #[serde(default)]
+    pub tools_dir: Option<String>,
+    pub cpu_overcommit: u32,
+    pub pids_max: u32,
+    pub max_records: usize,
+    pub max_operations_per_sandbox: usize,
+    #[serde(default = "default_concurrent_operations")]
+    pub max_concurrent_operations: usize,
+    #[serde(default = "default_retained_output")]
+    pub max_retained_output_bytes: usize,
+    pub max_artifact_bytes: u64,
+    pub command_timeout_seconds: u64,
+}
+
+fn default_retained_output() -> usize { 16777216 }
+fn default_concurrent_operations() -> usize { 16 }
+
+impl NativeConfig {
+    fn validate(&self) -> Result<(), &'static str> {
+        for path in [&self.root, &self.cgroup_parent].into_iter().chain(self.tools_dir.iter()) {
+            if !path.starts_with('/') || path.len() > 256
+                || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+                || std::path::Path::new(path).components().any(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)))
+                || path.split('/').any(|p| p == "." || p == "..")
+            {
+                return Err("native paths must be clean absolute paths");
+            }
+        }
+        if self.root == "/" || !self.cgroup_parent.starts_with("/sys/fs/cgroup/")
+            || !(1..=16).contains(&self.cpu_overcommit)
+            || !(16..=65536).contains(&self.pids_max)
+            || !(1..=100000).contains(&self.max_records)
+            || !(1..=64).contains(&self.max_operations_per_sandbox)
+            || !(1..=64).contains(&self.max_concurrent_operations)
+            || !(1048576..=268435456).contains(&self.max_retained_output_bytes)
+            || !(1048576..=1099511627776).contains(&self.max_artifact_bytes)
+            || !(10..=300).contains(&self.command_timeout_seconds)
+        { return Err("invalid native runtime bounds"); }
+        Ok(())
+    }
 }
 
 impl WorkerConfig {
@@ -165,6 +215,12 @@ impl WorkerConfig {
         self.server.validate()?;
         if !valid_id(&self.node_id) || !self.capacity.valid() {
             return Err("invalid worker identity or capacity budget");
+        }
+        if let Some(native) = &self.native {
+            native.validate()?;
+            if self.capacity.max_concurrent_restores as usize > native.max_concurrent_operations {
+                return Err("restore slots must fit the bounded operation pool");
+            }
         }
         if self.runtimes.len() != 1 {
             return Err("configure exactly one runtime: runc_criu");

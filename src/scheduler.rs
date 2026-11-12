@@ -1,7 +1,7 @@
 use crate::{controller::NodeView, model::CreateRequest};
 
 // Advisory only. A snapshot is not a reservation; worker-side atomic admission remains required.
-// Backend versions, checkpoint provenance and host compatibility also require a future manifest gate.
+// Template digests and exact compatibility are checked by the worker before launch.
 pub fn choose<'a>(nodes: &'a [NodeView], request: &CreateRequest) -> Option<&'a str> {
     nodes.iter().filter_map(|node| {
         let status = node.status.as_ref()?;
@@ -11,7 +11,7 @@ pub fn choose<'a>(nodes: &'a [NodeView], request: &CreateRequest) -> Option<&'a 
             || status.architecture != request.architecture
             || !status.runtimes.iter().any(|runtime| runtime.runtime == request.runtime && runtime.ready)
             || request.memory_mib > capacity.memory_mib.saturating_sub(usage.memory_mib)
-            || request.vcpus > capacity.vcpus.saturating_sub(usage.vcpus)
+            || request.vcpus > capacity.vcpus.saturating_mul(status.cpu_overcommit).saturating_sub(usage.vcpus)
             || usage.sandboxes >= capacity.max_sandboxes
             || usage.restores >= capacity.max_concurrent_restores
         {
@@ -19,7 +19,7 @@ pub fn choose<'a>(nodes: &'a [NodeView], request: &CreateRequest) -> Option<&'a 
         }
         let projected_load = [
             (usage.memory_mib + request.memory_mib) as f64 / capacity.memory_mib as f64,
-            (usage.vcpus + request.vcpus) as f64 / capacity.vcpus as f64,
+            (usage.vcpus + request.vcpus) as f64 / (capacity.vcpus * status.cpu_overcommit) as f64,
             (usage.sandboxes + 1) as f64 / capacity.max_sandboxes as f64,
             (usage.restores + 1) as f64 / capacity.max_concurrent_restores as f64,
         ].into_iter().fold(0.0, f64::max);

@@ -54,10 +54,6 @@ pub fn json<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     input.map(|Json(value)| value).map_err(|_| invalid_input())
 }
 
-pub fn not_implemented() -> ApiError {
-    ApiError(StatusCode::NOT_IMPLEMENTED, "lifecycle_not_implemented", "Sandbox lifecycle operations are not implemented")
-}
-
 pub fn protect(router: Router, config: &ServerConfig, token: String) -> Router {
     router
         .fallback(|| async {

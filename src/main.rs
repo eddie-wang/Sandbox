@@ -5,10 +5,14 @@ mod lifecycle;
 mod model;
 mod scheduler;
 mod worker;
+mod engine;
+mod native;
+mod process;
+mod storage;
 
 use std::path::Path;
 
-const USAGE: &str = "Usage: sandboxd <controller|worker> --config <file>\nCredentials are read only from the configured environment variable or file.";
+const USAGE: &str = "Usage: sandboxd <controller|worker|preflight> --config <file>\nCredentials are read only from the configured environment variable or file.";
 
 fn main() {
     if let Err(message) = start() {
@@ -34,6 +38,13 @@ fn start() -> Result<(), &'static str> {
             let token = config.auth.load()?;
             let worker_token = config.worker_auth.load()?;
             runtime()?.block_on(controller::run(config, token, worker_token))
+        }
+        Some("preflight") => {
+            let config: config::WorkerConfig = config::load(Path::new(&args[2]))?;
+            config.validate()?;
+            let report = native::preflight(config.native.as_ref());
+            println!("{}", serde_json::to_string_pretty(&report).map_err(|_| "preflight_encode_failed")?);
+            if report.ready { Ok(()) } else { Err("preflight requirements not met; no host state changed") }
         }
         Some("worker") => {
             let config: config::WorkerConfig = config::load(Path::new(&args[2]))?;
