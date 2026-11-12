@@ -61,7 +61,7 @@ def eventually(check, timeout=5):
 
 def worker_config(port_number, node="node-a", limit=32, timeout=800):
     return f'''node_id = "{node}"
-runtimes = ["runc_criu", "runsc_native"]
+runtimes = ["runc_criu"]
 [server]
 listen = "127.0.0.1:{port_number}"
 max_in_flight = {limit}
@@ -163,6 +163,8 @@ url = "http://127.0.0.1:{second_port}"
             # Strict startup validation and safe diagnostics, including accidentally embedded secrets.
             invalid_config("worker", worker_config(worker_port).replace("memory_mib = 8192", "memory_mib = 0"))
             invalid_config("worker", worker_config(worker_port).replace('"runc_criu"', '"unknown_runtime"'))
+            invalid_config("worker", worker_config(worker_port).replace('["runc_criu"]', '[]'))
+            invalid_config("worker", worker_config(worker_port).replace('["runc_criu"]', '["runc_criu", "runc_criu"]'))
             invalid_config("worker", 'unknown = ' + json.dumps(worker_token) + "\n" + worker_config(worker_port))
             invalid_config("worker", worker_config(worker_port), dict(environment, SANDBOX_WORKER_TOKEN="short"))
             missing = dict(environment)
@@ -192,8 +194,9 @@ url = "http://127.0.0.1:{second_port}"
 
             worker_status = expect(request(worker_port, "/v1/status", worker_token), 200)
             assert worker_status["usage"] is None and not worker_status["admission_ready"]
-            assert len(worker_status["runtimes"]) == 2
-            assert all(not item["ready"] and item["reason"] == "not_implemented" for item in worker_status["runtimes"])
+            assert worker_status["runtimes"] == [
+                {"runtime": "runc_criu", "ready": False, "reason": "not_implemented"},
+            ]
 
             def nodes():
                 status = expect(request(controller_port, "/v1/status", controller_token), 200)
@@ -202,8 +205,7 @@ url = "http://127.0.0.1:{second_port}"
 
             eventually(lambda: len(nodes()) == 2 and all(node["fresh"] for node in nodes().values()))
             for number, token, code in ((worker_port, worker_token, "runtime_unavailable"), (controller_port, controller_token, "no_ready_runtime")):
-                for runtime in ("runc_criu", "runsc_native"):
-                    expect(request(number, "/v1/sandboxes", token, dict(create, runtime=runtime), "POST"), 503, code)
+                expect(request(number, "/v1/sandboxes", token, create, "POST"), 503, code)
                 for change in ({"memory_mib": 0}, {"ttl_seconds": 0}, {"runtime": "other"}, {"unexpected": True}, {"vcpus": -1}):
                     expect(request(number, "/v1/sandboxes", token, dict(create, **change), "POST"), 400, "invalid_input")
                 expect(request(number, "/v1/sandboxes", token, b"{", "POST"), 400, "invalid_input")
@@ -212,7 +214,7 @@ url = "http://127.0.0.1:{second_port}"
                 execution = {"argv": ["echo", "hello"], "timeout_ms": 1000, "max_output_bytes": 1024}
                 expect(request(number, "/v1/sandboxes/example/exec", token, execution, "POST"), 501, "lifecycle_not_implemented")
                 expect(request(number, "/v1/sandboxes/example/exec", token, dict(execution, argv=[]), "POST"), 400, "invalid_input")
-                capture = {"template_id": "example", "runtime": "runsc_native"}
+                capture = {"template_id": "example", "runtime": "runc_criu"}
                 expect(request(number, "/v1/sandboxes/example/capture", token, capture, "POST"), 501, "lifecycle_not_implemented")
                 expect(request(number, "/v1/sandboxes/example/capture", token, dict(capture, runtime="other"), "POST"), 400, "invalid_input")
                 for identifier in ("%FF", "bad%2Fid"):

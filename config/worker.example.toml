@@ -1,6 +1,6 @@
 node_id = "node-a"
-# Candidates, NOT ready capabilities. Neither backend is implemented.
-runtimes = ["runc_criu", "runsc_native"]
+# Declared runtime, NOT a ready capability. The backend is not implemented.
+runtimes = ["runc_criu"]
 
 [server]
 listen = "127.0.0.1:8081"

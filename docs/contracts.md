@@ -1,9 +1,9 @@
 # Runtime, storage and admission contracts (not implemented)
 
 These are required future contracts, **not** serialized manifests accepted by the
-current API, runtime adapters, validated capabilities or successful stub methods.
-The executable runtime enum has only `runc_criu` and `runsc_native`; no plugin
-framework or interchangeable checkpoint format is intended.
+current API, runtime implementation, validated capabilities or successful stub methods.
+The only runtime is `runc_criu`: native Linux containers using runc and CRIU.
+There is no alternate-runtime adapter, plugin framework or runtime comparison.
 
 ## Checkpoint manifest boundary
 
@@ -13,28 +13,20 @@ runtime implementation and portability validation.
 
 | Common field group | Required information |
 | --- | --- |
-| Identity | Manifest schema version, template ID/version, runtime enum, capture generation |
+| Identity | Manifest schema version, template ID/version, `runc_criu` runtime marker, capture generation |
 | Compatibility | CPU architecture/features, host kernel constraints, resource/cgroup mode, network reconstruction requirements |
 | Immutable filesystem | Ordered EROFS lower artifact digests and sizes, format/options, mount layout |
 | Writable filesystem | Frozen private OverlayFS upper artifact digest/size and format, whiteout/xattr/ownership semantics, matching capture generation |
-| Process state | Backend-specific artifact digests/sizes, same capture generation and matching filesystem snapshot |
+| Process state | CRIU image-set artifact digests/sizes, same capture generation and matching filesystem snapshot |
 | Integrity/provenance | Digests for every referenced artifact and manifest, trusted publisher identity and verified publication provenance |
 
-Backend-specific process records must be **distinct discriminated variants**:
+The process record contains the runc version, CRIU version and image-format/feature
+requirements, OCI configuration digest, kernel/CPU requirements, and CRIU image-set
+artifact descriptors. Restore only through the runc/CRIU path.
 
-- **`runtime: runc_criu`**: runc version, CRIU version and image-format/feature
-  requirements, OCI configuration digest, kernel/CPU requirements, and the CRIU
-  image-set artifact descriptor. Restore only through the runc/CRIU path.
-- **`runtime: runsc_native`**: runsc version/build and selected platform,
-  native checkpoint-format requirements, OCI configuration digest, applicable
-  host/platform compatibility constraints, and native checkpoint artifact
-  descriptors. Restore only through the runsc native path; never feed these
-  artifacts to CRIU or reinterpret them as CRIU images.
-
-No runtime fallback or format conversion is implicit. Version/kernel/CPU matching
-is necessary but not sufficient evidence of portability; incompatible or unknown
-fields must fail closed. Runtime selection must eventually derive from a verified
-manifest rather than trust a caller's runtime/architecture assertion. Current
+Version/kernel/CPU matching is necessary but not sufficient evidence of portability;
+incompatible or unknown fields must fail closed. Runtime and architecture must be
+verified against the manifest rather than trusted from a caller assertion. Current
 create inputs are syntactic contracts only; no manifest is fetched or validated.
 
 ## EROFS + OverlayFS and publication
@@ -73,7 +65,7 @@ milestone intentionally creates **no** mock reservations or sandbox lifecycle st
 
 ## Validation and qualification gates
 
-Before advertising any runtime as ready, separately validate lifecycle correctness,
+Before advertising the runc/CRIU runtime as ready, separately validate lifecycle correctness,
 checkpoint/filesystem consistency, compatibility rejection, network isolation,
 resource enforcement, deletion/expiry, restart cleanup and artifact retention on
 approved hosts. Do not infer these from compilation or the nonprivileged smoke.

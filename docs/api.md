@@ -58,7 +58,7 @@ exec/capture because there is no lifecycle state store.
 ```
 
 All fields are required, and unknown fields are rejected. Runtime is exactly
-`runc_criu` or `runsc_native`; architecture is `x86_64` or `aarch64`. Identifiers
+`runc_criu`; architecture is `x86_64` or `aarch64`. Identifiers
 are 1–64 ASCII alphanumeric, hyphen or underscore characters. Syntactic limits:
 memory 1–1,048,576 MiB; vCPUs 1–4,096; TTL 1–86,400 seconds. These are API bounds,
 not resource guarantees; there is no TTL enforcement until lifecycle exists.
@@ -76,20 +76,21 @@ these are input contracts, not implemented execution/output limits.
 ### Capture input
 
 ```json
-{"template_id":"example-template","runtime":"runsc_native"}
+{"template_id":"example-template","runtime":"runc_criu"}
 ```
 
-Both fields required. No template is captured or published. Backend-specific
-future manifest requirements are in [contracts.md](contracts.md).
+Both fields required. No template is captured or published. Future CRIU
+manifest requirements are in [contracts.md](contracts.md).
 
 ### Status semantics and advisory scheduler
 
 Worker status schema version is `1`. `capacity` contains operator-configured
 `memory_mib`, `vcpus`, `max_sandboxes`, and `max_concurrent_restores`. They are not
 available memory measurements or enforcement. `usage:null` means unknown, not
-zero. `runtimes` entries contain `runtime`, `ready:false`, `reason:"not_implemented"`.
-Neither installing a runtime binary nor changing candidate configuration can
-make it ready in this milestone.
+zero. `runtimes` contains exactly one entry with `runtime:"runc_criu"`,
+`ready:false`, and `reason:"not_implemented"`. Worker configuration likewise requires
+`runtimes = ["runc_criu"]`; other runtimes, empty lists, and duplicates are rejected.
+Installing runtime binaries cannot make the backend ready in this milestone.
 
 Controller `nodes` entries include `node_id`, `fresh`, `reachable`, `age_ms`,
 `error`, and `status`. Age uses the controller's monotonic time since the last

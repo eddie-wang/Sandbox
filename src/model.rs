@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum Runtime {
     RuncCriu,
-    RunscNative,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -60,11 +59,8 @@ impl WorkerStatus {
     pub fn valid_for(&self, node_id: &str) -> bool {
         self.schema_version == 1 && self.node_id == node_id
             && self.architecture.len() <= 32 && self.os.len() <= 32
-            && self.capacity.valid() && !self.runtimes.is_empty() && self.runtimes.len() <= 2
-            && self.runtimes.iter().enumerate().all(|(i, capability)| {
-                capability.reason.len() <= 128
-                    && !self.runtimes[..i].iter().any(|other| other.runtime == capability.runtime)
-            })
+            && self.capacity.valid() && self.runtimes.len() == 1
+            && self.runtimes[0].reason.len() <= 128
             && self.usage.as_ref().is_none_or(|usage| {
                 usage.memory_mib <= self.capacity.memory_mib
                     && usage.vcpus <= self.capacity.vcpus

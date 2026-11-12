@@ -4,7 +4,7 @@ Keep this repository minimal and public-safe.
 
 - Implement the controller, scheduler, and node worker in Rust. Prefer existing runtime binaries and Linux facilities over custom replacements.
 - Keep the scheduler in the controller; avoid extra services, generic plugin frameworks, and speculative distributed infrastructure.
-- Use EROFS + OverlayFS for filesystem storage. Runtime candidates are runc + CRIU and runsc + native checkpointing. Never silently substitute one checkpoint format for the other.
+- Use EROFS + OverlayFS for filesystem storage and runc + CRIU for execution/checkpointing. Only native Linux containers are in scope; do not add alternate-runtime adapters or comparison infrastructure.
 - Separate implemented behavior, unimplemented contracts, and validated capabilities. An unavailable backend must fail closed, never return a fake running sandbox or advertise readiness.
 - Require authentication for management operations. Do not expose credentials through command-line arguments, logs, committed configuration, or error bodies.
 - Enforce bounded admission, restore concurrency, request sizes, subprocess output and deadlines. Keep blocking I/O off Tokio threads; never hold shared state locks across I/O.

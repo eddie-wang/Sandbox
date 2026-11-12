@@ -166,10 +166,8 @@ impl WorkerConfig {
         if !valid_id(&self.node_id) || !self.capacity.valid() {
             return Err("invalid worker identity or capacity budget");
         }
-        if self.runtimes.is_empty() || self.runtimes.len() > 2
-            || self.runtimes.iter().enumerate().any(|(i, r)| self.runtimes[..i].contains(r))
-        {
-            return Err("configure one or both distinct runtime candidates");
+        if self.runtimes.len() != 1 {
+            return Err("configure exactly one runtime: runc_criu");
         }
         Ok(())
     }

@@ -39,7 +39,7 @@ pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str
     let app = http::protect(router, &config.server, token);
     let listener = tokio::net::TcpListener::bind(config.server.address(8081)).await
         .map_err(|_| "cannot bind worker listener")?;
-    println!("worker listening; all runtime candidates unavailable");
+    println!("worker listening; runc/CRIU runtime unavailable");
     axum::serve(listener, app).with_graceful_shutdown(http::shutdown()).await
         .map_err(|_| "worker HTTP server failed")
 }
