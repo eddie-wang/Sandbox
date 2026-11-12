@@ -132,3 +132,58 @@ pub fn sandbox_owner(value: &str) -> Option<&str> {
     let (node, local) = value.split_once('.')?;
     (valid_id(node) && valid_id(local)).then_some(node)
 }
+
+// Policies are immutable template input; callers cannot author a broader policy.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TcpDestination { pub ip: std::net::Ipv4Addr, pub port: u16 }
+impl TcpDestination {
+    pub fn valid(&self) -> bool {
+        let o = self.ip.octets();
+        self.port != 0 && o[0] != 0 && o[0] != 127 && o[0] < 224
+            && !self.ip.is_link_local() && o[..3] != [192, 0, 2]
+    }
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkPolicy {
+    Isolated,
+    TcpAllowlist { egress: Vec<TcpDestination>, service_ports: Vec<u16> },
+}
+impl NetworkPolicy {
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Isolated => true,
+            Self::TcpAllowlist { egress, service_ports } => egress.len() <= 64 && service_ports.len() <= 16
+                && egress.iter().all(TcpDestination::valid) && service_ports.iter().all(|p| *p != 0),
+        }
+    }
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRequest {
+    pub operation_id: String,
+    pub port: u16,
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub body: String,
+    pub timeout_ms: u64,
+    pub max_response_bytes: u64,
+}
+impl HttpRequest {
+    pub fn valid(&self) -> bool {
+        valid_id(&self.operation_id) && self.port != 0 && matches!(self.method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
+            && self.path.starts_with('/') && !self.path.starts_with("//") && self.path.len() <= 2048
+            && self.path.bytes().all(|b| b.is_ascii_graphic() && b != b'\\' && b != b'#')
+            && self.body.len() <= 8192 && (1..=30000).contains(&self.timeout_ms)
+            && (1..=65536).contains(&self.max_response_bytes) && self.headers.len() <= 2
+            && self.headers.iter().all(|(k,v)| matches!(k.as_str(), "accept" | "content-type")
+                && v.len() <= 256 && v.bytes().all(|b| (32..127).contains(&b)))
+    }
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpOutput { pub status: u16, pub content_type: Option<String>, pub body: String }

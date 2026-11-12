@@ -7,6 +7,7 @@ mod scheduler;
 mod worker;
 mod engine;
 mod native;
+mod network;
 mod process;
 mod storage;
 
@@ -23,6 +24,8 @@ fn main() {
 
 fn start() -> Result<(), &'static str> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == "internal-forward" { return network::forward_helper(); }
+    if args.len() == 2 && args[0] == "internal-http" { return network::http_helper(Path::new(&args[1])); }
     if args.len() == 1 && args[0] == "--help" {
         println!("{USAGE}");
         return Ok(());

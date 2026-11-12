@@ -82,6 +82,10 @@ fn drain_helpers(path: &Path) -> Result<()> {
 
 // Read-only preflight executes only trusted version queries, never storage/runtime
 // commands. No cgroup mutation is allowed here; parent-death signaling still applies.
+pub fn inspect(program: &str, args: &[String], search_path: &str) -> Result<Output> {
+    run_inner(program, args, Duration::from_secs(3), 65536, false, search_path, None)
+}
+
 pub fn version(program: &str, search_path: &str) -> Result<Output> {
     run_inner(program, &["--version".into()], Duration::from_secs(3), 4096, false, search_path, None)
 }

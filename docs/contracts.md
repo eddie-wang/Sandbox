@@ -1,5 +1,10 @@
 # Local runtime and storage contracts
 
+> Review-branch note: the lifecycle baseline below uses the earlier manifest/layout.
+> This branch introduces a draft schema v2 network policy and compatibility layout;
+> see the [latest architecture](../plans/container-architecture-eddie-wang-2026-11-12.md).
+> Old manifests are not silently migrated. Networking qualification remains pending.
+
 These describe implemented code paths and serialized metadata. The bounded local
 fixture passed on one approved host; this is **not general isolation or checkpoint
 portability qualification**. Only native Linux runc + CRIU is supported.

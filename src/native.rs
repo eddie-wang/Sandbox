@@ -81,6 +81,13 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     add("host_capabilities", caps & required == required);
     for &name in TOOL_NAMES { add(&format!("tool_{name}"), tools.contains_key(name)); }
     add("helper_path_matches_verified_tools", search_path.is_ok());
+    if let Some(network) = config.and_then(|c| c.network.as_ref()) {
+        let bridge = Path::new("/sys/class/net").join(&network.bridge).join("bridge").is_dir();
+        let addresses = tools.get("ip").zip(search_path.as_ref().ok()).and_then(|(ip, path)| process::inspect(ip, &["-j".into(), "address".into(), "show".into(), "dev".into(), network.bridge.clone()], path).ok())
+            .filter(|o| o.exit_code == Some(0) && !o.interrupted).and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok());
+        let gateway = addresses.as_ref().and_then(|a| a.as_array()).is_some_and(|links| links.iter().any(|l| l["addr_info"].as_array().is_some_and(|a| a.iter().any(|a| a["local"] == network.gateway.to_string() && a["prefixlen"] == network.prefix))));
+        add("operator_bridge_gateway", bridge && gateway);
+    }
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     for name in ["erofs", "overlay", "cgroup2"] { add(name, filesystems.lines().any(|l| l.split_whitespace().last() == Some(name))); }
     add("seccomp_filter", status.lines().any(|l| l.starts_with("Seccomp:")));
@@ -115,7 +122,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let features = cpu.lines().find(|l| l.starts_with("flags") || l.starts_with("Features"))?.split_once(':')?.1.trim();
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             cpu_features_sha256: storage::digest(features.as_bytes()), runc_version: version("runc")?, criu_version: version("criu")?,
-            layout: "erofs-overlay-upper-v1-isolated-seccomp-v1".to_owned() })
+            layout: "erofs-overlay-upper-v2-fixed-slot-tcp-seccomp-v2".to_owned() })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
     Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility }
@@ -140,7 +147,7 @@ impl Native {
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
     pub fn private(&self, id: &str) -> PathBuf { self.root().join("private").join(id) }
     pub fn tool(&self, name: &str) -> Result<&str> { self.tools.get(name).map(String::as_str).ok_or("tool_missing") }
-    fn command(&self, tool: &str, args: Vec<String>) -> Result<()> {
+    pub(crate) fn command(&self, tool: &str, args: Vec<String>) -> Result<()> {
         process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers)
     }
     pub fn runc(&self, args: Vec<String>, timeout: Duration, limit: usize) -> Result<process::Output> {
@@ -156,11 +163,12 @@ impl Native {
     }
     pub fn template(&self, id: &str) -> Result<Manifest> {
         let m = storage::load(self.root(), id, &self.compatibility, self.config.max_artifact_bytes)?;
+        self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
         Ok(m)
     }
     pub fn resources_absent(&self, id: &str) -> bool {
-        !self.private(id).exists() && !self.root().join("runc").join(id).exists()
+        self.network_absent(id) && !self.private(id).exists() && !self.root().join("runc").join(id).exists()
             && !Path::new(&self.config.cgroup_parent).join(id).exists()
     }
     pub fn mount_lower(&self, manifest: &Manifest) -> Result<()> {
@@ -173,7 +181,7 @@ impl Native {
         }
         storage::verify_lower(&lower, &image)
     }
-    pub fn prepare(&self, request: &CreateRequest, manifest: &Manifest, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+    pub fn prepare(&self, request: &CreateRequest, manifest: &Manifest, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         let id = &request.sandbox_id;
         let private = self.private(id);
         storage::private_dir(&private)?;
@@ -195,6 +203,7 @@ impl Native {
             format!("nodev,nosuid,lowerdir={},upperdir={},workdir={},index=off,metacopy=off,redirect_dir=off,xino=off", lower.display(), private.join("upper").display(), private.join("work").display()),
             private.join("rootfs").display().to_string()])?;
         self.cgroup(request)?;
+        self.prepare_network(id, &manifest.network, network_slot)?;
         self.write_spec(request, manifest)?;
         if manifest.oci_config_sha256.as_ref().is_some_and(|d| self.spec_digest(id).as_ref() != Ok(d)) { return Err("oci_config_mismatch"); }
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
@@ -217,7 +226,7 @@ impl Native {
         // system CRIU configuration is part of the trusted host prerequisites.
         fs::write(private.join("criu.conf"), "network-lock nftables\n").map_err(|_| "criu_config_failed")?;
         let process = self.process_spec(manifest.init_argv.clone());
-        let spec = json!({
+        let mut spec = json!({
             "ociVersion": "1.2.0", "process": process, "root": {"path": "rootfs", "readonly": false}, "hostname": "sandbox",
             "annotations": {"org.criu.config": private.join("criu.conf").display().to_string()},
             "mounts": [
@@ -243,15 +252,19 @@ impl Native {
                         {"allow":true,"type":"c","major":1,"minor":9,"access":"rw"}]},
                 "maskedPaths":["/proc/acpi","/proc/asound","/proc/kcore","/proc/keys","/proc/latency_stats","/proc/timer_list","/proc/timer_stats","/proc/sched_debug","/proc/scsi","/proc/interrupts"],
                 "readonlyPaths":["/proc/bus","/proc/fs","/proc/irq","/proc/sys","/proc/sysrq-trigger"],
-                "seccomp": seccomp()
+                "seccomp": seccomp(!matches!(manifest.network, crate::model::NetworkPolicy::Isolated))
             }
         });
+        if !matches!(manifest.network, crate::model::NetworkPolicy::Isolated) {
+            spec["linux"]["namespaces"][2]["path"] = json!(format!("/run/netns/{}", self.network_names(&request.sandbox_id).0));
+        }
         process::atomic_json(&private.join("config.json"), &spec)
     }
     pub fn spec_digest(&self, id: &str) -> Result<String> {
         let mut spec: Value = storage::read_json(&self.private(id).join("config.json"), 65536)?;
         // Only worker-local reconstruction paths vary between independent containers.
         spec["linux"]["cgroupsPath"] = Value::String("<private-cgroup>".into());
+        if spec["linux"]["namespaces"][2].get("path").is_some() { spec["linux"]["namespaces"][2]["path"] = json!("<private-guest-netns>"); }
         spec["annotations"] = json!({"org.criu.config":"<worker-criu-config>"});
         Ok(storage::digest(&serde_json::to_vec(&spec).map_err(|_| "spec_encode_failed")?))
     }
@@ -325,6 +338,7 @@ impl Native {
             // runc may have removed its cgroup during delete.
             if cgroup.exists() { fs::remove_dir(&cgroup).map_err(|_| "cgroup_remove_failed")?; }
         }
+        self.cleanup_network(id)?;
         let private = self.private(id);
         let rootfs = private.join("rootfs");
         if storage::mounted(&rootfs)? { self.command("umount", vec!["--internal-only".into(), rootfs.display().to_string()])?; }
@@ -346,14 +360,27 @@ impl Native {
     }
 }
 
-fn seccomp() -> Value {
+fn seccomp(network: bool) -> Value {
     // Small native-tool profile, not a universal application compatibility claim.
     // Network creation, namespace changes, mount, ptrace, bpf, perf and io_uring
     // are absent. Unknown syscalls fail EPERM rather than default-allow.
     let calls = "read write readv writev pread64 pwrite64 preadv pwritev close close_range lseek open openat openat2 creat fstat stat lstat newfstatat statx statfs fstatfs access faccessat faccessat2 readlink readlinkat getdents getdents64 dup dup2 dup3 fcntl ioctl flock fsync fdatasync sync_file_range truncate ftruncate fallocate rename renameat renameat2 unlink unlinkat mkdir mkdirat rmdir link linkat symlink symlinkat chmod fchmod fchmodat chown fchown lchown fchownat umask utime utimes futimesat utimensat getxattr lgetxattr fgetxattr listxattr llistxattr flistxattr setxattr lsetxattr fsetxattr removexattr lremovexattr fremovexattr mmap mprotect munmap mremap madvise mincore brk msync mlock munlock mlockall munlockall rt_sigaction rt_sigprocmask rt_sigreturn rt_sigsuspend rt_sigtimedwait rt_sigpending sigaltstack kill tkill tgkill restart_syscall nanosleep clock_nanosleep clock_gettime clock_getres gettimeofday time times getpid getppid gettid getuid geteuid getgid getegid getgroups getresuid getresgid getcwd chdir fchdir uname sysinfo getrlimit setrlimit prlimit64 getrusage sched_yield sched_getaffinity sched_setaffinity sched_getparam sched_getscheduler sched_get_priority_max sched_get_priority_min getpriority setpriority arch_prctl prctl set_tid_address set_robust_list get_robust_list futex futex_waitv rseq membarrier fork vfork execve execveat wait4 waitid exit exit_group pipe pipe2 poll ppoll select pselect6 epoll_create epoll_create1 epoll_ctl epoll_wait epoll_pwait epoll_pwait2 eventfd eventfd2 timerfd_create timerfd_settime timerfd_gettime signalfd signalfd4 getrandom memfd_create sendfile copy_file_range splice tee vmsplice fadvise64 getcpu getitimer setitimer alarm capget";
-    json!({"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,
+    let mut profile = json!({"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,
         "syscalls":[{"names":calls.split_whitespace().collect::<Vec<_>>(),"action":"SCMP_ACT_ALLOW"},
             {"names":["clone"],"action":"SCMP_ACT_ALLOW","args":[{"index":0,"value":2114060288u64,"valueTwo":0,"op":"SCMP_CMP_MASKED_EQ"}]},
             // clone3 cannot filter its pointed-to flags. ENOSYS permits libc fallback.
-            {"names":["clone3"],"action":"SCMP_ACT_ERRNO","errnoRet":38}]})
+            {"names":["clone3"],"action":"SCMP_ACT_ERRNO","errnoRet":38}]});
+    if network {
+        let rules = profile["syscalls"].as_array_mut().unwrap();
+        rules.push(json!({"names":["connect","bind","listen","accept","accept4","getsockname","getpeername","getsockopt","setsockopt","shutdown","sendto","recvfrom","sendmsg","recvmsg","sendmmsg","recvmmsg"],"action":"SCMP_ACT_ALLOW"}));
+        // AF_INET + SOCK_STREAM only (CLOEXEC/NONBLOCK flags accepted), protocol
+        // zero or TCP. No AF_INET6/UNIX/PACKET/NETLINK, UDP or raw sockets.
+        for protocol in [0, 6] {
+            rules.push(json!({"names":["socket"],"action":"SCMP_ACT_ALLOW","args":[
+                {"index":0,"value":2,"op":"SCMP_CMP_EQ"},
+                {"index":1,"value":4294440959u64,"valueTwo":1,"op":"SCMP_CMP_MASKED_EQ"},
+                {"index":2,"value":protocol,"op":"SCMP_CMP_EQ"}]}));
+        }
+    }
+    profile
 }

@@ -1,5 +1,10 @@
 # Native API
 
+> Review-branch note: this reference describes the reviewed lifecycle baseline.
+> Draft networking and `/http` additions are described in the
+> [latest architecture](../plans/container-architecture-eddie-wang-2026-11-12.md).
+> The detailed API reference has not yet been fully updated or network-qualified.
+
 One `sandboxd` runs as controller or worker. This is an early native API, not an
 E2B-compatible interface. Runtime execution is experimental; the bounded local
 functional smoke has passed, but general isolation/workload readiness is unqualified;

@@ -18,6 +18,7 @@ from smoke import eventually, expect, port, request
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
+    parser.add_argument("--network", action="store_true", help="Only inside network_smoke.py disposable outer namespace")
     parser.add_argument("--binary", default="target/debug/sandboxd")
     parser.add_argument("--root", required=True, help="Existing trusted directory on ext4/XFS/Btrfs; retained for inspection")
     parser.add_argument("--cgroup-parent", required=True, help="Existing empty delegated domain; cpu memory pids already enabled")
@@ -25,6 +26,8 @@ def main():
     args = parser.parse_args()
     if not args.allow_privileged_runtime or os.geteuid() != 0:
         parser.error("requires explicit opt-in and administrator execution on an approved host")
+    if args.network and os.environ.get("SANDBOX_TEST_OUTER_NETNS") != os.readlink("/proc/self/ns/net"):
+        parser.error("network tests require the disposable outer namespace harness")
     binary = str(Path(args.binary).resolve())
     parent = Path(args.root).resolve(strict=True)
     cgroup = Path(args.cgroup_parent).resolve(strict=True)
@@ -59,11 +62,22 @@ cgroup_parent = {json.dumps(str(cgroup))}
 cpu_overcommit = 3
 pids_max = 64
 max_records = 32
-max_operations_per_sandbox = 32
+max_operations_per_sandbox = 64
 max_concurrent_operations = 4
 max_retained_output_bytes = 16777216
 max_artifact_bytes = 67108864
 command_timeout_seconds = 30
+''')
+    if args.network:
+        with worker_config.open("a") as f:
+            f.write('''
+[native.network]
+bridge = "sb-test-br"
+gateway = "198.18.0.1"
+prefix = 24
+addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
+egress = [{ip="198.18.0.1", port=18080}]
+service_ports = [8080]
 ''')
     controller_config = root / "controller.toml"
     controller_config.write_text(f'''[server]
@@ -106,10 +120,10 @@ url = "http://127.0.0.1:{worker_port}"
     (root / "templates").mkdir(mode=0o700)
     template = root / "templates" / "fixture"
     template.mkdir(mode=0o700)
-    manifest = dict(schema_version=1, template_id="fixture", generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
+    manifest = dict(schema_version=2, template_id="fixture", generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
                     base=dict(sha256=digest, bytes=(root / "layers" / (digest + ".erofs")).stat().st_size), upper=None, checkpoint=None,
-                    init_argv=["/fixture", "init"], memory_mib=None, vcpus=None, pids_max=64, oci_config_sha256=None,
-                    network="isolated", uid=65534, gid=65534)
+                    init_argv=["/fixture", "init-network" if args.network else "init"], memory_mib=None, vcpus=None, pids_max=64, oci_config_sha256=None,
+                    network=({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}), uid=65534, gid=65534)
     (template / "manifest.json").write_text(json.dumps(manifest))
     (template / "manifest.sha256").write_text(hashlib.sha256((template / "manifest.json").read_bytes()).hexdigest() + "\n")
     for name in ("incompatible", "tampered", "symlinked", "unknown-metadata"):
@@ -276,7 +290,7 @@ url = "http://127.0.0.1:{worker_port}"
         execute(source, "unlink", "removed")
         assert execute(isolated, "read", "copied") == "immutable-base"
         assert execute(isolated, "read", "removed") == "immutable-base"
-        status = execute(source, "isolation")
+        status = execute(source, "network-isolation" if args.network else "isolation")
         assert "CapEff:\t0000000000000000" in status and "NoNewPrivs:\t1" in status and "Seccomp:\t2" in status
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
         assert (cgroup / source / "memory.swap.max").read_text().strip() == "0"
@@ -295,7 +309,29 @@ url = "http://127.0.0.1:{worker_port}"
             observations["namespace_identities"][namespace] = identities
         # Examine links only inside owned netns; never change interfaces/rules.
         links = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "link", "show"], check=True, capture_output=True, timeout=5)
-        assert [link["ifname"] for link in json.loads(links.stdout)] == ["lo"]
+        assert sorted(link["ifname"] for link in json.loads(links.stdout)) == (["eth0", "lo"] if args.network else ["lo"])
+        def network_gate(sandbox, full=False):
+            assert "connected=1" in execute(sandbox, "connect", "198.18.0.1", "18080", "1")
+            for ip, port_number in [("198.18.0.1", "18081"), ("198.18.0.2", "18080"), ("198.18.0.11", "8080")]:
+                assert "connected=0" in execute(sandbox, "connect", ip, port_number, "0")
+            body = dict(port=8080, method="POST", path="/headers?test=1", headers={"content-type":"text/plain"}, body="request-text", timeout_ms=2000, max_response_bytes=4096)
+            result = op(sandbox, "http", body)["http_output"]
+            assert result["status"] == 200 and "request-text" in result["body"]
+            assert "authorization:" not in result["body"].lower() and token not in result["body"] and worker_token not in result["body"]
+            if full:
+                expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", body=dict(body, operation_id="unauth"), method="POST"), 401, "unauthorized")
+                for changes in [dict(path="http://198.18.0.1/"), dict(path="//198.18.0.1/"), dict(headers={"authorization":"secret"}), dict(body="x"*8193), dict(max_response_bytes=65537)]:
+                    expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", token, dict(body, operation_id="invalid", **changes), "POST"), 400, "invalid_input")
+                assert op(sandbox, "http", dict(body, port=8081), allow_failure=True)["error"] == "service_port_not_authorized"
+                assert op(sandbox, "http", dict(body, path="/redirect"))["http_output"]["status"] == 302
+                for changes in [dict(path="/slow", timeout_ms=50), dict(path="/large", max_response_bytes=128)]:
+                    assert op(sandbox, "http", dict(body, **changes), allow_failure=True)["state"] == "failed"
+                assert get(sandbox)["state"] == "running"
+            return True
+        if args.network:
+            observations["network_and_http_before_capture"] = network_gate(source, True)
+            # Close fixture connections before capture; remote TCP state is not cloned.
+            time.sleep(1)
         before, nonce = map(int, execute(source, "counter").split())
         rejected_capture = op(source, "capture", dict(template_id="fixture", runtime="runc_criu"), allow_failure=True)
         assert rejected_capture["error"] == "template_already_exists" and get(source)["state"] == "running"
@@ -347,6 +383,9 @@ url = "http://127.0.0.1:{worker_port}"
         for sandbox in (source, child):
             assert str(host_pid(sandbox)) in (cgroup / sandbox / "cgroup.procs").read_text().split()
             assert (cgroup / sandbox / "memory.max").read_text().strip() == "67108864"
+        if args.network:
+            observations["restored_listening_socket_and_fresh_egress"] = network_gate(child)
+            observations["source_listening_socket_and_fresh_egress"] = network_gate(source)
         print("PASS cold create, private writes/whiteouts, retained open files/mappings, warm memory nonce, independent restore and source recovery")
         remove(child)
         other_child = create("other-child", "isolated-warm")
@@ -442,6 +481,9 @@ url = "http://127.0.0.1:{worker_port}"
     assert not any(str(root) in line.split()[4] for line in mountinfo.splitlines()), "owned mounts remain"
     assert not any(path.is_dir() for path in cgroup.iterdir()), "owned workload/helper cgroups remain"
     assert all(not (root / "private" / sandbox).exists() for sandbox in ids), "private state remains"
+    if args.network:
+        assert not any(p.name.startswith(("sb-g-", "sb-s-")) for p in Path("/run/netns").iterdir()), "owned netns remain"
+        assert not any(p.name.startswith("sb") and p.name != "sb-test-br" for p in Path("/sys/class/net").iterdir()), "owned veth remain"
     for log in root.glob("*.log"):
         assert token.encode() not in log.read_bytes() and worker_token.encode() not in log.read_bytes()
     print("REAL LIFECYCLE SMOKE PASSED on this host only; not a capacity or two-node qualification")

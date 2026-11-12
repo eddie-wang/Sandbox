@@ -1,7 +1,7 @@
 use axum::{Json, Router, extract::{Path, State, rejection::{JsonRejection, PathRejection}}, http::StatusCode, routing::{get, post}};
 use serde_json::{Value, json};
 use crate::{config::WorkerConfig, engine::{Handle, Work}, http::{self, ApiError}, lifecycle::Health,
-    model::{CaptureRequest, CreateRequest, ExecRequest, sandbox_owner, valid_id}};
+    model::{CaptureRequest, CreateRequest, ExecRequest, HttpRequest, sandbox_owner, valid_id}};
 
 fn unavailable() -> ApiError { ApiError(StatusCode::SERVICE_UNAVAILABLE, "runtime_unavailable", "Runtime is disabled or preflight failed") }
 fn id(handle: &Handle, input: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
@@ -56,6 +56,14 @@ async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejec
     submit(&handle, |ack| Work::Exec(id.clone(), request, ack)).await?;
     Ok(accepted(id, Some(op)))
 }
+async fn application_http(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = id(&handle, path)?;
+    let request = http::json(input)?;
+    if !request.valid() { return Err(http::invalid_input()); }
+    let op = request.operation_id.clone();
+    submit(&handle, |ack| Work::Http(id.clone(), request, ack)).await?;
+    Ok(accepted(id, Some(op)))
+}
 async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -85,6 +93,7 @@ pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str
         .route("/v1/sandboxes", post(create))
         .route("/v1/sandboxes/{id}", get(get_sandbox).delete(delete))
         .route("/v1/sandboxes/{id}/exec", post(exec))
+        .route("/v1/sandboxes/{id}/http", post(application_http))
         .route("/v1/sandboxes/{id}/capture", post(capture))
         .route("/v1/sandboxes/{id}/operations/{op}", get(operation))
         .with_state(handle.clone());

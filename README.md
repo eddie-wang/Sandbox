@@ -2,14 +2,19 @@
 
 A small Rust controller/scheduler and Linux node worker for stateful tool execution.
 
-**Status: experimental real-runtime implementation; the bounded native lifecycle
-smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This includes
-cold create, capture/source recovery, independent warm restore, overlapping commands,
-private writes/whiteouts, idempotent retry, TTL/delete and crash/restart cleanup.
-This is a targeted functional result, **not production isolation, general workload
-readiness, cross-node portability or capacity qualification**. The validation host's
-indirect system-library/shell trust was not established; see the operator recipe.
-Compilation and the nonprivileged HTTP smoke are separate checks.
+**Review checkpoint: networking and application HTTP are in progress and are NOT
+privileged-runtime qualified.** This snapshot builds and passes the original
+nonprivileged process smoke; it is published for code/design review, not deployment.
+
+**[Latest architecture and implementation status](plans/container-architecture-eddie-wang-2026-11-12.md)**
+
+The reviewed baseline `e34616b` passed a bounded isolated lifecycle smoke on one
+approved Linux x86-64 host (runc 1.3.6, CRIU 4.3): cold create, capture/source recovery,
+independent warm restore, concurrent operations, private writes, retries and cleanup.
+That result does not qualify this draft's new network layout or manifest schema.
+Neither version is a production-isolation, general-workload, cross-node or capacity
+certification. The validation host's indirect system-library/shell trust was not
+established; see the operator recipe.
 
 ## Safe default
 
@@ -47,12 +52,12 @@ RBAC, built-in TLS or Internet-facing connection defense.
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
   65534, empty capabilities, `no_new_privs`, a default-deny seccomp syscall profile
   and cgroup-v2 memory/swap/CPU/pids limits installed before launch.
-- Only **fully isolated, deny-all networking** is implemented: no veth, route,
-  external interface, host networking or network socket syscall. No host firewall
-  or sysctl changes. CRIU uses temporary nftables locks only in the owned netns.
-  Destination/port egress allowlists are **not implemented**;
-  requests cannot enable them. This is deliberately narrower than a general
-  container application profile.
+- Fully isolated networking remains the default. **Draft, unqualified:** template
+  IPv4/TCP destination+port allowlists bounded by operator policy, with fixed guest
+  addressing behind worker-owned router-slot namespaces. The operator provisions
+  the bridge/gateway/address pool; filtering and SNAT are slot-local. No worker
+  changes to default-host routes/firewall/sysctls are intended. Ownership/restart
+  review and real network/CRIU qualification are still pending.
 - One durable admission/state coordinator per worker, a fixed bounded pool for
   parallel runtime I/O across sandboxes, per-sandbox exclusion, separate restore
   slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic records,
@@ -75,8 +80,10 @@ RBAC, built-in TLS or Internet-facing connection defense.
 - `runc exec` with argv, bounded output/deadline and durable results. A bound
   violation conservatively terminates the **whole sandbox**, not just its runc
   client. Each exec uses an owned child cgroup and cleans descendants even after
-  a successful parent exit. Application HTTP is a distinct, **unimplemented** interface; there is
-  no arbitrary upstream proxy.
+  a successful parent exit. **Draft application HTTP** uses a tracked helper in the
+  owned slot namespace, with a fixed guest target, authorized port and bounded
+  UTF-8 request/response. No arbitrary upstream URL, redirects or credential
+  forwarding. Real HTTP/network validation is still pending.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting
@@ -89,10 +96,12 @@ from the nonprivileged smoke. No unit tests are added. No license has been selec
 
 ## Deferred qualification and features
 
-No two-node, S3, application HTTP, egress allowlist, broad application compatibility
-or performance result is claimed. Fork and user-facing pause/resume remain out of
-scope. The worker root needs operator-controlled disk capacity/quota; sandbox disk
-quotas and an automatic artifact retention policy are not implemented.
+Networking/application HTTP code in this branch is an unqualified draft; no
+successful privileged network result is claimed. S3 is owner-deferred. Two-node,
+broad application compatibility and performance qualification remain outstanding.
+Fork and user-facing pause/resume remain out of scope. The worker root needs
+operator-controlled disk capacity/quota; sandbox disk quotas and an automatic
+artifact retention policy are not implemented.
 
 Capacity qualification remains **two nodes, 10% active and 90% resident idle, under
 a 512 GB budget**. Per-node versus total scope, exact byte count and acceptable

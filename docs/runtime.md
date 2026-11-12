@@ -1,5 +1,10 @@
 # Explicitly privileged real-runtime qualification
 
+> Review-branch note: the passing results below apply to baseline `e34616b`, not
+> this branch's new networking/schema changes. Optional network assertions are
+> being added, but the disposable topology harness and privileged network gate
+> have not run. See the [latest architecture](../plans/container-architecture-eddie-wang-2026-11-12.md).
+
 **Targeted functional gate passed on one explicitly approved Linux x86-64 host,
 with runc 1.3.6 and CRIU 4.3.** The real script exercised shared EROFS/private OverlayFS,
 capture/source recovery, independent restored memory/file state, overlapping exec,
