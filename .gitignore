@@ -1,0 +1,12 @@
+/target/
+/.pi/
+/.agents/
+/.cargo/
+/state/
+/artifacts/
+*.log
+.env
+.env.*
+!.env.example
+*.local.toml
+.DS_Store
