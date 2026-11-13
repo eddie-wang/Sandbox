@@ -168,13 +168,16 @@ run on a bounded operation pool. Capture follows the AgentENV container backend 
 On an ordinary failure the worker thaws the source and keeps it if runc reports it
 running; CRIU leaves dumped tasks alive, so a failed dump is not treated as
 terminating the source (the gate forces a dump failure with an undumpable file and
-checks the source keeps running). A source that stays frozen, or was
-cancelled/expired, is deleted. So is a source whose `runc checkpoint` was stopped at
-its command deadline or output limit (`checkpoint_interrupted`): a killed CRIU can
-leave its network lock, sockets in repair mode or parasite code behind, so the state
-is uncertain even if runc reports it running (the gate stops the checkpoint helper
-and checks the source is deleted). A source template already at 16 sealed layers is
-refused before the pause (`template_layer_limit`). A layer published before a later step failed stays in `layers/`
+checks the source keeps running). A `runc checkpoint` stopped at its command
+deadline or output limit gets the same AgentENV thaw-and-keep handling but its own
+code, `checkpoint_interrupted`: a killed CRIU can leave its network lock, sockets in
+repair mode or parasite code behind in a source that runc still reports running, so
+the caller decides whether to delete it (the gate stops the checkpoint helper until
+the deadline and checks the source keeps running). A source that stays frozen, is not
+running after the thaw, or was cancelled/expired, is deleted (the gate kills a
+source's processes during its dump and checks it is deleted). A source template
+already at 16 sealed layers is refused before the pause (`template_layer_limit`). A
+layer published before a later step failed stays in `layers/`
 (content-addressed, retained like every layer). Failed/stale staging is removed
 without touching live mounts or published templates.
 

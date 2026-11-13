@@ -173,9 +173,11 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    later restore after a worker restart. A checkpoint that fails after the freeze
    (the fixture holds an undumpable userfaultfd) leaves the source running and
    publishes nothing; a `runc checkpoint` stopped by the test (SIGSTOP) until the
-   worker kills it at the 30 s command deadline is `500 checkpoint_interrupted` and
-   deletes that source. A **chained capture** of the warm child (two sealed layers)
-   restores a grandchild with the same nonce, the child's file change, the source's
+   worker kills it at the 30 s command deadline is `500 checkpoint_interrupted`, and
+   that source is thawed and keeps running (its counter advances). A source whose
+   processes the test kills while its `runc checkpoint` is stopped fails with `500
+   checkpoint_failed` and is deleted. A **chained capture** of the warm child (two
+   sealed layers) restores a grandchild with the same nonce, the child's file change, the source's
    whiteout and a working loopback connection. Restored host PIDs must be in their
    own cgroups. This is a
    targeted file-identity check, not blanket CRIU compatibility for all

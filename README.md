@@ -94,8 +94,9 @@ RBAC, built-in TLS or Internet-facing connection defense.
   finish with normal cleanup; a create whose reply the worker could not deliver is
   deleted as `create_response_lost`), except when a later hop loses a reply the
   worker already handed over; the sandbox's TTL bounds that case. The controller chooses the
-  worker (least projected load, counting its own in-flight and not-yet-polled
-  creates, with round-robin between equal scores, so simultaneous creates spread)
+  worker (room by polled usage; least projected load, also counting its own
+  in-flight and not-yet-polled creates, with round-robin between equal scores, so
+  simultaneous creates spread without a false `no_capacity`)
   and generates an opaque sandbox ID that routes later calls; clients never
   name nodes. Worker admission is final; stale controller capacity cannot
   reserve memory or start a workload. CPU quota admission has an explicit bounded
@@ -106,10 +107,12 @@ RBAC, built-in TLS or Internet-facing connection defense.
   whiteouts kept), `runc checkpoint --leave-running` with `--tcp-established
   --ext-unix-sk --file-locks`, `runc resume`; then archive the images and atomically
   publish the layer, manifest and digests. On failure the source is thawed and kept
-  if it runs, except that a dump stopped at its deadline deletes the source (its
-  state is uncertain). Children mount the sealed layer(s) above the base (captures
-  of warm children chain up to 16 layers) and restore from CRIU images unpacked once
-  per node per manifest digest, synced before they are trusted, and shared read-only. File
+  if it runs, otherwise deleted; a dump stopped at its deadline or output limit is
+  handled the same way but reported as `checkpoint_interrupted`, so the caller can
+  delete a source the killed dump may have degraded. Children mount the sealed
+  layer(s) above the base (captures of warm children chain up to 16 layers) and
+  restore from CRIU images unpacked once per node per manifest digest, synced
+  before they are trusted, and shared read-only. File
   identity and independent restore are explicit qualification gates, exercised by
   open upper/lower descriptors, mappings and a loopback TCP connection in the real
   fixture. That fixture passed; arbitrary open-file/application states and other

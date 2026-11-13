@@ -596,9 +596,9 @@ impl Runner<'_> {
     // Capture a running sandbox as a new warm template without stopping it (AgentENV order): freeze it,
     // flush and seal its upper directory into an EROFS layer, checkpoint it with CRIU leaving it running,
     // then thaw it. Afterwards archive the images, write the manifest and publish the layer and template.
-    // On an ordinary failure thaw the source and keep it if it runs; a source that stays frozen or was
-    // cancelled is deleted, and so is one whose dump was interrupted at its deadline (its state is
-    // uncertain). Success means publication and a running source.
+    // On any failure, including a dump stopped at its deadline (`checkpoint_interrupted`), thaw the
+    // source and keep it if it runs (AgentENV recover); a source that stays frozen, is not running
+    // or was cancelled is deleted. Success means publication and a running source.
     fn capture(&mut self, request: CaptureRequest, generation: String) -> Result<Outcome> {
         let id = self.record.request.sandbox_id.clone();
         let max = self.native.config.max_artifact_bytes;
@@ -646,15 +646,11 @@ impl Runner<'_> {
         })();
         // CRIU leaves the dumped tasks alive, so a failed step needs only a thaw. A
         // resume error is not final: runc state decides (a paused source is not running).
-        // A dump killed midway may leave CRIU's network lock, repaired sockets or
-        // parasite code behind, so that source is deleted even if it runs.
+        // As in AgentENV, an interrupted dump is handled the same way; its own error code
+        // tells the caller, who may delete a source that a killed dump could have degraded.
         if paused { let _ = self.native.resume(&id); }
-        let recovery = if matches!(result, Err("checkpoint_interrupted")) { Err("checkpoint_interrupted") }
-            else { self.active().and_then(|_| self.native.ensure_running(&id)) };
-        if recovery.is_ok() { self.record.state = "running".into(); } else {
-            if recovery == Err("checkpoint_interrupted") { self.record.error = Some("checkpoint_interrupted".into()); }
-            self.delete();
-        }
+        let recovery = self.active().and_then(|_| self.native.ensure_running(&id));
+        if recovery.is_ok() { self.record.state = "running".into(); } else { self.delete(); }
         let cleanup = if stage_owned { self.native.helpers.ensure_healthy().and_then(|_| storage::remove_private(&stage)) } else { Ok(()) };
         // Success means both publication and a running source.
         result.and(recovery).and(cleanup).map(|_| Outcome::Captured(CaptureResult {

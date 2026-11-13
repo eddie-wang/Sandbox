@@ -122,10 +122,13 @@ class RoutingDouble:
     # Start a loopback HTTP server that answers worker status, create, get, exec (blocking and
     # streaming), delete and app-proxy calls for one node ID. The mode selects accept, busy, drop,
     # template, fail or hang behavior for creates; an accepted create can be answered after a delay
-    # (its record counts in the status at once, as a real worker's reservation does).
+    # (its record counts in the status at once, as a real worker's reservation does). The status
+    # reports `vcpus` vCPUs and `max_sandboxes` slots (4 and 8 unless a test changes them); each
+    # record uses one vCPU and 64 MiB.
     def __init__(self, node_id, token):
         self.node_id, self.token = node_id, token
         self.mode, self.ready, self.peer_closed, self.create_delay = "accept", True, False, 0
+        self.vcpus, self.max_sandboxes = 4, 8
         self.create_attempts, self.records, self.calls = [], {}, []
         self.lock = threading.Lock()
         double = self
@@ -260,7 +263,7 @@ class RoutingDouble:
                     if method == "GET" and self.path == "/v1/status":
                         count = sum(r["state"] == "running" for r in double.records.values())
                         return self.reply(200, dict(schema_version=1, node_id=double.node_id, architecture="x86_64", os="linux",
-                            capacity=dict(memory_mib=1024, vcpus=4, max_sandboxes=8, max_concurrent_restores=2),
+                            capacity=dict(memory_mib=1024, vcpus=double.vcpus, max_sandboxes=double.max_sandboxes, max_concurrent_restores=2),
                             usage=dict(memory_mib=64 * count, vcpus=count, sandboxes=count, restores=0),
                             admission_ready=double.ready, runtimes=[dict(runtime="runc_criu", ready=double.ready, reason="routing_test_double")],
                             cpu_overcommit=1, qualification="unvalidated"))
@@ -819,8 +822,31 @@ command_timeout_seconds = 10
                 split = {double.node_id: len(double.records) for double in spreading}
                 print("spread of 8 simultaneous creates:", split)
                 assert all(3 <= count <= 5 for count in split.values()), f"simultaneous creates were not spread: {split}"
-                stop(spread)
                 print("PASS 8 simultaneous creates split across two equal workers (in-flight placements counted, round-robin ties)")
+
+                # Return the spreading controller's view of one node's status.
+                def spread_status(node_id):
+                    nodes = expect(request(spread_port, "/v1/status", controller_token), 200)["nodes"]
+                    return next(n for n in nodes if n["node_id"] == node_id)["status"]
+
+                # A node with exactly one free slot while one create is still in flight is still
+                # offered: its polled usage already counts that create, so the controller's own entry
+                # for it only orders nodes and must not cause a false no_capacity.
+                tight = spreading[0]
+                spreading[1].ready = False
+                tight.max_sandboxes = tight.vcpus = len(tight.records) + 2
+                tight.create_delay = 1.5
+                eventually(lambda: not spread_status("spread-b")["admission_ready"] and spread_status("spread-a")["capacity"]["max_sandboxes"] == tight.max_sandboxes)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    in_flight = pool.submit(request, spread_port, "/v1/sandboxes", controller_token, light, "POST", timeout=10)
+                    eventually(lambda: spread_status("spread-a")["usage"]["sandboxes"] == tight.max_sandboxes - 1, timeout=1)
+                    assert not in_flight.done(), "the in-flight create was answered before the next one was placed"
+                    code, body = request(spread_port, "/v1/sandboxes", controller_token, light, "POST", timeout=10)
+                    assert code == 201 and body["sandbox_id"].startswith("spread-a."), f"last free slot was not offered: {code} {body}"
+                    assert in_flight.result(timeout=10)[0] == 201
+                assert len(tight.records) == tight.max_sandboxes
+                stop(spread)
+                print("PASS a node with one free slot and one in-flight create is still offered (no false no_capacity)")
             finally:
                 for double in doubles:
                     double.close()

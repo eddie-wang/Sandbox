@@ -34,7 +34,7 @@ fn failure(code: &'static str) -> ApiError {
         "resources_required" => (StatusCode::UNPROCESSABLE_ENTITY, "Template declares no default memory_mib/vcpus; supply them"),
         "template_already_exists" => (StatusCode::CONFLICT, "Capture rejected before checkpoint; the source keeps running"),
         "template_layer_limit" => (StatusCode::CONFLICT, "Source template already has the maximum sealed layers; capture rejected before checkpoint, the source keeps running"),
-        "checkpoint_interrupted" => (StatusCode::INTERNAL_SERVER_ERROR, "Checkpoint was stopped at its deadline; the source state was uncertain, so it was deleted"),
+        "checkpoint_interrupted" => (StatusCode::INTERNAL_SERVER_ERROR, "Checkpoint was stopped at its deadline or output limit; nothing was published. The source was thawed and kept only if still running; read sandbox state"),
         "service_port_not_authorized" => (StatusCode::FORBIDDEN, "Port is not an approved service port of this sandbox"),
         "busy" => (StatusCode::SERVICE_UNAVAILABLE, "Operation pool, restore slots or command limit are busy; nothing was started"),
         "admission_exhausted" => (StatusCode::SERVICE_UNAVAILABLE, "Worker capacity is exhausted; nothing was started or recorded"),

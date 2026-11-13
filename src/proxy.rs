@@ -228,9 +228,9 @@ async fn namespace_socket(netns: PathBuf) -> Option<OwnedFd> {
 // namespace `netns`, sending `app` (path and query) with Host set to the guest address and without
 // the Authorization header. Stream both bodies; a 101 answer to an upgrade request becomes a byte
 // tunnel. The idle timeout covers the response head, both bodies and the tunnel; `stop` (sandbox
-// deletion or expiry) ends the exchange at every step, including while it is still connecting or
-// waiting for the head, so a pooled slot never carries it to the slot's next sandbox; `permit` is
-// held until it ends.
+// deletion or expiry) ends the exchange while it is connecting, waiting for the head or tunnelling,
+// and a body at its next read, so a pooled slot never carries it to the slot's next sandbox; `permit`
+// is held until it ends.
 pub async fn to_sandbox(netns: PathBuf, port: u16, app: String, mut request: Request, idle: Duration, stop: watch::Receiver<()>, permit: OwnedSemaphorePermit) -> Response {
     let upgrade = upgrade_requested(request.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));

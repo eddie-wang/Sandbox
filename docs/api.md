@@ -30,16 +30,19 @@ infrastructure.
 ## Placement, IDs and blocking operations
 
 Clients talk only to the controller and never choose or need to know nodes. For
-create, the controller ranks every fresh, ready worker by advisory reserved load
-(least projected memory/vCPU/slot load, then fewer active restores, then round-robin
-between equal scores, as AgentENV's scheduler takes turns), generates the sandbox ID
-and forwards the create. The projected load adds the controller's own creates that
-are still in flight or were answered after the worker's last polled status (their
-requested memory, vCPUs and one slot each); an entry is dropped once a poll sent
-after the answer counts it, when the node refused before reserving anything, or
-after the freshness window. Creates sent at the same moment therefore spread over
-equal workers instead of all landing on the first one. This view is advisory (it can
-briefly count a create twice) and holds at most 4,096 entries; worker admission
+create, the controller offers every fresh, ready worker whose last polled usage
+leaves room for the request, ranked by advisory projected load (least projected
+memory/vCPU/slot load, then fewer active restores, then round-robin between equal
+scores, as AgentENV's scheduler takes turns), generates the sandbox ID and forwards
+the create. The projected load adds the controller's own creates that are still in
+flight or were answered after the worker's last polled status (their requested
+memory, vCPUs and one slot each); an entry is dropped once a poll sent after the
+answer counts it, when the node refused before reserving anything, or after the
+freshness window. Creates sent at the same moment therefore spread over equal
+workers instead of all landing on the first one. These entries only order the
+workers: the room check uses polled usage alone, because a poll taken while a create
+is in flight already counts it, so a worker with one free slot is still offered
+(no false `no_capacity`). The table holds at most 4,096 entries; worker admission
 stays final. The controller does not read
 templates: a worker without a valid, compatible template answers before creating
 anything. IDs are currently `<node_id>.<32 hex>`; treat them as **opaque**. The owner
@@ -273,12 +276,14 @@ manifest. The source is unavailable only from the pause to the resume (the real-
 gate reports the cgroup-freezer time and the longest gap a client saw, which is
 somewhat longer because CRIU briefly thaws the cgroup while the tasks stay stopped;
 both grow with the upper's size and the process memory); clients connecting
-meanwhile wait and are served after the thaw. On an ordinary failure the source is
-thawed and stays running if runc reports it running (`500 checkpoint_failed`); a
-source that stays frozen or was cancelled/expired is deleted, and so is one whose
-CRIU dump was stopped at its command deadline (`500 checkpoint_interrupted`, record
-error `checkpoint_interrupted`), because a killed dump can leave CRIU's network lock,
-repaired sockets or parasite code behind. A source template that already has 16
+meanwhile wait and are served after the thaw. On a failure the source is thawed and
+stays running if runc reports it running, as in AgentENV (`500 checkpoint_failed`).
+A `runc checkpoint` stopped at its command deadline or 64 KiB output limit is
+handled the same way but answers `500 checkpoint_interrupted`, so callers can tell:
+a dump killed midway may leave CRIU's network lock, repaired sockets or parasite code
+in a source that still runs, and a caller may delete it. A source that stays frozen,
+is not running after the thaw, or was cancelled/expired is deleted. A source
+template that already has 16
 sealed layers is refused before the pause (`409 template_layer_limit`; the source
 keeps running). Failure publishes no template.
 Established connections, including outbound ones, do not block capture. Loopback
@@ -413,8 +418,8 @@ limit, 422 template unavailable or resource rules, 500 failed operation or
 unavailability, busy or capacity, 504 outcome wait or proxy idle timeout expired.
 Proxied applications return their own statuses, which pass through unchanged.
 Failed operations name a static code; read the sandbox state afterward, because a
-capture that leaves the source frozen or whose dump was interrupted, or a command
-whose resource group cannot be emptied, terminates the sandbox. A 65th concurrent
+capture that leaves the source frozen or not running, or a command whose resource
+group cannot be emptied, terminates the sandbox. A 65th concurrent
 DELETE of one sandbox (or kill of one command) gets `503 busy` with a message saying
 too many requests already wait for it.
 

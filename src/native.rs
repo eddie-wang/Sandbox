@@ -546,8 +546,8 @@ impl Native {
     // Checkpoint the paused source through runc and leave it running afterwards. Save process images,
     // established TCP connections, external Unix sockets and file locks, with the network locked during
     // the dump; skip connections not yet accepted, and allow uprobes mappings only when the caller found
-    // some. A dump stopped at its deadline or output limit is `checkpoint_interrupted` (the source's
-    // state is then uncertain); any other failure is `checkpoint_failed`.
+    // some. A dump stopped at its deadline or output limit is `checkpoint_interrupted` (the caller then
+    // knows a killed dump may have left the source degraded); any other failure is `checkpoint_failed`.
     pub fn checkpoint(&self, id: &str, images: &Path, allow_uprobes: bool) -> Result<()> {
         // Clients that connect while the source is frozen sit unaccepted in a listen
         // backlog, which CRIU otherwise refuses to dump. The running source still
@@ -658,11 +658,12 @@ impl Native {
     }
 }
 
-// One restore's exclusive turn on a checkpoint cache key. Waiting releases the set's lock, so no lock
-// is held while another restore unpacks; dropping the turn wakes the waiters.
+// One job's exclusive turn on a key: a checkpoint cache key (restores unpacking it), a layer digest
+// (creates hashing it) or the verified-state write. Waiting releases the set's lock, so no lock is
+// held while the holder works; dropping the turn wakes the waiters.
 struct KeyTurn<'a> { keys: &'a Mutex<BTreeSet<String>>, changed: &'a Condvar, key: String }
 impl<'a> KeyTurn<'a> {
-    // Wait until no other restore holds this key, then claim it.
+    // Wait until no other job holds this key, then claim it.
     fn take(keys: &'a Mutex<BTreeSet<String>>, changed: &'a Condvar, key: &str) -> Self {
         let mut busy = keys.lock().unwrap_or_else(PoisonError::into_inner);
         while busy.contains(key) { busy = changed.wait(busy).unwrap_or_else(PoisonError::into_inner); }
@@ -671,7 +672,7 @@ impl<'a> KeyTurn<'a> {
     }
 }
 impl Drop for KeyTurn<'_> {
-    // Release the key, even after a failure or panic, and wake restores waiting for it.
+    // Release the key, even after a failure or panic, and wake the jobs waiting for it.
     fn drop(&mut self) {
         self.keys.lock().unwrap_or_else(PoisonError::into_inner).remove(&self.key);
         self.changed.notify_all();

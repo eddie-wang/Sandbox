@@ -121,9 +121,10 @@ def write_template(root, manifest):
 
 
 # Run the privileged gate on fixture templates through a real worker and controller: creates, execs
-# and bounds, rejections, disconnects, DELETE waits, captures (failed, interrupted, chained), warm
-# restores, layer verification across restarts, TTL and crash cleanup; --network adds policy
-# networking and the app proxy. Retain the root and observations; require no owned state to remain.
+# and bounds, rejections, disconnects, DELETE waits, captures (failed, interrupted, dead source,
+# chained), warm restores, layer verification across restarts, TTL and crash cleanup; --network adds
+# policy networking and the app proxy. Retain the root and observations; require no owned state to
+# remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -860,13 +861,17 @@ url = "http://127.0.0.1:{worker_port}"
         execute(source, "unlink", "hold-uffd")
         eventually(lambda: uffd_status().startswith("released"), timeout=10)
         observations["failed_checkpoint_keeps_source_running"] = True
-        # A dump stopped at its deadline leaves the source in an uncertain state, so it is deleted rather
-        # than kept. The test stops the `runc checkpoint` helper (SIGSTOP) as soon as it appears; the
-        # worker kills it at the 30 s command deadline.
-        doomed = create()
+        # A dump stopped at its deadline is reported as `checkpoint_interrupted`, and (as in
+        # AgentENV) the source is thawed and kept because it still runs. The test stops the
+        # `runc checkpoint` helper (SIGSTOP) as soon as it appears; the worker kills it at the 30 s
+        # command deadline. A source that is not running after a failed capture is deleted: the test
+        # stops the helper again, kills the sandbox's processes, then lets the helper continue so
+        # the dump fails.
         stopped = {}
-        # Find this sandbox's runc checkpoint process among the worker's helpers and stop it.
-        def stop_checkpoint():
+        # Find the sandbox's runc checkpoint process among the worker's helpers and stop it. With
+        # `kill_source`, also kill every process of the sandbox, wait until none is left, then let
+        # the helper continue.
+        def stop_checkpoint(sandbox, kill_source):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 for procs in helpers.glob("command-*/cgroup.procs"):
@@ -879,24 +884,44 @@ url = "http://127.0.0.1:{worker_port}"
                             argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
                         except OSError:
                             continue
-                        if b"checkpoint" in argv and doomed.encode() in argv:
+                        if b"checkpoint" in argv and sandbox.encode() in argv:
                             os.kill(int(pid), signal.SIGSTOP)
-                            stopped["pid"] = int(pid)
+                            stopped[sandbox] = int(pid)
+                            if kill_source:
+                                (cgroup / sandbox / "cgroup.kill").write_text("1")
+                                eventually(lambda: "populated 0" in (cgroup / sandbox / "cgroup.events").read_text(), timeout=10)
+                                os.kill(int(pid), signal.SIGCONT)
                             return
                 time.sleep(0.001)
-        stopper = threading.Thread(target=stop_checkpoint, daemon=True)
-        stopper.start()
-        started = time.monotonic()
-        code, interrupted = capture(doomed, "interrupted-dump")
-        interrupted_seconds = time.monotonic() - started
-        stopper.join(timeout=5)
-        assert stopped and code == 500 and interrupted["error"]["code"] == "checkpoint_interrupted", (stopped, code, interrupted)
+        # Capture the sandbox while stop_checkpoint runs on it; require that its helper was found
+        # and nothing was published or left staged. Return the status, body and seconds taken.
+        def stopped_capture(sandbox, template_id, kill_source):
+            stopper = threading.Thread(target=stop_checkpoint, args=(sandbox, kill_source), daemon=True)
+            stopper.start()
+            started = time.monotonic()
+            code, body = capture(sandbox, template_id)
+            seconds = time.monotonic() - started
+            stopper.join(timeout=15)
+            assert sandbox in stopped, "runc checkpoint helper was not found"
+            assert not (root / "templates" / template_id).exists() and not (root / "staging" / template_id).exists()
+            return code, body, seconds
+        kept = create()
+        kept_counter = int(execute(kept, "counter").split()[0])
+        code, interrupted, interrupted_seconds = stopped_capture(kept, "interrupted-dump", False)
+        assert code == 500 and interrupted["error"]["code"] == "checkpoint_interrupted", (code, interrupted)
         assert interrupted_seconds >= 29, interrupted_seconds
-        assert get(doomed)["state"] == "deleted" and get(doomed)["error"] == "checkpoint_interrupted", get(doomed)
-        gone(doomed)
-        assert not (root / "templates" / "interrupted-dump").exists() and not (root / "staging" / "interrupted-dump").exists()
+        assert get(kept)["state"] == "running", get(kept)
+        time.sleep(0.3)
+        assert int(execute(kept, "counter").split()[0]) > kept_counter
+        remove(kept)
+        dead = create()
+        code, failed_dead, dead_seconds = stopped_capture(dead, "dead-source", True)
+        assert code == 500 and failed_dead["error"]["code"] == "checkpoint_failed", (code, failed_dead)
+        assert get(dead)["state"] == "deleted", get(dead)
+        gone(dead)
         assert get(source)["state"] == "running" and get(isolated)["state"] == "running"
-        observations["interrupted_checkpoint_deletes_source"] = dict(stopped_pid=stopped["pid"], capture_s=round(interrupted_seconds, 3))
+        observations["interrupted_checkpoint_keeps_running_source"] = dict(stopped_pid=stopped[kept], capture_s=round(interrupted_seconds, 3))
+        observations["failed_capture_deletes_dead_source"] = dict(stopped_pid=stopped[dead], capture_s=round(dead_seconds, 3))
         isolated_nonce = int(execute(isolated, "counter").split()[1])
         # The source keeps running during capture except while frozen (pause to resume).
         stop_watch = threading.Event()
@@ -976,7 +1001,7 @@ url = "http://127.0.0.1:{worker_port}"
         # CRIU only read the shared images while restoring the child.
         assert checkpoint_cache(root, "warm")[1] == warm_cache_state
         print("PASS capture without stopping the source (stopped only while frozen and dumped), sealed EROFS layer with whiteout/xattr, "
-              "warm restore with established loopback TCP, independent child")
+              "warm restore with established loopback TCP, independent child; an interrupted dump keeps a running source, a dead source is deleted")
         # Chained capture: capturing the warm child seals its own changes as a second layer above the
         # source's; a grandchild restores from that two-layer template.
         captured(child, "chained")
