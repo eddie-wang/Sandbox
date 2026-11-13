@@ -99,10 +99,12 @@ or performance result is claimed. Fork and user-facing pause/resume remain out o
 scope. The worker root needs operator-controlled disk capacity/quota; sandbox disk
 quotas and an automatic artifact retention policy are not implemented.
 
-Capacity qualification remains **two nodes, 10% active and 90% resident idle, under
-a 512 GB budget**. Per-node versus total scope, exact byte count and acceptable
-latency regression must be agreed before any run. Measure full-service memory
-including page cache, p50/p95/p99 end-to-end latency, queueing, failures and teardown;
-functional/isolation/leak gates come first. Example budgets are not capacity claims.
+The planned capacity test uses **two nodes, about 10% active and 90% resident
+idle, below 512 GB per node**. Use a 500,000,000,000-byte hard limit per node for
+headroom and include the whole experiment's memory and charged file cache.
+The acceptable latency regression has not yet been agreed. Report end-to-end
+latency (including queueing and retries), throughput, memory, failures and cleanup.
+Real application and cleanup checks come before load testing; example budgets
+are not measured capacity claims.
 
 Keep tracked examples, workloads and traces generic and public-safe.

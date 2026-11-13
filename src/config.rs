@@ -11,6 +11,25 @@ pub struct ServerConfig {
     pub max_in_flight: usize,
     pub request_timeout_ms: u64,
     pub max_body_bytes: usize,
+    pub application_http: ApplicationHttpLimits,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApplicationHttpLimits {
+    pub max_body_bytes: usize,
+    pub max_response_bytes: u64,
+    pub max_timeout_ms: u64,
+}
+impl Default for ApplicationHttpLimits {
+    fn default() -> Self { Self { max_body_bytes: 8192, max_response_bytes: 65536, max_timeout_ms: 30000 } }
+}
+impl ApplicationHttpLimits {
+    pub fn response_reservation(&self) -> usize { self.max_response_bytes as usize * 6 + 8192 }
+    fn valid(&self) -> bool {
+        (1..=16384).contains(&self.max_body_bytes) && (1..=8388608).contains(&self.max_response_bytes)
+            && (1..=600000).contains(&self.max_timeout_ms)
+    }
 }
 
 impl Default for ServerConfig {
@@ -20,6 +39,7 @@ impl Default for ServerConfig {
             max_in_flight: 64,
             request_timeout_ms: 5_000,
             max_body_bytes: 16_384,
+            application_http: ApplicationHttpLimits::default(),
         }
     }
 }
@@ -28,7 +48,11 @@ impl ServerConfig {
     fn validate(&self) -> Result<(), &'static str> {
         if !(1..=1_024).contains(&self.max_in_flight)
             || !(100..=30_000).contains(&self.request_timeout_ms)
-            || !(256..=65_536).contains(&self.max_body_bytes)
+            || !(256..=131_072).contains(&self.max_body_bytes)
+            || !self.application_http.valid()
+            // Opt-in larger text bodies need room for worst-case JSON escaping.
+            || (self.application_http.max_body_bytes > 8192
+                && self.max_body_bytes < self.application_http.max_body_bytes * 6 + 8192)
         {
             return Err("invalid server limits");
         }
@@ -178,6 +202,8 @@ pub struct NativeConfig {
     pub max_concurrent_operations: usize,
     #[serde(default = "default_retained_output")]
     pub max_retained_output_bytes: usize,
+    #[serde(default = "default_sandbox_retained_output")]
+    pub max_retained_output_per_sandbox_bytes: usize,
     pub max_artifact_bytes: u64,
     pub command_timeout_seconds: u64,
     #[serde(default)]
@@ -209,6 +235,7 @@ impl NetworkConfig {
 }
 
 fn default_retained_output() -> usize { 16777216 }
+fn default_sandbox_retained_output() -> usize { 8388608 }
 fn default_concurrent_operations() -> usize { 16 }
 
 impl NativeConfig {
@@ -229,7 +256,8 @@ impl NativeConfig {
             || !(1..=100000).contains(&self.max_records)
             || !(1..=64).contains(&self.max_operations_per_sandbox)
             || !(1..=64).contains(&self.max_concurrent_operations)
-            || !(1048576..=268435456).contains(&self.max_retained_output_bytes)
+            || !(1048576..=4294967296).contains(&self.max_retained_output_bytes)
+            || !(1048576..=67108864).contains(&self.max_retained_output_per_sandbox_bytes)
             || !(1048576..=1099511627776).contains(&self.max_artifact_bytes)
             || !(10..=300).contains(&self.command_timeout_seconds)
         { return Err("invalid native runtime bounds"); }
@@ -245,6 +273,10 @@ impl WorkerConfig {
         }
         if let Some(native) = &self.native {
             native.validate()?;
+            let reservation = self.server.application_http.response_reservation();
+            if reservation > native.max_retained_output_bytes || reservation > native.max_retained_output_per_sandbox_bytes {
+                return Err("application HTTP response ceiling exceeds retained output budget");
+            }
             if native.network.as_ref().is_some_and(|n| n.addresses.len() < self.capacity.max_sandboxes as usize) { return Err("network slots must cover sandbox capacity"); }
             if self.capacity.max_concurrent_restores as usize > native.max_concurrent_operations {
                 return Err("restore slots must fit the bounded operation pool");

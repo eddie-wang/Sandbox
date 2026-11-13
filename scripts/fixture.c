@@ -34,6 +34,12 @@ static int read_file(const char *path) {
 }
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
+    if (!strcmp(argv[1], "process-group")) {
+        pid_t group = getpgrp();
+        if (group < 0) fail("getpgrp");
+        printf("%ld\n", (long)group);
+        return 0;
+    }
     if (!strcmp(argv[1], "connect") && argc == 5) {
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0) fail("tcp socket");
@@ -118,10 +124,48 @@ int main(int argc, char **argv) {
                 int client = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
                 if (client >= 0) {
                     struct pollfd p = {.fd=client, .events=POLLIN};
-                    char request[16384] = {0};
-                    if (poll(&p, 1, 500) > 0 && read(client, request, sizeof(request)-1) > 0) {
+                    char request[32768] = {0};
+                    size_t received = 0, body_length = 0;
+                    char *headers_end = NULL;
+                    while (received < sizeof(request)-1 && poll(&p, 1, 500) > 0) {
+                        ssize_t count = read(client, request+received, sizeof(request)-1-received);
+                        if (count <= 0) break;
+                        received += (size_t)count;
+                        headers_end = strstr(request, "\r\n\r\n");
+                        if (headers_end) {
+                            char *length = strcasestr(request, "\r\ncontent-length:");
+                            body_length = length ? strtoul(length+17, NULL, 10) : 0;
+                            if (body_length > 16384 || received >= (size_t)(headers_end+4-request)+body_length) break;
+                        }
+                    }
+                    if (received && headers_end) {
                         if (strstr(request, " /slow ")) usleep(500000);
-                        if (strstr(request, " /large ")) {
+                        unsigned long bytes = 0, value = 0, delay = 0;
+                        char *route = strchr(request, ' ');
+                        if (route && sscanf(route, " /delay/%lu", &delay) == 1 && delay <= 31000) usleep((useconds_t)(delay*1000));
+                        if (route && sscanf(route, " /sized/%lu/%lu", &bytes, &value) == 2 && bytes <= 8388609 && value <= 127) {
+                            char chunk[4096]; memset(chunk, (int)value, sizeof(chunk));
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", bytes);
+                            struct timespec transmit_start;
+                            if (clock_gettime(CLOCK_MONOTONIC, &transmit_start)) fail("transmit clock");
+                            for (size_t sent = 0; sent < bytes;) {
+                                size_t left = bytes-sent;
+                                ssize_t count = send(client, chunk, left < sizeof(chunk) ? left : sizeof(chunk), MSG_NOSIGNAL);
+                                if (count < 0 && errno == EINTR) continue;
+                                if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                                    struct timespec now;
+                                    if (clock_gettime(CLOCK_MONOTONIC, &now)) fail("transmit clock");
+                                    struct pollfd writable = {.fd=client, .events=POLLOUT};
+                                    if (now.tv_sec-transmit_start.tv_sec < 10 && poll(&writable, 1, 100) >= 0) continue;
+                                }
+                                if (count <= 0) break;
+                                sent += (size_t)count;
+                            }
+                        } else if (strstr(request, " /body-size ")) {
+                            size_t actual = received-(size_t)(headers_end+4-request);
+                            char body[64]; int length = snprintf(body, sizeof(body), "body_bytes=%zu", actual);
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", length, body);
+                        } else if (strstr(request, " /large ")) {
                             dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: 70000\r\nConnection: close\r\n\r\n");
                         } else if (strstr(request, " /binary ")) {
                             dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n");
@@ -134,9 +178,9 @@ int main(int argc, char **argv) {
                         } else if (strstr(request, " /redirect ")) {
                             dprintf(client, "HTTP/1.1 302 Found\r\nLocation: http://198.18.0.2:18080/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                         } else {
-                            char response[17000];
+                            char response[sizeof(request)+512];
                             int length = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(request), request);
-                            if (length > 0) (void)send(client, response, (size_t)length, MSG_NOSIGNAL);
+                            if (length > 0 && (size_t)length < sizeof(response)) (void)send(client, response, (size_t)length, MSG_NOSIGNAL);
                         }
                     }
                     close(client);
@@ -187,6 +231,15 @@ int main(int argc, char **argv) {
         printf("%llu %llu\n", (unsigned long long)begin.tv_sec * 1000000000 + begin.tv_nsec,
                (unsigned long long)end.tv_sec * 1000000000 + end.tv_nsec);
         return 0;
+    }
+    if (!strcmp(argv[1], "dual-output")) {
+        char out[4096], err[4096]; memset(out, 'o', sizeof(out)); memset(err, 'e', sizeof(err));
+        for (int i=0; i<32; i++) if (write(1, out, sizeof(out)) != sizeof(out) || write(2, err, sizeof(err)) != sizeof(err)) return 1;
+        return 0;
+    }
+    if (!strcmp(argv[1], "flood-both")) {
+        char bytes[4096]; memset(bytes, 'x', sizeof(bytes));
+        for (;;) if (write(1, bytes, sizeof(bytes)) < 0 || write(2, bytes, sizeof(bytes)) < 0) return 0;
     }
     if (!strcmp(argv[1], "hang")) { for (;;) pause(); }
     if (!strcmp(argv[1], "flood")) { char bytes[4096]; memset(bytes, 'x', sizeof(bytes)); for (;;) if (write(1, bytes, sizeof(bytes)) < 0) return 0; }

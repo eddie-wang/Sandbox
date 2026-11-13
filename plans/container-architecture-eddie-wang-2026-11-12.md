@@ -1,195 +1,256 @@
-# Sandbox architecture
+# Sandbox architecture, in plain English
 
-This is the current architecture and qualification status, superseding the networking draft published at `27be407`. The isolated lifecycle baseline was reviewed at `e34616b`; networking/application HTTP subsequently passed independent review and targeted real integration checks, including a path-MTU fix and re-review.
+Sandbox runs tools in Linux containers that can keep their files and running programs between calls. It can also save an initialized container as a template and start independent containers from that saved state.
 
-**Status: experimental implementation with bounded single-host functional evidence, not production isolation, broad application compatibility, cross-node portability or capacity qualification.** Build/check, nonprivileged process smoke, isolated lifecycle, and disposable-topology network/HTTP lifecycle gates passed with runc 1.3.6 and CRIU 4.3. No JVM/Spark workload or two-node capacity result is claimed.
+This document explains the current code, not a future design. **Small, real-container tests have passed on one host. Real application compatibility, two-node operation and capacity are not yet qualified.** It is an experimental service, not a production security guarantee.
 
 ## Motivation/Goals
 
-Build a small container-native service for stateful tool execution without coupling process checkpoints to VM disk/snapshot abstractions.
+An application may need many separate environments for running tools. Starting the application and loading its data from scratch for every environment can be expensive. Keeping a separate copy of every unchanged file is wasteful too.
 
-- Restore independent sandboxes from a warmed filesystem/process template instead of repeating initialization.
-- Share immutable environment/seed files while isolating each sandbox's writes.
-- Execute work concurrently across independent sandboxes without losing admission, cancellation or cleanup ownership.
-- Expose a native `SandboxProvider` integration, bounded commands/application HTTP, and explicitly restricted outbound access.
-- Qualify sustainable capacity on two nodes with 10% actively executing and 90% resident idle, under a 512 GB budget and a specified latency bound. Budget scope, exact units and latency threshold remain open.
+Sandbox aims to:
+
+- Start new environments from an already initialized application.
+- Share unchanged files while keeping each environment's writes private.
+- Run work in several environments at once, without letting a slow one block all the others.
+- Put limits on resource use and reliably clean up when work ends or fails.
+
+A **sandbox** is one container and the resources assigned to it. A **template** is the saved material needed to create one. A template can contain just files and startup instructions, or also a saved running application.
 
 ## Alternatives
 
-- **Adapt a VM-shaped snapshot format — rejected.** Container snapshots should not need dummy memory disks or ignored VM configuration.
-- **OverlayBD and per-container block filesystems — rejected for this implementation.** Shared filesystem mounts and private OverlayFS directories match the selected model. This is not a general claim against block-level CoW.
-- **Additional runtimes/gVisor comparison — rejected for current scope.** Only native Linux containers with runc + CRIU are selected.
-- **One worker-wide blocking executor — rejected.** State ownership can be serialized, but a slow command/restore must not serialize unrelated sandboxes.
-- **Worker-managed global routing/NAT — rejected.** Operators supply bridge/uplink/address pools; workers own their slots and namespace-local filtering/NAT.
-- **S3 transport — deferred by owner.** Current artifacts are node-local and staged explicitly by an administrator. No cloud client or storage-plugin framework is needed now.
+These choices keep the first version small:
+
+| Choice | Decision and reason |
+| --- | --- |
+| Reuse a VM snapshot format | **Rejected.** A container should not need pretend VM disks or unused VM settings. |
+| Give each sandbox its own disk image | **Rejected for this version.** Ordinary private directories are sufficient for its changed files. |
+| Support several container runtimes | **Rejected for this version.** Use runc and CRIU first; no gVisor or runtime-plugin system. |
+| Run all worker operations one at a time | **Rejected.** A slow command in one sandbox should not stop an unrelated sandbox. |
+| Let the worker repair host networking | **Rejected.** An operator prepares the surrounding network; the worker manages only its own sandbox connections. |
+
+S3 transfer is **deferred**, not a prerequisite. An administrator currently places the required template files on each node before they are used.
 
 ## Constraints
 
-- One Rust package and one `sandboxd` binary with controller/worker modes. Scheduling stays inside the controller.
-- No full E2B compatibility, separate scheduling daemon, assignment database, runtime plugin framework, public fork API or user-facing pause/resume API.
-- Authenticated management and explicit administrator runtime enablement. TLS, tenancy/RBAC and Internet-facing connection defenses remain operator concerns.
-- Workloads share the host kernel. Namespace/capability/seccomp/cgroup controls are not a VM-equivalent or fully qualified hostile-code boundary.
-- Filesystem, resource and network policy setup precede untrusted execution. API callers cannot choose host paths, runtime tools, arbitrary upstream URLs or broader-than-operator network permissions.
-- Checkpoint and filesystem delta must represent the same capture. Unknown/incompatible manifests fail closed; old artifacts are not silently upgraded.
-- No unit tests by project preference. Use compile/static checks and real process/runtime integration evidence. All fixtures and public content remain generic.
+- Management requests require authentication. The service does not provide built-in TLS, user accounts or per-user permissions; an operator must supply the appropriate access boundary.
+- A container shares the host's Linux kernel. Its isolation is not the same as a separate virtual machine, and hostile-workload security has not been fully qualified.
+- Resource limits, private files and network restrictions must be in place before application code starts.
+- A saved process and its saved file changes must come from the same capture. The worker rejects missing, damaged or incompatible template files instead of trying to guess how to use them.
+- Every created resource must belong to a saved sandbox record, so the worker can find and clean it up after a restart.
+- API callers cannot supply arbitrary host paths, select host executables or expand the operator's network permissions.
 
 ## Architecture
 
-### Components and ownership
+There is one executable, `sandboxd`, which can run in two roles. The **controller** receives client requests and forwards them to the right node. Each node has a **worker** that owns its containers, checks its resource budget and performs the requested work.
 
 ```text
-Application / SandboxProvider
-             |
-      native HTTP API
-             |
-  Rust controller + scheduler
-    - configured worker origins
-    - bounded status polling/freshness
-    - advisory capacity/compatibility gate
-    - owner-based routing
-             |
-       +-----+-------------------+
-       |                         |
-  Rust worker A             Rust worker B
-    durable records           durable records
-    admission coordinator     admission coordinator
-    bounded operation pool    bounded operation pool
-    EROFS/OverlayFS            EROFS/OverlayFS
-    runc + CRIU                runc + CRIU
-    owned networking           owned networking
-       |                         |
-   containers                 containers
+Application / client
+        |
+        | HTTP requests
+        v
+Controller
+  knows the configured workers
+  checks their recent status
+  forwards to the sandbox's owner
+        |
+        +-------------------------+
+        |                         |
+        v                         v
+Worker on node A            Worker on node B
+  saved records               saved records
+  resource budget             resource budget
+  background work             background work
+        |                         |
+        v                         v
+Containers                  Containers
 ```
 
-**Controller.** Routes to static administrator-configured workers and refreshes their status in a bounded background poller. Currently the client chooses an owner from status and supplies `<node_id>.<local_id>`; the controller checks that owner's advisory eligibility. Automatic owner allocation is not wired into create. An ambiguous create is never silently retried on another worker. Owner-bearing IDs avoid a separate assignment database and preserve routing across controller restarts.
+The controller does not launch containers itself. The worker uses existing Linux tools:
 
-**Worker.** Final admission authority. A coordinator performs short durable transitions/reservations, then a fixed bounded pool runs runtime I/O. One mutation runs per sandbox; different sandboxes overlap. Restore slots, live slots, memory reservations, retained outputs and CPU-overcommit budgets are separate limits. A small mailbox owns shared-lower mount operations without a shared state lock spanning mount I/O.
-
-**Operation ownership.** HTTP cancellation does not abandon accepted work/resources. Caller-chosen IDs make retries observable and idempotent. `202` means durable acceptance, not success; callers poll results/state. Resources are not created before their durable owner exists. These behaviors follow established per-sandbox exclusion, operation-owned work, conditional-transition, retryable-cleanup and artifact-protection patterns without inheriting VM storage assumptions.
-
-### Filesystem and template model
-
-```text
-Node-local immutable artifacts
-  base.erofs  ----> shared read-only mount per digest
-                           |
-                  +--------+--------+
-                  |                 |
-            OverlayFS A       OverlayFS B
-            upper/ work/      upper/ work/
-                  |                 |
-             merged root       merged root
-```
-
-Each template currently references **one EROFS base** containing environment files and optionally seed data. Independently composable base/seed/toolkit layers and a separate seed-volume API are not implemented. Unchanged files from the same mounted lower can share host file-cache pages; process heaps/decoded buffers remain private.
-
-Only the shared EROFS mount uses the standard loop-mount facility. Per-sandbox upper/work directories are ordinary directories on a supported local filesystem: no private ext4 image, OverlayBD or block-device daemon.
-
-A cold template has the base digest and administrator-authored init/configuration. A warm template adds a private-upper archive preserving ownership/xattrs/ACLs/whiteouts, the matching CRIU image set, resource/normalized-OCI requirements, network policy, and architecture/kernel/CPU/runc/CRIU/layout compatibility. Artifact digests/sizes and a manifest digest bind publication.
-
-Capture stops/checkpoints the source, archives its upper in the same role, restores the source, then publishes the complete pair atomically. It is disruptive, not a zero-downtime fork. The upper is not promoted into a new lower. Version matching and the passing open-file/mapping fixture do not prove arbitrary application portability.
-
-Local artifacts are administrator-controlled and retained across source/child deletion/restart. Automatic GC, writable-disk quotas and tombstone pruning are not implemented; operators must bound and monitor storage. S3 is deferred, not an implicit dependency.
-
-### Runtime and recovery
-
-```text
-durable admission/slot reservation
-  -> verify template and acquire shared lower
-  -> prepare private upper/work
-  -> install cgroups and network policy
-  -> runc launch or CRIU restore
-  -> publish running/result state
-```
-
-Workloads use an unprivileged UID/GID, empty capabilities, `no_new_privs`, restricted devices, default-deny seccomp and private PID/mount/network/IPC/UTS/cgroup namespaces. The selected network profile narrowly permits the required IPv4 TCP socket operations; it does not enable all socket families or an allow-all syscall policy.
-
-Commands run through `runc exec` with argv, deadlines/output limits and a private exec child cgroup. Descendants are drained even after successful parent exit; timeout/overflow conservatively terminates the sandbox. Host runtime/storage/HTTP helper processes have separate restart-discoverable helper cgroups and parent-death protection. Restart drains helpers before reconciling their files/mounts; it does not rely only on process groups or a dead worker's timeout loop.
-
-Deletion/TTL kill owned workloads, remove private mounts/network state/files and release admission. Failures stay reserved, observable and retryable. Worker restart terminates/reconciles prior live workloads and fails pending operations rather than adopting arbitrary surviving state or automatically resuming every sandbox.
-
-### Networking: operator uplink, private router slots
-
-```text
-operator-provisioned stable-MAC bridge / gateway
-                         |
-                  unique slot uplink IP
-                         |
-             worker-owned router namespace
-             exact TCP allowlist + local SNAT
-                         |
-                private guest namespace
-                fixed guest-visible IP
-                         |
-                 container application
-```
-
-Operators configure an existing stable-MAC bridge, gateway/prefix, exclusive address pool, allowed literal IPv4 destination/port pairs and application service-port ceiling. Workers durably reserve slots and own guest/router namespaces and veth endpoints. Default-drop rules precede links/untrusted execution. Filtering/SNAT are slot-local; workers do not repair default-host routing, firewall or forwarding settings.
-
-The fixed guest address preserves application-visible layout across independent restores while external slot addresses vary. It **does not clone external TCP peers or NAT/conntrack state**. Capture requires quiescent TCP: active/closing connections are rejected before stopping. Listening sockets and fresh allowed connections were exercised after source recovery and independent restore.
-
-Allowed TCP traffic supports IPv4 path-MTU discovery. Only related fragmentation-needed errors matching the original guest source and an authorized TCP destination/port may return from a downstream router or the slot itself. There is no blanket ICMP/RELATED allowance and no extra workload raw-socket permission. The fix was validated with a DF-marked verified payload over reduced-MTU paths, including a restored child.
-
-No DNS, UDP, IPv6 or domain/CIDR policy is implicit. Fully isolated mode remains default. Egress/service policies are currently **immutable template fields** bounded by operator configuration; create-time endpoint overrides are not implemented. Changing a job's service endpoint therefore requires another approved template. Operators own trusted bridge peers, pool exclusivity and routing beyond the bridge.
-
-See [network details](../docs/network.md) for ordering, namespace ownership, cleanup/restart and capture restrictions.
-
-### Application HTTP
-
-`POST /v1/sandboxes/{id}/http` is a bounded asynchronous/idempotent operation, not a general proxy. After service-port authorization, a tracked same-binary helper enters only the owned router namespace and reaches the fixed guest address. Namespace entry never changes a reusable worker/Tokio thread.
-
-The HTTP/1 client accepts a relative path/query, limited methods, UTF-8 text and only `accept`/`content-type` request headers. It disables redirects/proxies, bounds headers/body/result/deadline and does not forward management credentials. Results contain status, optional content type and UTF-8 body. Binary/streaming/WebSocket support is not implemented.
-
-Controller routing currently carries management and operation results through the controller. Direct worker data-plane access is a possible later optimization, not an implemented path.
-
-### Source map
-
-| Module | Responsibility |
+| Piece | What it does |
 | --- | --- |
-| `src/main.rs`, `config.rs`, `http.rs` | Modes, operator configuration, authentication, bounded HTTP handling |
-| `src/controller.rs`, `scheduler.rs` | Polling, advisory eligibility and stable owner routing |
-| `src/worker.rs`, `model.rs` | Native endpoints and typed contracts |
-| `src/engine.rs` | Durable ownership, admission, operation pool, state transitions/retries |
-| `src/native.rs` | runc/CRIU, OCI, cgroups, mounts and preflight |
-| `src/process.rs` | Bounded subprocesses, verified PATH and helper-cgroup fencing |
-| `src/storage.rs` | Artifacts, filesystem deltas, manifests, integrity/publication |
-| `src/network.rs` | Slot topology, policy, cleanup and HTTP helper |
-| `scripts/smoke.py` | Nonprivileged process integration |
-| `scripts/runtime_smoke.py`, `scripts/fixture.c` | Bounded real lifecycle fixture |
-| `scripts/network_smoke.py` | Disposable network/mount topology and network/HTTP qualification |
+| **runc** | Starts a container or runs another command inside it. |
+| **CRIU** | Saves and restores running processes, including their memory. The worker asks runc to perform these operations. |
+| **EROFS** | Stores the shared, read-only base filesystem in an image. |
+| **OverlayFS** | Makes the shared base and one sandbox's private changes appear as one filesystem. |
+| **Linux resource controls** | Enforce limits on memory, CPU time and the number of processes. These controls are called cgroups. |
+
+### 1. Creating a sandbox
+
+Suppose a client wants to create `node-a.example` from template `example-template`.
+
+1. **The client chooses the owner.** It reads the controller's status and chooses node A. The `node-a` part of the sandbox ID records that choice. Automatic node selection is **not** connected to the create API yet.
+2. **The controller validates the request.** It checks authentication, request fields and the owner's recent status. It checks the requested platform/runtime and whether the owner's reported budget appears to have enough room.
+3. **The controller forwards the request to worker A.** Worker addresses come from administrator configuration, not the caller. The controller uses its separate worker credential.
+4. **Worker A makes the final resource decision.** The controller's information may already be out of date. The worker checks its own reservations, container count and available background-work slots. It saves a record of the request before creating external resources. A rejected resource request can be saved as a failed create without launching anything.
+5. **The client gets an acknowledgement.** `202 Accepted` means the worker saved the request. It does **not** mean the container is running, or even that creation will succeed. The client checks the sandbox's state in subsequent requests.
+6. **Background work checks the template.** It verifies the files and their checksums, platform compatibility, requested limits and network policy. It acquires the shared read-only base mount.
+7. **The worker prepares this sandbox's private environment.** It creates the writable directories, mounts OverlayFS, installs resource limits and any permitted networking, and writes the container's configuration file.
+8. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions.
+9. **The worker verifies the container is running and saves the result.** The client can now observe `running`, or a failure that explains why it did not start.
+
+The status budget counts **resources already promised to sandboxes**, not a live measurement of free host RAM. The controller's check is an early filter; it cannot reserve resources on a worker. For example, two requests can pass the same cached check, but the worker must still prevent them from reserving the same remaining capacity.
+
+### 2. Sharing files without sharing private changes
+
+```text
+One shared EROFS image and read-only mount on the node
+                         |
+              +----------+----------+
+              |                     |
+         OverlayFS A           OverlayFS B
+         private changes A     private changes B
+              |                     |
+         Sandbox A             Sandbox B
+```
+
+Each sandbox reads unchanged files from the shared base. Its own new files and changes go into its private directory. Modifying a base file can cause OverlayFS to copy that file into the private directory. Deleting a base file records a private deletion; it does not remove the file for other sandboxes.
+
+The private directory that stores changes is called `upper`. OverlayFS also needs a private working directory, called `work`. These are ordinary directories, not a disk image per sandbox. The shared EROFS image is mounted through Linux's standard loop-device mechanism.
+
+The current template format references **one base image**. Separate, independently selectable application/data/toolkit layers are not implemented.
+
+**What EROFS adds:** a read-only image format, optional on-disk compression and convenient image-based staging. The main sharing benefit is not unique to EROFS: OverlayFS over a shared ext4/XFS directory could also share base files and cached file pages. That alternative is not implemented here. Compression does not mean an application's working data stays compressed in RAM.
+
+**What is not shared:** private application memory, such as a JVM heap or a Python object's contents. Two containers restored from the same template still have independent process memory.
+
+### 3. Running a command or calling a tool service
+
+There are two different operations:
+
+- **Run a command:** the client submits an argument list such as `["/fixture", "counter"]`. The worker runs it inside the container with `runc exec`. It does not pass the arguments through a host shell. Each exec starts a new command process; state that must survive calls belongs in files or an application already running in the sandbox. The worker collects the exit code and bounded output, saves them, and the client retrieves the result.
+- **Make an application HTTP request:** the client submits an approved service port, a method, a relative path and an optional text body. A worker-controlled helper connects to that sandbox's application. It saves the HTTP status and text response for later retrieval. This does not run `runc exec`, and it is not an arbitrary-URL proxy.
+
+Both use the same request-ID and polling pattern as other background operations. Only one such operation runs in a sandbox at a time, but operations in different sandboxes can run concurrently.
+
+The worker limits how many operations can run at once. Creating/restoring containers and capturing templates have an additional concurrency limit. Slow mounts, commands and file copies run separately from the short checks that reserve resources and update records.
+
+Command timeouts or excessive output cause the **whole sandbox** to be terminated, not just the host-side runc command. Even a successful command has its leftover child processes cleaned up; detached background jobs are not supported by this API. An application HTTP timeout or response-size failure ends that HTTP operation without automatically terminating the sandbox.
+
+### 4. Saving an initialized application and starting a copy
+
+A **cold template** contains the base files and startup instructions. A **warm template** also contains saved process state and the original sandbox's file changes.
+
+Capture works as follows:
+
+1. Check that the requested template name is unused and that the sandbox can be captured.
+2. Reject active or closing TCP connections. Listening sockets are supported, but connections to external services cannot simply be copied.
+3. Ask runc/CRIU to checkpoint the application. **This stops the source application.**
+4. Archive the source's private file changes, including file permissions and records of deleted base files.
+5. Restore the source application from the checkpoint. Do not call it running until recovery succeeds.
+6. Publish the complete template only after source recovery succeeds. It contains the matching process checkpoint, private-file archive, base reference, required configuration and checksums.
+
+Capture therefore interrupts the source briefly; it is not a zero-downtime fork. The saved private changes remain private changes: they are not turned into a replacement base layer.
+
+To create a child, the client makes another create request with a new sandbox ID and the warm template ID. The worker creates new private directories, reconstructs the filesystem and limits, and invokes `runc restore`. Source and child then continue independently.
+
+The worker checks the architecture, kernel, CPU features, runtime versions and required configuration. Successful tests on one machine do not prove a template can be restored on every other machine. A target node must already have the required artifacts; the service does not fetch them from S3.
+
+### 5. Retrying requests and cleaning up
+
+A client supplies an operation ID for commands, application HTTP and capture. Repeating the same ID with the same request refers to the existing operation rather than starting another one; the client still polls for its result. Reusing the ID with different input is an error.
+
+**A lost HTTP response does not cancel work already accepted by the worker.** Read the saved state or retry with the original IDs and input. Do not immediately choose a different node or ID: the original request may already be running. Once a create is confirmed failed, correct the underlying problem and use a new sandbox ID. Deleted and failed IDs are retained and cannot be reused.
+
+This is not an exactly-once guarantee for application side effects. An application may have processed an HTTP request just before the worker crashed, even if no completed result was saved.
+
+Cleanup happens when the client deletes a sandbox, its lifetime expires, or the worker restarts:
+
+- Stop its processes and the worker's associated helper processes.
+- Remove its runtime state, private mounts, network connections and private files.
+- Release its reserved capacity only after cleanup succeeds.
+
+If cleanup fails, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
+
+A separate lifetime monitor can stop an expired sandbox even while a long background operation is running. The requested lifetime starts when the create request is saved, not when application startup finishes.
+
+**Worker restart does not resume or adopt old containers.** It reads the saved records, stops leftover work, marks interrupted operations as failed and cleans up. Host-side helper programs are tracked separately so that a dead worker does not leave an unowned mount or runtime command behind.
+
+### 6. Network access is off unless explicitly allowed
+
+By default, a sandbox has no external network access. An approved template can allow specific **IPv4 addresses and TCP ports**, plus ports on which its own application may receive tool requests.
+
+An operator supplies a bridge, gateway and an address pool reserved for this worker. Each networked sandbox has its own isolated network and a private routing environment that checks traffic before forwarding it. The worker installs the rules before starting the application. It does not repair the host's existing firewall, routes or forwarding settings.
+
+All guests see the same private address inside their separate environments. The address used outside each sandbox is different. Keeping the guest-side address stable helps restore saved applications; it does not copy external connections or the router's connection state.
+
+There is no implicit DNS, UDP, IPv6 or access to the host or sibling sandboxes. The allowed endpoints are fixed in the template and checked against the operator's limits. A create request cannot override them.
+
+Application HTTP is restricted to that sandbox's approved service ports. It does not forward management credentials, follow redirects or accept arbitrary upstream URLs. Its request and result bodies are bounded UTF-8 text; binary responses, streaming and WebSockets are not supported.
+
+Low-level packet rules and the tested fix for paths with smaller packet-size limits are documented in [network details](../docs/network.md).
+
+### Where to look in the code
+
+| File | Plain-English responsibility |
+| --- | --- |
+| [`main.rs`](../src/main.rs) | Chooses controller, worker or read-only preflight mode. |
+| [`config.rs`](../src/config.rs) | Loads and checks administrator settings and credential sources. |
+| [`http.rs`](../src/http.rs) | Checks management authentication and request size/time limits. |
+| [`controller.rs`](../src/controller.rs) | Polls workers, handles client requests and forwards to the owner. |
+| [`scheduler.rs`](../src/scheduler.rs) | Checks candidate-node readiness and budget. Create currently supplies only the caller-selected owner. |
+| [`worker.rs`](../src/worker.rs) | Receives node-local API requests and returns saved state/results. |
+| [`model.rs`](../src/model.rs) | Defines request/status fields and checks valid values. |
+| [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work, expiry and restart cleanup. |
+| [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU. |
+| [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time, and safely writes saved JSON records. |
+| [`storage.rs`](../src/storage.rs) | Checks template files, handles file archives and publishes complete templates. |
+| [`network.rs`](../src/network.rs) | Creates private sandbox networking, applies traffic rules and runs the application HTTP helper. |
+| [`lifecycle.rs`](../src/lifecycle.rs) | Defines the small liveness response. Despite its name, the lifecycle logic is in `engine.rs`. |
 
 ## Interfaces/signatures/headers
 
-Exact fields/bounds are in [API](../docs/api.md), [storage contracts](../docs/contracts.md), [network](../docs/network.md) and [operator validation](../docs/runtime.md).
+The same executable starts either service:
 
-- `sandboxd controller --config <file>`: trusted configuration and separate controller/worker environment/file credentials.
-- `sandboxd worker --config <file>`: explicit native enablement; no automatic package/module/network repair.
-- `sandboxd preflight --config <file>`: read-only prerequisite checks, not certification.
-- `POST /v1/sandboxes`: owner-bearing ID, template ID, `runc_criu`, architecture, memory/vCPU quota and TTL; durable acceptance then polling.
-- `GET/DELETE /v1/sandboxes/{id}`: state or idempotent deletion request.
-- `POST /v1/sandboxes/{id}/exec`: operation ID, argv, deadline/output limit.
-- `POST /v1/sandboxes/{id}/capture`: operation ID and immutable template ID.
-- `POST /v1/sandboxes/{id}/http`: operation ID, permitted port, method, relative path, restricted headers/text and timeout/response limit.
-- `GET /v1/sandboxes/{id}/operations/{operation_id}`: pending/completed/failed result.
-- `[native.network]`: administrator-only bridge, gateway, prefix, addresses, egress and service ports.
-- Manifest schema v2 selects `isolated` or `tcp_allowlist`; exact layout includes `tcp-pmtu-v1`. Incompatible old schemas/layouts are rejected rather than converted implicitly.
+```text
+sandboxd controller --config <controller-config>
+sandboxd worker --config <worker-config>
+sandboxd preflight --config <worker-config>
+```
+
+Preflight only checks prerequisites. It does not install packages, load kernel modules or change host networking. A worker without explicit runtime enablement, or with failed checks, cannot create containers.
+
+The main API operations are:
+
+| Request | Purpose |
+| --- | --- |
+| `GET /v1/status` | Inspect worker budgets/readiness, or the controller's recent observations. |
+| `POST /v1/sandboxes` | Request a new sandbox from a cold or warm template. |
+| `GET /v1/sandboxes/{id}` | Read its state and expiry time. |
+| `POST /v1/sandboxes/{id}/exec` | Request a command inside it. |
+| `POST /v1/sandboxes/{id}/http` | Request an HTTP call to its application. |
+| `POST /v1/sandboxes/{id}/capture` | Save its initialized state as a new template. |
+| `GET /v1/sandboxes/{id}/operations/{operation_id}` | Read an operation's status and result. |
+| `DELETE /v1/sandboxes/{id}` | Request cleanup; poll until it is complete. |
+
+Only `/healthz` is public, and it reports that the service is alive—not that it can run workloads. See the [API reference](../docs/api.md) for exact fields, limits, response states and retry rules.
+
+There is no full E2B-compatible API, public fork/pause/resume API, automatic node assignment, automatic template cleanup, writable-disk quota or deletion of old request records. Operators must monitor disk usage and retained artifacts. The [storage reference](../docs/contracts.md) describes the exact saved-file format.
 
 ## Testing
 
-| Gate | Current evidence |
-| --- | --- |
-| Locked build/check, nonprivileged smoke, C/Python compilation | Passed on the final reviewed source |
-| Isolated cold create, capture/source recovery, independent restore | Passed with tiny fixture on one host |
-| Overlapping operations/captures, atomic admission, retries, TTL/delete, helper/restart cleanup | Passed within bounded fixture scope |
-| Exact TCP destination/port positives and negatives; host/sibling isolation checks | Passed in disposable topology |
-| Application HTTP auth, target/headers, text/bounds/timeouts/redirect handling | Passed in disposable topology |
-| Restored listener/fresh egress, active-TCP capture rejection, retained namespace-FD cleanup retry | Passed in disposable topology |
-| TCP path-MTU discovery, forwarded and slot-generated errors | Before-fix stall reproduced; final cold/restored cases passed with denied-traffic regression checks |
-| Cross-node portability and real application trajectories | Not qualified |
-| Two-node capacity/latency | Not run; budget scope/threshold unresolved |
+### What has passed
 
-Tests were limited to three containers, each 64 MiB / one-vCPU / 64-pids, using an original local static fixture. Network tests created a disposable outer network/mount namespace and local peers; bridge, routing, MTU and nftables changes stayed there. Default-host network inventory was unchanged. Owned processes/mounts/namespaces/loops/cgroups were cleaned; diagnostic artifacts were intentionally retained outside the repository.
+Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linux host, with at most three containers, each limited to 64 MiB, one vCPU and 64 processes. They checked:
 
-This development-host evidence does not certify executable-ancestor/system-library trust, every failure/crash point, arbitrary kernel/CRIU states or hostile-workload containment. No unit tests or capacity claims are substituted for missing integration qualification.
+- Cold startup, private file changes, capture, source recovery and independent restore.
+- Saved open files and memory mappings in that fixture.
+- Concurrent operations in different sandboxes, safe retries, lifetime expiry, deletion and worker-restart cleanup.
+- Allowed and denied TCP connections, application HTTP limits, restored listeners and new connections after restore.
+- Cleanup of test-owned processes, mounts, namespaces, loop devices and resource groups.
 
-Next gate: real application compatibility and explicit artifact staging between two approved nodes. Capacity is a separate test with 10% actually executing (not merely queued), measuring full-service memory including cache, p50/p95/p99 including queueing, throughput, failures and teardown. Keep restore/first-call bursts separate from steady state. **512 GB per node versus combined, exact units and acceptable latency regression remain unresolved.**
+Networking tests ran inside a disposable private network environment; they did not change the default host network. Build checks and a separate nonprivileged API smoke also passed. Detailed instructions and limits are in [runtime validation](../docs/runtime.md).
+
+These results do not prove arbitrary application compatibility, all possible crash cases, hostile-workload containment, complete host/library trust or cross-node restore. No unit tests are used by project preference; small fixture results are not a substitute for real workload testing.
+
+### What the next qualification must establish
+
+First, run a representative real application through startup, tool calls, capture, source recovery and independent restore on both nodes. Only then measure pressure:
+
+- **Two nodes; below 512 GB per node**, not 512 GB combined. Use a 500,000,000,000-byte hard limit per node for headroom, covering the whole experiment and its charged file cache. Report any memory outside that accounting boundary.
+- **16, 32 and 64 live sandboxes across the job**, with the per-node split reported. Keep about 10% actually executing and 90% resident but idle; queued requests do not count as active execution.
+- Compare against a low-contention baseline. Report median, 95th- and 99th-percentile end-to-end latency, including queueing and retries, plus throughput, memory, CPU, errors and cleanup.
+- Measure startup/restore and synchronized tool-call bursts separately from normal steady-state operation.
+
+The acceptable latency regression has not yet been agreed. There is no completed two-node capacity result to report, and no basis yet to declare a particular population supported.

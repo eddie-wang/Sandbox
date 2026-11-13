@@ -83,7 +83,9 @@ Strict JSON fields (unknown fields are rejected):
 
 `compatibility` is emitted by read-only `preflight` and has exactly:
 `architecture`, `kernel`, `cpu_features_sha256`, `runc_version`, `criu_version`,
-`layout`. The OCI network-policy digest annotation is preserved during normalization. `layout` is `erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v2`. The local fixture
+`layout`. The OCI network-policy digest annotation is preserved during normalization. `layout` is `erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v3`. The profile permits the read-only `getpgrp` query needed by ordinary shell startup;
+process-group setters and additional socket families remain denied. Older layout
+fingerprints are incompatible rather than silently reinterpreted. The local fixture
 script demonstrates complete cold publication; do not guess compatibility strings.
 Exact matching deliberately rejects more hosts than might technically work. Version
 matching is necessary, **not sufficient proof of CRIU portability**.
@@ -144,7 +146,9 @@ before exec as well as retained afterward. The mailbox is bounded and short HTTP
 deadlines do not cancel jobs owned by the coordinator.
 Caller-chosen sandbox/operation IDs make ambiguous response retries idempotent.
 Result bytes/counts and tombstones are bounded and retained; no automatic pruning
-can silently reopen an ID for execution.
+can silently reopen an ID for execution. Operations with neither exec nor HTTP output
+consume no retained-output bytes; record/operation limits bound their metadata.
+Present outputs include serialization overhead in both admission and restart accounting.
 
 Network policy and cgroup limits precede runc launch and restore. A slot index is
 reserved in the durable record before network side effects. Unique root/sandbox

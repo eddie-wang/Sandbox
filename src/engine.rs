@@ -42,7 +42,7 @@ pub struct Snapshot {
     cancels: BTreeMap<String, Arc<AtomicBool>>,
 }
 #[derive(Clone)]
-pub struct Handle { pub snapshot: Arc<RwLock<Snapshot>>, pub preflight: Preflight, pub sender: Option<mpsc::SyncSender<Work>> }
+pub struct Handle { pub snapshot: Arc<RwLock<Snapshot>>, pub preflight: Preflight, pub sender: Option<mpsc::SyncSender<Work>>, pub application_http_limits: crate::config::ApplicationHttpLimits }
 pub type Ack = tokio::sync::oneshot::Sender<Result<()>>;
 pub enum Work {
     Create(CreateRequest, Ack), Http(String, HttpRequest, Ack), Exec(String, ExecRequest, Ack), Capture(String, CaptureRequest, Ack), Delete(String, Ack),
@@ -55,7 +55,9 @@ struct Lower { manifest: storage::Manifest, done: mpsc::Sender<Result<()>> }
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 pub fn fingerprint<T: Serialize>(input: &T) -> String { storage::digest(&serde_json::to_vec(input).expect("serialize validated input")) }
 fn output_bytes(record: &Record) -> usize {
-    record.operations.values().map(|o| serde_json::to_vec(&(&o.output, &o.http_output)).map_or(usize::MAX / 2, |v| v.len())).sum()
+    // No-output history is bounded by record/operation counts, not result bytes.
+    record.operations.values().filter(|o| o.output.is_some() || o.http_output.is_some())
+        .map(|o| serde_json::to_vec(&(&o.output, &o.http_output)).map_or(usize::MAX / 2, |v| v.len())).sum()
 }
 
 impl Handle {
@@ -66,7 +68,7 @@ impl Handle {
             runtimes: vec![RuntimeCapability { runtime: Runtime::RuncCriu, ready: false, reason: if enabled { "reconciling" } else if config.native.as_ref().is_some_and(|c| c.enabled) { "preflight_failed" } else { "runtime_disabled" }.into() }],
             cpu_overcommit: config.native.as_ref().map_or(1, |c| c.cpu_overcommit), qualification: "unvalidated".into() };
         let snapshot = Arc::new(RwLock::new(Snapshot { status, records: BTreeMap::new(), cancels: BTreeMap::new() }));
-        if !enabled { return Ok(Self { snapshot, preflight: report, sender: None }); }
+        if !enabled { return Ok(Self { snapshot, preflight: report, sender: None, application_http_limits: config.server.application_http.clone() }); }
         let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
         let mut engine = Engine { native: native.clone(), snapshot: snapshot.clone(), records: BTreeMap::new(), healthy: true,
             pool: Vec::new(), flights: BTreeMap::new(), retry_after: BTreeMap::new(), stopping: None, stop_attempted: BTreeSet::new() };
@@ -153,7 +155,7 @@ impl Handle {
             }
             watchdog_stop.store(true, Ordering::Relaxed);
         }).map_err(|_| "admission_thread_failed")?;
-        Ok(Self { snapshot, preflight: report, sender: Some(tx) })
+        Ok(Self { snapshot, preflight: report, sender: Some(tx), application_http_limits: config.server.application_http.clone() })
     }
 }
 
@@ -260,7 +262,7 @@ impl Engine {
         let reserved = match &action { Action::Exec(r) => r.max_output_bytes as usize * 6 + 4096, Action::Http(r) => r.max_response_bytes as usize * 6 + 8192, _ => 0 };
         if reserved != 0 {
             if self.records.values().map(output_bytes).sum::<usize>() + self.flights.values().map(|f| f.output_bytes).sum::<usize>() + reserved > self.native.config.max_retained_output_bytes
-                || output_bytes(record) + reserved > 8388608 { let _ = ack.send(Err("result_limit")); return; }
+                || output_bytes(record) + reserved > self.native.config.max_retained_output_per_sandbox_bytes { let _ = ack.send(Err("result_limit")); return; }
         }
         let running = record.state == "running" && record.expires_at > now() && !record.delete_requested;
         let record = self.records.get_mut(id).unwrap();
@@ -294,13 +296,19 @@ impl Engine {
         }
     }
     fn reconcile(&mut self) -> Result<()> {
+        let mut retained_bytes = 0usize;
         for entry in fs::read_dir(self.native.root().join("records")).map_err(|_| "record_scan_failed")? {
             let path = entry.map_err(|_| "record_scan_failed")?.path();
             if path.extension().is_some_and(|e| e == "pending") { continue; }
             let id = path.file_stem().and_then(|n| n.to_str()).ok_or("invalid_record_name")?;
             let node = self.snapshot.read().expect("snapshot poisoned").status.node_id.clone();
             if crate::model::sandbox_owner(id) != Some(node.as_str()) || path.extension().is_none_or(|e| e != "json") { return Err("invalid_record_name"); }
-            let r: Record = storage::read_json(&path, 16777216)?;
+            let r: Record = storage::read_json(&path, self.native.config.max_retained_output_per_sandbox_bytes as u64 + 1048576)?;
+            let bytes = output_bytes(&r);
+            retained_bytes = retained_bytes.checked_add(bytes).ok_or("retained_output_limit")?;
+            if bytes > self.native.config.max_retained_output_per_sandbox_bytes || retained_bytes > self.native.config.max_retained_output_bytes {
+                return Err("retained_output_limit");
+            }
             if r.schema_version != 1 || r.request.sandbox_id != id || !r.request.valid() || self.records.len() >= self.native.config.max_records { return Err("invalid_record"); }
             if r.network_slot.is_some_and(|slot| slot >= 256 || (r.reserved() && self.records.values().any(|other| other.reserved() && other.network_slot == Some(slot)))) { return Err("invalid_network_slot_record"); }
             self.records.insert(id.into(), r);

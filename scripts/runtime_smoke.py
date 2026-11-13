@@ -12,22 +12,33 @@ import subprocess
 import tempfile
 import time
 
-from smoke import eventually, expect, port, request
+from functools import partial
+from smoke import eventually, expect, port, request as smoke_request
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
     parser.add_argument("--network", action="store_true", help="Only inside network_smoke.py disposable outer namespace")
+    parser.add_argument("--http-limits", action="store_true", help="Also exercise opt-in large text HTTP and retained results")
     parser.add_argument("--binary", default="target/debug/sandboxd")
     parser.add_argument("--root", required=True, help="Existing trusted directory on ext4/XFS/Btrfs; retained for inspection")
     parser.add_argument("--cgroup-parent", required=True, help="Existing empty delegated domain; cpu memory pids already enabled")
     parser.add_argument("--tools-dir", help="Optional existing administrator-staged trusted tool directory")
     args = parser.parse_args()
+    request = partial(smoke_request, timeout=30 if args.http_limits else 4)
     if not args.allow_privileged_runtime or os.geteuid() != 0:
         parser.error("requires explicit opt-in and administrator execution on an approved host")
     if args.network and os.environ.get("SANDBOX_TEST_OUTER_NETNS") != os.readlink("/proc/self/ns/net"):
         parser.error("network tests require the disposable outer namespace harness")
+    if args.http_limits and not args.network:
+        parser.error("large HTTP qualification requires the disposable network harness")
+    server_limits = ('''request_timeout_ms = 30000
+max_body_bytes = 131072
+[server.application_http]
+max_body_bytes = 16384
+max_response_bytes = 8388608
+max_timeout_ms = 600000''' if args.http_limits else 'request_timeout_ms = 5000')
     binary = str(Path(args.binary).resolve())
     parent = Path(args.root).resolve(strict=True)
     cgroup = Path(args.cgroup_parent).resolve(strict=True)
@@ -46,7 +57,7 @@ def main():
 runtimes = ["runc_criu"]
 [server]
 listen = "127.0.0.1:{worker_port}"
-request_timeout_ms = 5000
+{server_limits}
 [auth]
 env = "SANDBOX_WORKER_TOKEN"
 [capacity]
@@ -64,7 +75,8 @@ pids_max = 64
 max_records = 32
 max_operations_per_sandbox = 64
 max_concurrent_operations = 4
-max_retained_output_bytes = 16777216
+max_retained_output_bytes = {83886080 if args.http_limits else 16777216}
+max_retained_output_per_sandbox_bytes = {67108864 if args.http_limits else 8388608}
 max_artifact_bytes = 67108864
 command_timeout_seconds = 30
 ''')
@@ -82,15 +94,15 @@ service_ports = [8080]
     controller_config = root / "controller.toml"
     controller_config.write_text(f'''[server]
 listen = "127.0.0.1:{controller_port}"
-request_timeout_ms = 5000
+{server_limits}
 [auth]
 env = "SANDBOX_CONTROLLER_TOKEN"
 [worker_auth]
 env = "SANDBOX_WORKER_TOKEN"
 [poll]
 interval_ms = 100
-timeout_ms = 4000
-freshness_ms = 5000
+timeout_ms = {10000 if args.http_limits else 4000}
+freshness_ms = {15000 if args.http_limits else 5000}
 fanout = 1
 [[workers]]
 node_id = "node-smoke"
@@ -245,6 +257,8 @@ url = "http://127.0.0.1:{worker_port}"
         controller = start("controller", controller_config)
         eventually(lambda: expect(request(controller_port, "/v1/status", token), 200)["nodes"][0]["fresh"], timeout=15)
         source = create("source")
+        assert int(execute(source, "process-group")) >= 0
+        observations["read_only_process_group_query"] = True
         isolated = create("source-part")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(execute, source, "delay")
@@ -365,7 +379,7 @@ url = "http://127.0.0.1:{worker_port}"
             assert "authorization:" not in result["body"].lower() and token not in result["body"] and worker_token not in result["body"]
             if full:
                 expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", body=dict(body, operation_id="unauth"), method="POST"), 401, "unauthorized")
-                for changes in [dict(path="http://198.18.0.1/"), dict(path="//198.18.0.1/"), dict(headers={"authorization":"secret"}), dict(body="x"*8193), dict(max_response_bytes=65537)]:
+                for changes in [dict(path="http://198.18.0.1/"), dict(path="//198.18.0.1/"), dict(headers={"authorization":"secret"}), dict(body="x"*(16385 if args.http_limits else 8193)), dict(max_response_bytes=8388609 if args.http_limits else 65537)]:
                     expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", token, dict(body, operation_id="invalid", **changes), "POST"), 400, "invalid_input")
                 assert op(sandbox, "http", dict(body, port=8081), allow_failure=True)["error"] == "service_port_not_authorized"
                 assert op(sandbox, "http", dict(body, path="/redirect"))["http_output"]["status"] == 302
@@ -450,14 +464,18 @@ url = "http://127.0.0.1:{worker_port}"
         state(expiring, "deleted", timeout=15)
         assert not (cgroup / expiring).exists()
         bounded = create("bounded")
+        dual = op(bounded, "exec", dict(argv=["/fixture", "dual-output"], timeout_ms=2000, max_output_bytes=262144))["output"]
+        assert dual["stdout"] == "o"*131072 and dual["stderr"] == "e"*131072
+        observations["exec_both_streams_drained"] = True
         result = op(bounded, "exec", dict(argv=["/fixture", "hang"], timeout_ms=100, max_output_bytes=1024), allow_failure=True)
         assert result["error"] == "exec_deadline_or_output_limit"
         state(bounded, "deleted")
-        flooding = create("flooding")
-        result = op(flooding, "exec", dict(argv=["/fixture", "flood"], timeout_ms=1000, max_output_bytes=128), allow_failure=True)
-        assert result["error"] == "exec_deadline_or_output_limit"
-        assert len(result["output"]["stdout"].encode()) + len(result["output"]["stderr"].encode()) <= 128
-        state(flooding, "deleted")
+        for name, command in [("flooding", "flood"), ("flooding-both", "flood-both")]:
+            flooding = create(name)
+            result = op(flooding, "exec", dict(argv=["/fixture", command], timeout_ms=1000, max_output_bytes=128), allow_failure=True)
+            assert result["error"] == "exec_deadline_or_output_limit"
+            assert len(result["output"]["stdout"].encode()) + len(result["output"]["stderr"].encode()) <= 128
+            state(flooding, "deleted")
         print("PASS configured cgroup limits, namespace separation, deny-all profile, TTL and bounded exec teardown")
         pending = dict(operation_id="restart-pending", argv=["/fixture", "hang"], timeout_ms=60000, max_output_bytes=1024)
         expect(request(worker_port, f"/v1/sandboxes/{source}/exec", worker_token, pending, "POST"), 202)
@@ -520,6 +538,53 @@ url = "http://127.0.0.1:{worker_port}"
             assert interrupted["error"] == "worker_restarted" and not any(helpers.glob("command-*"))
             observations["restart_http_helper_reconciled"] = True
         print("PASS concurrent capture ownership, worker crash/host-helper drain and retained-template restore")
+        if args.http_limits:
+            plain = create("http-plain", ttl=180)
+            escaped = create("http-escaped", ttl=180)
+            large = dict(port=8080, method="GET", path="/sized/8388608/120", timeout_ms=10000, max_response_bytes=8388608)
+            result = op(plain, "http", large, operation="plain-max")["http_output"]
+            assert result["body"] == "x"*8388608
+            result = op(plain, "http", dict(large, method="POST", path="/body-size", body="\u0000"*16384, max_response_bytes=128))["http_output"]
+            assert result["body"] == "body_bytes=16384", "escaped request envelope or body was truncated"
+            assert op(plain, "http", dict(large, path="/sized/8388609/120"), allow_failure=True)["state"] == "failed"
+            expect(request(controller_port, f"/v1/sandboxes/{plain}/http", token, dict(large, operation_id="timeout-over", timeout_ms=600001), "POST"), 400, "invalid_input")
+            # Freeze only this worker's test-owned helper subtree to make the
+            # concurrent worst-case reservation gate deterministic.
+            payload = dict(large, operation_id="escaped-max", path="/sized/8388608/0")
+            (helpers / "cgroup.freeze").write_text("1")
+            try:
+                expect(request(controller_port, f"/v1/sandboxes/{escaped}/http", token, payload, "POST"), 202)
+                eventually(lambda: any("populated 1" in p.read_text() for p in helpers.glob("command-*/cgroup.events")), timeout=10)
+                expect(request(controller_port, f"/v1/sandboxes/{plain}/http", token, dict(large, operation_id="concurrent-retention"), "POST"), 503, "retention_limit")
+            finally:
+                (helpers / "cgroup.freeze").write_text("0")
+            escaped_result = op(escaped, "http", payload, operation="escaped-max")
+            assert escaped_result["http_output"]["body"] == "\u0000"*8388608
+            expect(request(controller_port, f"/v1/sandboxes/{escaped}/http", token, dict(large, operation_id="sandbox-retention"), "POST"), 503, "retention_limit")
+            long_call = op(plain, "http", dict(large, path="/delay/31000", timeout_ms=35000, max_response_bytes=4096))
+            assert long_call["state"] == "complete"
+            worker.terminate(); worker.wait(timeout=30)
+            # Reducing configured retention must fail closed, never silently
+            # drop persisted results or reopen their idempotency IDs.
+            original = worker_config.read_text()
+            worker_config.write_text(original.replace("max_response_bytes = 8388608", "max_response_bytes = 65536").replace("max_retained_output_per_sandbox_bytes = 67108864", "max_retained_output_per_sandbox_bytes = 8388608"))
+            try:
+                lowered = subprocess.run([binary, "worker", "--config", str(worker_config)], env=env, capture_output=True, timeout=20)
+                assert lowered.returncode != 0, "lowered budget adopted an oversized retained record"
+            finally:
+                worker_config.write_text(original)
+            worker = start("worker", worker_config)
+            eventually(lambda: expect(request(controller_port, "/v1/status", token), 200)["nodes"][0]["fresh"], timeout=15)
+            persisted = expect(request(controller_port, f"/v1/sandboxes/{escaped}/operations/escaped-max", token), 200)
+            assert persisted["http_output"]["body"] == "\u0000"*8388608
+            state(plain, "deleted"); state(escaped, "deleted")
+            expiring_http = create("http-ttl", ttl=2)
+            started = time.monotonic()
+            assert op(expiring_http, "http", dict(large, path="/delay/31000", timeout_ms=600000, max_response_bytes=128), allow_failure=True)["state"] == "failed"
+            assert time.monotonic()-started < 10, "HTTP deadline was not clamped to TTL"
+            observations["opt_in_http_limits"] = {"raw_response_bytes":8388608, "escaped_result_bytes":len(json.dumps(persisted).encode()), "request_body_bytes":16384,
+                                                   "concurrent_retention_rejected":True, "persisted_restart":True, "lowered_budget_rejected":True, "ttl_clamped":True}
+            print("PASS opt-in HTTP raw/escaped bounds, long deadline/TTL, conservative retention and persisted-result restart")
     finally:
         if helpers.exists():
             (helpers / "cgroup.freeze").write_text("0")

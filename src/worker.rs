@@ -59,7 +59,7 @@ async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejec
 async fn application_http(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
-    if !request.valid() { return Err(http::invalid_input()); }
+    if !request.valid_for(&handle.application_http_limits) { return Err(http::invalid_input()); }
     let op = request.operation_id.clone();
     submit(&handle, |ack| Work::Http(id.clone(), request, ack)).await?;
     Ok(accepted(id, Some(op)))

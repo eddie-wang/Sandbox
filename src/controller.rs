@@ -39,6 +39,7 @@ struct Controller {
     endpoints: Arc<Vec<WorkerEndpoint>>,
     client: reqwest::Client,
     worker_token: Arc<String>,
+    application_http_limits: crate::config::ApplicationHttpLimits,
 }
 
 impl Controller {
@@ -111,7 +112,7 @@ async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathReject
 async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     let request = http::json(input)?;
-    if !request.valid() { return Err(http::invalid_input()); }
+    if !request.valid_for(&c.application_http_limits) { return Err(http::invalid_input()); }
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
 }
 async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
@@ -139,11 +140,11 @@ async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &st
     let uncertain = || ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_response_unavailable", "Read state or retry the identical identifiers; an operation may already be accepted");
     let mut response = request.send().await.map_err(|_| uncertain())?;
     let status = response.status();
-    const MAX_RESPONSE: usize = 8388608;
-    if response.content_length().is_some_and(|n| n > MAX_RESPONSE as u64) { return Err(uncertain()); }
+    let max_response = c.application_http_limits.response_reservation().max(8388608);
+    if response.content_length().is_some_and(|n| n > max_response as u64) { return Err(uncertain()); }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
-        if bytes.len() + chunk.len() > MAX_RESPONSE { return Err(uncertain()); }
+        if bytes.len() + chunk.len() > max_response { return Err(uncertain()); }
         bytes.extend_from_slice(&chunk);
     }
     let value = serde_json::from_slice(&bytes).map_err(|_| uncertain())?;
@@ -165,6 +166,7 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         }).collect())),
         freshness: Duration::from_millis(config.poll.freshness_ms),
         endpoints: Arc::new(config.workers.clone()), client: client.clone(), worker_token: Arc::new(worker_token),
+        application_http_limits: config.server.application_http.clone(),
     };
     let router = Router::new()
         .route("/healthz", get(|| async { Json(lifecycle::Health { service: "controller", live: true }) }))

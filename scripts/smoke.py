@@ -20,7 +20,7 @@ def port():
         return sock.getsockname()[1]
 
 
-def request(port_number, path, token=None, body=None, method="GET", chunked=False):
+def request(port_number, path, token=None, body=None, method="GET", chunked=False, timeout=4):
     headers = {}
     if token is not None:
         headers["Authorization"] = "Bearer " + token
@@ -28,7 +28,7 @@ def request(port_number, path, token=None, body=None, method="GET", chunked=Fals
         headers["Content-Type"] = "application/json"
         if isinstance(body, dict):
             body = json.dumps(body).encode()
-    connection = http.client.HTTPConnection("127.0.0.1", port_number, timeout=4)
+    connection = http.client.HTTPConnection("127.0.0.1", port_number, timeout=timeout)
     try:
         connection.request(method, path, body=body, headers=headers, encode_chunked=chunked)
         response = connection.getresponse()
@@ -174,6 +174,10 @@ url = "http://127.0.0.1:{second_port}"
             invalid_config("controller", controller_text.replace(f"http://127.0.0.1:{worker_port}", "http://user:password@127.0.0.1/"))
             invalid_config("controller", controller_text.replace("fanout = 2", "fanout = 0"))
             invalid_config("controller", controller_text.replace("[worker_auth]", 'env = "SANDBOX_WORKER_TOKEN"\n[worker_auth]'))
+            for setting in ("max_body_bytes = 16385", "max_response_bytes = 8388609", "max_timeout_ms = 600001", "max_body_bytes = 16384"):
+                # The final case has a valid opt-in body ceiling but insufficient
+                # outer JSON envelope capacity and must also fail at startup.
+                invalid_config("worker", worker_config(worker_port).replace("[auth]", "[server.application_http]\n" + setting + "\n[auth]"))
             print("PASS strict configuration and credential-source validation")
 
             worker = start("worker", worker_config(worker_port))

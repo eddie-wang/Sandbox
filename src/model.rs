@@ -178,10 +178,14 @@ impl HttpRequest {
         valid_id(&self.operation_id) && self.port != 0 && matches!(self.method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
             && self.path.starts_with('/') && !self.path.starts_with("//") && self.path.len() <= 2048
             && self.path.bytes().all(|b| b.is_ascii_graphic() && b != b'\\' && b != b'#')
-            && self.body.len() <= 8192 && (1..=30000).contains(&self.timeout_ms)
-            && (1..=65536).contains(&self.max_response_bytes) && self.headers.len() <= 2
+            && self.body.len() <= 16384 && (1..=600000).contains(&self.timeout_ms)
+            && (1..=8388608).contains(&self.max_response_bytes) && self.headers.len() <= 2
             && self.headers.iter().all(|(k,v)| matches!(k.as_str(), "accept" | "content-type")
                 && v.len() <= 256 && v.bytes().all(|b| (32..127).contains(&b)))
+    }
+    pub fn valid_for(&self, limits: &crate::config::ApplicationHttpLimits) -> bool {
+        self.valid() && self.body.len() <= limits.max_body_bytes && self.max_response_bytes <= limits.max_response_bytes
+            && self.timeout_ms <= limits.max_timeout_ms
     }
 }
 #[derive(Clone, Deserialize, Serialize)]

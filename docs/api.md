@@ -132,8 +132,11 @@ pipes does not permit a background child to escape command cleanup. Background j
 are not a supported exec contract.
 
 Results are retained and authenticated. Worker retained-output budget defaults to
-16 MiB; one sandbox's encoded outputs are capped below 8 MiB. Operation count and
-record count are separately bounded. Commands are not logged; the worker-authored
+16 MiB; one sandbox's encoded outputs default to an 8 MiB ceiling. Explicit native
+configuration can raise the global budget to at most 4 GiB and the per-sandbox
+budget to at most 64 MiB. In-flight worst-case JSON output is reserved before
+acceptance, in addition to retained results. Operation count and record count are
+separately bounded. Commands are not logged; the worker-authored
 process JSON is temporarily stored under the protected private directory. Checkpoint
 artifacts and exec outputs can contain workload secrets: protect the entire root.
 
@@ -201,14 +204,31 @@ only request headers are lowercase `accept` and `content-type`, each at most 256
 printable ASCII bytes. No caller/management Authorization, Host or hop-by-hop header
 is forwarded. The client ignores proxy environment and does not follow redirects.
 
-Body is a UTF-8 JSON string up to 8192 bytes (text/JSON, **not a binary contract**).
-Deadline 1–30,000 ms, additionally clamped to remaining TTL; an owned helper is
-killed/drained within a further one-second startup/exit allowance. Response body
-limit 1–65,536 bytes, UTF-8 only; response headers are checked against 16 KiB and
-only content-type (at most 256 bytes) is returned. Client parsing has its own bounded HTTP/1 buffers.
-The normal management body/retained-result limits still apply. Non-UTF-8, oversized,
-invalid or timed-out responses fail with a static error, never an upstream error
-body. Unlike exec bounds, an HTTP bound failure does not terminate the sandbox.
+By default, body is a UTF-8 JSON string up to 8192 bytes (text/JSON, **not a binary
+contract**), deadline is 1–30,000 ms, and response body limit is 1–65,536 bytes.
+The controller and worker can each explicitly configure `[server.application_http]`
+with `max_body_bytes` up to 16,384, `max_response_bytes` up to 8,388,608, and
+`max_timeout_ms` up to 600,000. Both services enforce their configured ceilings;
+configure them consistently. These are opt-in ceilings, not new defaults.
+
+Every operation deadline remains clamped to remaining TTL; an owned helper is
+killed/drained within a further one-second startup/exit allowance. Increasing this
+application deadline does **not** increase management request deadlines or make
+acceptance synchronous. Responses remain UTF-8 only; headers are checked against
+16 KiB and only content-type (at most 256 bytes) is returned. Client parsing has its
+own bounded HTTP/1 buffers.
+The normal management body/retained-result limits still apply. A 16 KiB text body
+can expand toward 96 KiB inside its JSON request envelope; opt-in body configuration
+requires sufficient `server.max_body_bytes` (128 KiB covers all supported fields).
+The helper's private request file is bounded at 128 KiB. Output admission retains
+its conservative `6 * max_response_bytes + 8192` encoded-byte reservation: an 8 MiB
+raw response can occupy approximately 48 MiB when JSON-escaped. Startup rejects a
+worker whose configured HTTP response ceiling cannot fit either native retained
+budget. Controller forwarding stays bounded by the larger of 8 MiB and its configured
+worst-case HTTP result reservation, not by the long application deadline.
+
+Non-UTF-8, oversized, invalid or timed-out responses fail with a static error, never
+an upstream error body. No response is truncated into a successful result. Unlike exec bounds, an HTTP bound failure does not terminate the sandbox.
 
 Completed operations contain `http_output:{"status":200,"content_type":"text/plain",
 "body":"..."}`; non-2xx and redirects are returned as application statuses, not
@@ -238,8 +258,9 @@ worker rejection is authoritative even if controller usage is stale.
 
 Default HTTP bounds: 64 active requests, 16 KiB body, 5-second body/handler deadline,
 no waiting HTTP admission queue. Full request or lifecycle queues return `503 busy`.
-Worker forwarding responses are capped at 8 MiB; subprocess output/deadlines and
-artifact sizes are independently bounded. Configuration files are capped at 64 KiB.
+Worker forwarding responses default to an 8 MiB cap; the explicitly configured
+application HTTP ceiling can increase this bounded encoded-result allowance.
+Subprocess output/deadlines and artifact sizes are independently bounded. Configuration files are capped at 64 KiB.
 Startup fields are strict; credentials/error bodies are not parser diagnostics.
 
 Static errors use `{"error":{"code":"invalid_input","message":"..."}}`.
@@ -248,7 +269,13 @@ Common statuses: 400 invalid fields/IDs, 401 unauthorized, 404 missing route/res
 owner unavailability, busy, retention or durability failures. An enabled worker can
 return a 202 acceptance followed by a failed resource operation; always poll results.
 
-Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–65,536 bytes.
+Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–131,072 bytes.
+Native output budgets count retained encoded results plus in-flight reservations,
+not anonymous memory alone. Record reads are bounded by the configured per-sandbox
+retained-output ceiling plus 1 MiB of metadata headroom. Lowering output budgets
+below existing records fails startup/reconciliation; it never discards outputs or
+idempotency IDs. Restore the previous budgets to reconcile/clean safely before
+making a compatible configuration change.
 Poll: interval 100–30,000 ms, timeout 100–10,000 ms, freshness 500–60,000 ms and at least
 interval, fanout 1–16, workers at most 128. Capacity: memory/CPU as above, sandbox
 slots 1–1,000,000, restore slots 1–1024 and at most sandbox slots. Native bounds are

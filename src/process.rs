@@ -134,11 +134,13 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
     let start = Instant::now();
     let mut interrupted = false;
     let status = loop {
+        let mut made_progress = false;
         for (pipe, buffer) in [(&mut stdout as &mut dyn Read, &mut out), (&mut stderr as &mut dyn Read, &mut err)] {
             let mut chunk = [0u8; 4096];
             // One bounded batch per iteration, including when output is continuous.
             match pipe.read(&mut chunk) {
                 Ok(n) => {
+                    made_progress |= n != 0;
                     let remaining = limit.saturating_sub(buffer.len());
                     buffer.extend_from_slice(&chunk[..n.min(remaining)]);
                     if n > remaining { interrupted = true; }
@@ -164,7 +166,9 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
             }
             break status;
         }
-        thread::sleep(Duration::from_millis(5));
+        // Check deadline/size after every bounded batch, but do not throttle
+        // available pipe data to one 4 KiB read per five milliseconds.
+        if !made_progress { thread::sleep(Duration::from_millis(5)); }
     };
     // Use a single combined output budget, even though each pipe is drained separately.
     if out.len() + err.len() > limit { interrupted = true; err.truncate(limit.saturating_sub(out.len())); }

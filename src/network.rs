@@ -156,7 +156,9 @@ pub fn tcp_check_helper() -> Result<()> {
     Ok(())
 }
 pub fn http_helper(path: &Path) -> Result<()> {
-    let request: HttpRequest = storage::read_json(path, 65536)?;
+    // Covers the opt-in 16 KiB text body after worst-case JSON escaping,
+    // plus bounded path/headers/operation metadata.
+    let request: HttpRequest = storage::read_json(path, 131072)?;
     if !request.valid() { return Err("invalid_http_request"); }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "http_runtime_failed")?;
     let output = runtime.block_on(async {
