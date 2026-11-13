@@ -36,7 +36,7 @@ pub struct Manifest {
     pub vcpus: Option<u32>,
     pub pids_max: u32,
     pub oci_config_sha256: Option<String>,
-    pub network: String,
+    pub network: crate::model::NetworkPolicy,
     pub uid: u32,
     pub gid: u32,
 }
@@ -116,9 +116,9 @@ pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> R
     digest_file.take(66).read_to_string(&mut expected).map_err(|_| "invalid_manifest_digest")?;
     if !expected.ends_with('\n') || !hex_digest(expected.trim_end()) || artifact(&dir.join("manifest.json"), 65536)?.sha256 != expected.trim_end() { return Err("manifest_digest_mismatch"); }
     let m: Manifest = read_json(&dir.join("manifest.json"), 65536)?;
-    if m.schema_version != 1 || m.template_id != id || !valid_id(&m.generation)
+    if m.schema_version != 2 || m.template_id != id || !valid_id(&m.generation)
         || m.runtime != "runc_criu" || &m.compatibility != compatibility
-        || m.network != "isolated" || m.uid != 65534 || m.gid != 65534
+        || !m.network.valid() || m.uid != 65534 || m.gid != 65534
         || m.upper.is_some() != m.checkpoint.is_some()
         || m.upper.is_some() != m.memory_mib.is_some() || m.upper.is_some() != m.vcpus.is_some()
         || m.upper.is_some() != m.oci_config_sha256.is_some()

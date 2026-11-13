@@ -214,13 +214,18 @@ url = "http://127.0.0.1:{second_port}"
                 execution = {"operation_id": "exec-1", "argv": ["echo", "hello"], "timeout_ms": 1000, "max_output_bytes": 1024}
                 expect(request(number, "/v1/sandboxes/node-a.example/exec", token, execution, "POST"), 503, "runtime_unavailable")
                 expect(request(number, "/v1/sandboxes/node-a.example/exec", token, dict(execution, argv=[]), "POST"), 400, "invalid_input")
+                app_http = {"operation_id":"http-1", "port":8080, "method":"GET", "path":"/", "timeout_ms":1000, "max_response_bytes":4096}
+                expect(request(number, "/v1/sandboxes/node-a.example/http", token, app_http, "POST"), 503, "runtime_unavailable")
+                for changes in [dict(path="http://example.invalid/"), dict(path="//example.invalid/"), dict(headers={"authorization":"not-forwarded"}), dict(port=0), dict(method="CONNECT")]:
+                    expect(request(number, "/v1/sandboxes/node-a.example/http", token, dict(app_http, **changes), "POST"), 400, "invalid_input")
+                expect(request(number, "/v1/sandboxes/node-a.example/http", token, dict(app_http, body="x"*8193), "POST"), 413, "body_too_large")
                 capture = {"operation_id": "capture-1", "template_id": "example", "runtime": "runc_criu"}
                 expect(request(number, "/v1/sandboxes/node-a.example/capture", token, capture, "POST"), 503, "runtime_unavailable")
                 expect(request(number, "/v1/sandboxes/node-a.example/capture", token, dict(capture, runtime="other"), "POST"), 400, "invalid_input")
                 for identifier in ("%FF", "bad%2Fid"):
                     expect(request(number, f"/v1/sandboxes/{identifier}/exec", token, execution, "POST"), 400, "invalid_input")
                     expect(request(number, f"/v1/sandboxes/{identifier}/capture", token, capture, "POST"), 400, "invalid_input")
-            print("PASS strict inputs/identifiers, fixed/chunked body bounds and fail-closed create/exec/capture")
+            print("PASS strict inputs/identifiers, fixed/chunked body bounds and fail-closed create/exec/capture/HTTP")
 
             def concurrent_check(index):
                 number, token = (worker_port, worker_token) if index % 2 else (controller_port, controller_token)

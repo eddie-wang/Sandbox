@@ -18,6 +18,7 @@ from smoke import eventually, expect, port, request
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
+    parser.add_argument("--network", action="store_true", help="Only inside network_smoke.py disposable outer namespace")
     parser.add_argument("--binary", default="target/debug/sandboxd")
     parser.add_argument("--root", required=True, help="Existing trusted directory on ext4/XFS/Btrfs; retained for inspection")
     parser.add_argument("--cgroup-parent", required=True, help="Existing empty delegated domain; cpu memory pids already enabled")
@@ -25,6 +26,8 @@ def main():
     args = parser.parse_args()
     if not args.allow_privileged_runtime or os.geteuid() != 0:
         parser.error("requires explicit opt-in and administrator execution on an approved host")
+    if args.network and os.environ.get("SANDBOX_TEST_OUTER_NETNS") != os.readlink("/proc/self/ns/net"):
+        parser.error("network tests require the disposable outer namespace harness")
     binary = str(Path(args.binary).resolve())
     parent = Path(args.root).resolve(strict=True)
     cgroup = Path(args.cgroup_parent).resolve(strict=True)
@@ -59,11 +62,22 @@ cgroup_parent = {json.dumps(str(cgroup))}
 cpu_overcommit = 3
 pids_max = 64
 max_records = 32
-max_operations_per_sandbox = 32
+max_operations_per_sandbox = 64
 max_concurrent_operations = 4
 max_retained_output_bytes = 16777216
 max_artifact_bytes = 67108864
 command_timeout_seconds = 30
+''')
+    if args.network:
+        with worker_config.open("a") as f:
+            f.write('''
+[native.network]
+bridge = "sb-test-br"
+gateway = "198.18.0.1"
+prefix = 24
+addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
+egress = [{ip="198.18.0.1", port=18080}, {ip="198.19.0.2", port=18080}, {ip="198.19.0.3", port=18080}]
+service_ports = [8080]
 ''')
     controller_config = root / "controller.toml"
     controller_config.write_text(f'''[server]
@@ -106,13 +120,13 @@ url = "http://127.0.0.1:{worker_port}"
     (root / "templates").mkdir(mode=0o700)
     template = root / "templates" / "fixture"
     template.mkdir(mode=0o700)
-    manifest = dict(schema_version=1, template_id="fixture", generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
+    manifest = dict(schema_version=2, template_id="fixture", generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
                     base=dict(sha256=digest, bytes=(root / "layers" / (digest + ".erofs")).stat().st_size), upper=None, checkpoint=None,
-                    init_argv=["/fixture", "init"], memory_mib=None, vcpus=None, pids_max=64, oci_config_sha256=None,
-                    network="isolated", uid=65534, gid=65534)
+                    init_argv=["/fixture", "init-network" if args.network else "init"], memory_mib=None, vcpus=None, pids_max=64, oci_config_sha256=None,
+                    network=({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}), uid=65534, gid=65534)
     (template / "manifest.json").write_text(json.dumps(manifest))
     (template / "manifest.sha256").write_text(hashlib.sha256((template / "manifest.json").read_bytes()).hexdigest() + "\n")
-    for name in ("incompatible", "tampered", "symlinked", "unknown-metadata"):
+    for name in ("incompatible", "tampered", "symlinked", "unknown-metadata") + (("policy-not-authorized", "unsupported-policy", "old-schema") if args.network else ()):
         directory = root / "templates" / name
         directory.mkdir(mode=0o700)
         invalid = json.loads(json.dumps(manifest))
@@ -123,6 +137,12 @@ url = "http://127.0.0.1:{worker_port}"
             invalid["base"]["bytes"] += 1
         if name == "unknown-metadata":
             invalid["unsupported_field"] = True
+        if name == "policy-not-authorized":
+            invalid["network"]["egress"][0]["port"] = 18081
+        if name == "unsupported-policy":
+            invalid["network"]["egress"][0]["protocol"] = "udp"
+        if name == "old-schema":
+            invalid["schema_version"] = 1
         if name == "symlinked":
             (directory / "manifest.json").symlink_to("../fixture/manifest.json")
         else:
@@ -212,7 +232,7 @@ url = "http://127.0.0.1:{worker_port}"
         return result
 
     def execute(sandbox, *argv):
-        return op(sandbox, "exec", dict(argv=["/fixture", *argv], timeout_ms=2000, max_output_bytes=8192))["output"]["stdout"]
+        return op(sandbox, "exec", dict(argv=["/fixture", *argv], timeout_ms=3000, max_output_bytes=8192))["output"]["stdout"]
 
     def remove(sandbox):
         expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, method="DELETE"), 202)
@@ -239,7 +259,7 @@ url = "http://127.0.0.1:{worker_port}"
         observations["same_sandbox_exclusion"] = True
         execute(source, "orphan")
         assert not any(path.is_dir() for path in (cgroup / source).iterdir()), "exec descendants/cgroup survived successful command"
-        for invalid_template, error in (("incompatible", "incompatible_template"), ("tampered", "artifact_digest_mismatch"), ("symlinked", "artifact_unavailable"), ("unknown-metadata", "invalid_record")):
+        for invalid_template, error in (("incompatible", "incompatible_template"), ("tampered", "artifact_digest_mismatch"), ("symlinked", "artifact_unavailable"), ("unknown-metadata", "invalid_record")) + ((("policy-not-authorized", "network_policy_not_authorized"), ("unsupported-policy", "invalid_record"), ("old-schema", "incompatible_template")) if args.network else ()):
             invalid_id = "node-smoke." + invalid_template
             ids.append(invalid_id)
             invalid_request = dict(sandbox_id=invalid_id, template_id=invalid_template, runtime="runc_criu", architecture=compatibility["architecture"], memory_mib=64, vcpus=1, ttl_seconds=120)
@@ -254,7 +274,18 @@ url = "http://127.0.0.1:{worker_port}"
         expect(request(worker_port, "/v1/sandboxes", worker_token, body, "POST"), 202)
         denied = eventually(lambda: get(rejected) if get(rejected)["state"] == "failed" else None)
         assert denied["error"] == "admission_exhausted" and not (cgroup / rejected).exists()
-        remove(third)
+        if args.network:
+            guest = Path(json.loads((root / "private" / third / "config.json").read_text())["linux"]["namespaces"][2]["path"])
+            # A test-owned namespace FD deliberately delays kernel link destruction.
+            # Ownership/reservations must survive failure, then retry after release.
+            with open(guest.with_name(guest.name.replace("-g-", "-s-")), "rb"):
+                expect(request(controller_port, f"/v1/sandboxes/{third}", token, method="DELETE"), 202)
+                eventually(lambda: get(third)["state"] == "cleanup_failed", timeout=15)
+                assert (root / "private" / third / "network-owned").exists()
+            eventually(lambda: get(third)["state"] == "deleted", timeout=15)
+            observations["network_cleanup_retry_after_namespace_fd_release"] = True
+        else:
+            remove(third)
         disconnected = dict(operation_id="disconnected-response", argv=["/fixture", "write", "marker", "once"], timeout_ms=2000, max_output_bytes=1024)
         connection = http.client.HTTPConnection("127.0.0.1", worker_port, timeout=4)
         connection.request("POST", f"/v1/sandboxes/{source}/exec", body=json.dumps(disconnected), headers={"Authorization":"Bearer " + worker_token,"Content-Type":"application/json"})
@@ -276,7 +307,7 @@ url = "http://127.0.0.1:{worker_port}"
         execute(source, "unlink", "removed")
         assert execute(isolated, "read", "copied") == "immutable-base"
         assert execute(isolated, "read", "removed") == "immutable-base"
-        status = execute(source, "isolation")
+        status = execute(source, "network-isolation" if args.network else "isolation")
         assert "CapEff:\t0000000000000000" in status and "NoNewPrivs:\t1" in status and "Seccomp:\t2" in status
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
         assert (cgroup / source / "memory.swap.max").read_text().strip() == "0"
@@ -295,7 +326,65 @@ url = "http://127.0.0.1:{worker_port}"
             observations["namespace_identities"][namespace] = identities
         # Examine links only inside owned netns; never change interfaces/rules.
         links = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "link", "show"], check=True, capture_output=True, timeout=5)
-        assert [link["ifname"] for link in json.loads(links.stdout)] == ["lo"]
+        assert sorted(link["ifname"] for link in json.loads(links.stdout)) == (["eth0", "lo"] if args.network else ["lo"])
+        def network_gate(sandbox, full=False):
+            config_json = json.loads((root / "private" / sandbox / "config.json").read_text())
+            guest = Path(config_json["linux"]["namespaces"][2]["path"]).name
+            slot = guest.replace("-g-", "-s-")
+            observations.setdefault("network_rules", {})[sandbox] = {name: subprocess.check_output(["ip", "netns", "exec", name, "nft", "list", "ruleset"], text=True, timeout=5) for name in [guest, slot]}
+            observations.setdefault("network_links", {})[sandbox] = {name: {what: subprocess.check_output(["ip", "-n", name, "-j", what], text=True, timeout=5) for what in ["address", "route", "neigh"]} for name in [guest, slot]}
+            observations.setdefault("guest_netns_match", {})[sandbox] = [os.readlink(f"/proc/{host_pid(sandbox)}/ns/net"), os.stat("/run/netns/" + guest).st_ino]
+            assert "connected=1" in execute(sandbox, "connect", "198.18.0.1", "18080", "1")
+            for ip, port_number in [("198.18.0.1", "18081"), ("198.18.0.2", "18080"), ("198.18.0.11", "8080")]:
+                assert "connected=0" in execute(sandbox, "connect", ip, port_number, "0")
+            # Black-hole probing must not mask the actual fragmentation-needed path.
+            assert subprocess.check_output(["ip", "netns", "exec", guest, "cat", "/proc/sys/net/ipv4/tcp_mtu_probing"], text=True).strip() == "0"
+            def pmtu_count(chain):
+                data = json.loads(subprocess.check_output(["ip", "netns", "exec", slot, "nft", "-j", "list", "chain", "inet", "sandbox", chain], text=True))
+                return sum(expr["counter"]["packets"] for entry in data["nftables"] for expr in entry.get("rule", {}).get("expr", []) if "counter" in expr)
+            for destination, chain, mtu in [("198.19.0.2", "forward", 1500), ("198.19.0.3", "output", 1280)]:
+                before_packets = pmtu_count(chain)
+                subprocess.run(["ip", "-n", slot, "link", "set", "uplink", "mtu", str(mtu)], check=True, timeout=5)
+                try:
+                    transfer = op(sandbox, "exec", dict(argv=["/fixture", "transfer", destination], timeout_ms=5000, max_output_bytes=1024))["output"]["stdout"].strip()
+                finally:
+                    subprocess.run(["ip", "-n", slot, "link", "set", "uplink", "mtu", "1500"], check=True, timeout=5)
+                after_packets = pmtu_count(chain)
+                assert "bytes=65536" in transfer and "mtu_after=1280" in transfer
+                if full:
+                    assert "mtu_before=1500" in transfer, "test must start without a cached reduced PMTU"
+                if "mtu_before=1500" in transfer:
+                    assert after_packets > before_packets, "necessary ICMP did not traverse the narrow PMTU rule"
+                observations.setdefault("pmtu_transfers", []).append(dict(sandbox=sandbox, destination=destination, chain=chain,
+                    result=transfer, counter_before=before_packets, counter_after=after_packets, blackhole_probing=0))
+            for destination, port_number in [("198.19.0.2", "18081"), ("198.19.0.4", "18080")]:
+                assert "connected=0" in execute(sandbox, "connect", destination, port_number, "0")
+            body = dict(port=8080, method="POST", path="/headers?test=1", headers={"content-type":"text/plain"}, body="request-text", timeout_ms=2000, max_response_bytes=4096)
+            result = op(sandbox, "http", body)["http_output"]
+            assert result["status"] == 200 and "request-text" in result["body"]
+            assert "authorization:" not in result["body"].lower() and token not in result["body"] and worker_token not in result["body"]
+            if full:
+                expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", body=dict(body, operation_id="unauth"), method="POST"), 401, "unauthorized")
+                for changes in [dict(path="http://198.18.0.1/"), dict(path="//198.18.0.1/"), dict(headers={"authorization":"secret"}), dict(body="x"*8193), dict(max_response_bytes=65537)]:
+                    expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", token, dict(body, operation_id="invalid", **changes), "POST"), 400, "invalid_input")
+                assert op(sandbox, "http", dict(body, port=8081), allow_failure=True)["error"] == "service_port_not_authorized"
+                assert op(sandbox, "http", dict(body, path="/redirect"))["http_output"]["status"] == 302
+                for changes in [dict(path="/slow", timeout_ms=50), dict(path="/large", max_response_bytes=128), dict(path="/binary"), dict(path="/headers-large")]:
+                    assert op(sandbox, "http", dict(body, **changes), allow_failure=True)["state"] == "failed"
+                assert get(sandbox)["state"] == "running"
+            return True
+        if args.network:
+            observations["network_and_http_before_capture"] = network_gate(source, True)
+            held = create("held-external")
+            execute(held, "write", "hold-external", "1")
+            time.sleep(0.3)
+            assert execute(held, "read", "holding") == "ready"
+            held_capture = op(held, "capture", dict(template_id="held-invalid", runtime="runc_criu"), allow_failure=True)
+            assert held_capture["error"] == "capture_requires_quiescent_tcp" and get(held)["state"] == "running"
+            observations["established_connection_capture_rejected"] = True
+            remove(held)
+            # Close fixture connections before capture; remote TCP state is not cloned.
+            time.sleep(1)
         before, nonce = map(int, execute(source, "counter").split())
         rejected_capture = op(source, "capture", dict(template_id="fixture", runtime="runc_criu"), allow_failure=True)
         assert rejected_capture["error"] == "template_already_exists" and get(source)["state"] == "running"
@@ -347,6 +436,9 @@ url = "http://127.0.0.1:{worker_port}"
         for sandbox in (source, child):
             assert str(host_pid(sandbox)) in (cgroup / sandbox / "cgroup.procs").read_text().split()
             assert (cgroup / sandbox / "memory.max").read_text().strip() == "67108864"
+        if args.network:
+            observations["restored_listening_socket_and_fresh_egress"] = network_gate(child)
+            observations["source_listening_socket_and_fresh_egress"] = network_gate(source)
         print("PASS cold create, private writes/whiteouts, retained open files/mappings, warm memory nonce, independent restore and source recovery")
         remove(child)
         other_child = create("other-child", "isolated-warm")
@@ -413,6 +505,20 @@ url = "http://127.0.0.1:{worker_port}"
         assert not stage.exists() and not (root / "templates" / "interrupted-warm").exists()
         assert not any(helpers.glob("command-*"))
         observations["restart_host_helper"]["drained_before_ready"] = True
+        if args.network:
+            http_restart = create("http-restart", "warm")
+            (helpers / "cgroup.freeze").write_text("1")
+            payload = dict(operation_id="restart-http", port=8080, method="GET", path="/", timeout_ms=30000, max_response_bytes=4096)
+            expect(request(worker_port, f"/v1/sandboxes/{http_restart}/http", worker_token, payload, "POST"), 202)
+            eventually(lambda: any("populated 1" in p.read_text() for p in helpers.glob("command-*/cgroup.events")), timeout=10)
+            worker.kill()
+            worker.wait(timeout=5)
+            worker = start("worker", worker_config)
+            eventually(lambda: expect(request(controller_port, "/v1/status", token), 200)["nodes"][0]["fresh"], timeout=15)
+            state(http_restart, "deleted")
+            interrupted = expect(request(worker_port, f"/v1/sandboxes/{http_restart}/operations/restart-http", worker_token), 200)
+            assert interrupted["error"] == "worker_restarted" and not any(helpers.glob("command-*"))
+            observations["restart_http_helper_reconciled"] = True
         print("PASS concurrent capture ownership, worker crash/host-helper drain and retained-template restore")
     finally:
         if helpers.exists():
@@ -442,6 +548,9 @@ url = "http://127.0.0.1:{worker_port}"
     assert not any(str(root) in line.split()[4] for line in mountinfo.splitlines()), "owned mounts remain"
     assert not any(path.is_dir() for path in cgroup.iterdir()), "owned workload/helper cgroups remain"
     assert all(not (root / "private" / sandbox).exists() for sandbox in ids), "private state remains"
+    if args.network:
+        assert not any(p.name.startswith("sb-") and p.name != "sb-test-peer" for p in Path("/run/netns").iterdir()), "owned netns remain"
+        assert not any(link["ifname"].startswith("sb") and link["ifname"] not in ("sb-test-br", "sb-pmtu-out") for link in json.loads(subprocess.check_output(["ip", "-j", "link"]))), "owned veth remain"
     for log in root.glob("*.log"):
         assert token.encode() not in log.read_bytes() and worker_token.encode() not in log.read_bytes()
     print("REAL LIFECYCLE SMOKE PASSED on this host only; not a capacity or two-node qualification")

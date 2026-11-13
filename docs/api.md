@@ -50,7 +50,7 @@ payload**. Never invent another ID merely because a response was lost. Work that
 was queued but not durably accepted can disappear on worker crash; retry is safe.
 No external resource is created before its owning durable record exists.
 
-Create is idempotent for the complete original payload. Exec/capture require
+Create is idempotent for the complete original payload. Exec/capture/HTTP require
 `operation_id`; the same ID/kind/payload replays the existing operation, while
 changed input returns `409 idempotency_conflict`. Delete is idempotent. Deleted and
 failed records are retained as tombstones; IDs cannot be reused. Retention limits
@@ -70,6 +70,7 @@ capacity gate even for an existing ID; GET still routes to the owner.
 | `GET /v1/sandboxes/{id}` | State, static error code, absolute Unix `expires_at`, operation summaries |
 | `DELETE /v1/sandboxes/{id}` | Durable deletion request; poll until `deleted` |
 | `POST /v1/sandboxes/{id}/exec` | Durable bounded command operation |
+| `POST /v1/sandboxes/{id}/http` | Durable bounded application HTTP operation (not a management proxy) |
 | `POST /v1/sandboxes/{id}/capture` | Durable warmed-template capture operation |
 | `GET /v1/sandboxes/{id}/operations/{operation_id}` | Pending/complete/failed operation, static error, result/template ID |
 
@@ -150,17 +151,71 @@ state, or failed source recovery, terminates/cleans the source rather than treat
 PID liveness as recovery. Failure before checkpoint leaves the source running;
 after a complete checkpoint the worker attempts source recovery. Capture is
  disruptive, not zero-downtime. The fixture's independent child restore and open-file/
-mapping consistency gate passed; other applications/hosts remain unqualified. There is no per-step pause, fork, S3 or application HTTP operation.
+mapping consistency gate passed; other applications/hosts remain unqualified. There is no per-step pause, fork or S3 operation. Networked capture requires
+quiescent TCP: listening sockets are supported, established/closing connections are
+not a cloning contract. Close application/egress connections before capture. A
+namespace TCP-state precheck rejects active connections before stopping the source;
+CRIU remains authoritative for races and unsupported socket state. External peer
+and slot conntrack/NAT state are never captured.
 
 ### Networking
 
-The only supported policy is `isolated`, authored by the worker/template. There is
-no API network-policy field: egress/destination/port/host-network requests are
-rejected as unknown input. Workloads get their own netns with no external link or
-route, no network capabilities and no socket syscalls. No host firewall rules,
-interfaces, routes or sysctls are changed. CRIU's temporary nftables network locks
-and firewall-state helpers operate inside the owned workload namespace. This does **not** implement a usable egress allowlist or app
-HTTP service, and is not presented as tested isolation without the real gate.
+Create has no caller-authored network field: callers select an immutable template.
+Manifest v2 specifies either `{"mode":"isolated"}` (no links or socket syscalls) or:
+
+```json
+{"mode":"tcp_allowlist","egress":[{"ip":"198.51.100.20","port":8443}],"service_ports":[8080]}
+```
+
+The worker rejects any destination/port or service port outside `[native.network]`
+operator bounds, including on warm restore. At most 64 literal IPv4 TCP entries
+and 16 service ports; no domains, CIDRs, protocols, DNS, UDP, IPv6 or host-network
+policy types. Unsupported/unknown input fails explicitly. The fixed internal
+`192.0.2.0/30`, loopback, link-local, multicast and pool destinations cannot be
+operator egress entries. Other destinations (including host endpoints) require
+explicit operator approval of that exact IP and port. There is no implicit access
+to the host, siblings or their service ports. Necessary IPv4 fragmentation-needed
+control replies are accepted only toward the guest and only when conntrack relates
+them to an authorized TCP destination/port; this does not add an ICMP policy type
+or permit workload ICMP/raw socket creation.
+
+**Current restriction:** policy endpoints are fixed in the immutable template and
+in captured children. Per-create policy subsets are not implemented; publish a
+separate approved template for a different tool-service destination. Selection
+cannot broaden the operator ceiling. See [network architecture](network.md) for
+operator bridge/pool prerequisites and the fixed-address restore boundary.
+
+### Application HTTP
+
+```json
+{"operation_id":"request-1","port":8080,"method":"POST","path":"/tool?mode=small","headers":{"content-type":"application/json"},"body":"{\"input\":\"example\"}","timeout_ms":2000,"max_response_bytes":4096}
+```
+
+`POST /v1/sandboxes/{id}/http` has the same authentication, durable acceptance,
+idempotency, polling and per-sandbox exclusion as exec/capture. It uses worker I/O
+capacity, not long-lived controller proxy connections. Only the selected sandbox's
+fixed guest IP and an explicitly template/operator-approved service port are
+reachable. GET/POST/PUT/DELETE/HEAD, relative absolute-path-form paths up to 2048
+ASCII bytes (optional query), no URL/authority, `//`, backslash or fragment. The
+only request headers are lowercase `accept` and `content-type`, each at most 256
+printable ASCII bytes. No caller/management Authorization, Host or hop-by-hop header
+is forwarded. The client ignores proxy environment and does not follow redirects.
+
+Body is a UTF-8 JSON string up to 8192 bytes (text/JSON, **not a binary contract**).
+Deadline 1–30,000 ms, additionally clamped to remaining TTL; an owned helper is
+killed/drained within a further one-second startup/exit allowance. Response body
+limit 1–65,536 bytes, UTF-8 only; response headers are checked against 16 KiB and
+only content-type (at most 256 bytes) is returned. Client parsing has its own bounded HTTP/1 buffers.
+The normal management body/retained-result limits still apply. Non-UTF-8, oversized,
+invalid or timed-out responses fail with a static error, never an upstream error
+body. Unlike exec bounds, an HTTP bound failure does not terminate the sandbox.
+
+Completed operations contain `http_output:{"status":200,"content_type":"text/plain",
+"body":"..."}`; non-2xx and redirects are returned as application statuses, not
+followed. GET operation responses remain authenticated. A retry of a completed
+ID never sends the application request twice. On worker crash an accepted pending
+request is failed as `worker_restarted`; application side effects may already have
+occurred, so callers must not infer exactly-once remote application semantics.
 
 ## Status and bounds
 

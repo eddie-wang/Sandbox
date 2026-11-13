@@ -1,6 +1,8 @@
 /* Tiny original, static smoke workload; no downloads or application image. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -32,7 +34,58 @@ static int read_file(const char *path) {
 }
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
-    if (!strcmp(argv[1], "init")) {
+    if (!strcmp(argv[1], "connect") && argc == 5) {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (fd < 0) fail("tcp socket");
+        struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons((uint16_t)atoi(argv[3]))};
+        if (inet_pton(AF_INET, argv[2], &a.sin_addr) != 1) return 2;
+        int ok = connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0;
+        if (!ok && errno == EINPROGRESS) {
+            struct pollfd p = {.fd=fd, .events=POLLOUT};
+            if (poll(&p, 1, atoi(argv[4]) ? 1500 : 350) > 0) { int error=0; socklen_t n=sizeof(error); ok = !getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &n) && !error; }
+        }
+        close(fd);
+        printf("connected=%d\n", ok);
+        return ok == atoi(argv[4]) ? 0 : 7;
+    }
+    if (!strcmp(argv[1], "transfer") && argc == 3) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int discover = IP_PMTUDISC_DO;
+        struct timeval timeout = {.tv_sec=3};
+        if (fd < 0 || setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &discover, sizeof(discover))
+            || setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))
+            || setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) fail("transfer socket");
+        struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(18080)};
+        if (inet_pton(AF_INET, argv[2], &a.sin_addr) != 1 || connect(fd, (struct sockaddr *)&a, sizeof(a))) fail("transfer connect");
+        int before=0, after=0; socklen_t size=sizeof(before);
+        if (getsockopt(fd, IPPROTO_IP, IP_MTU, &before, &size)) fail("initial mtu");
+        unsigned char payload[65536];
+        for (size_t i=0; i<sizeof(payload); i++) payload[i]=(unsigned char)(i%251);
+        for (size_t sent=0; sent<sizeof(payload);) {
+            ssize_t n=send(fd, payload+sent, sizeof(payload)-sent, MSG_NOSIGNAL);
+            if (n <= 0) fail("transfer send");
+            sent+=(size_t)n;
+        }
+        char response[8]; size_t received=0;
+        while (received<sizeof(response)) {
+            ssize_t n=recv(fd, response+received, sizeof(response)-received, 0);
+            if (n <= 0) fail("transfer acknowledgement");
+            received+=(size_t)n;
+        }
+        if (memcmp(response, "OK65536\n", sizeof(response))) return 8;
+        if (getsockopt(fd, IPPROTO_IP, IP_MTU, &after, &size)) fail("discovered mtu");
+        close(fd);
+        printf("bytes=65536 mtu_before=%d mtu_after=%d\n", before, after);
+        return after == 1280 ? 0 : 9;
+    }
+    if (!strcmp(argv[1], "init") || !strcmp(argv[1], "init-network")) {
+        int listener = -1;
+        if (!strcmp(argv[1], "init-network")) {
+            listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(8080), .sin_addr={.s_addr=INADDR_ANY}};
+            int one=1;
+            if (listener < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) || bind(listener, (struct sockaddr *)&a, sizeof(a)) || listen(listener, 16)) fail("listen");
+        }
         signal(SIGCHLD, SIG_IGN);
         /* Keep upper and immutable-lower descriptors AND mappings open over
            capture. The counter starts in memory, never from the filesystem. */
@@ -46,13 +99,49 @@ int main(int argc, char **argv) {
         volatile uint64_t count = 0;
         uint64_t nonce;
         if (getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce)) fail("getrandom");
+        int held = -1;
         for (;;) {
+            if (listener >= 0 && held < 0 && !access("/workspace/hold-external", F_OK)) {
+                held = socket(AF_INET, SOCK_STREAM, 0);
+                struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(18080)};
+                if (inet_pton(AF_INET, "198.18.0.1", &a.sin_addr) != 1 || connect(held, (struct sockaddr *)&a, sizeof(a))) fail("held connect");
+                int ready = open("/workspace/holding", O_CREAT | O_WRONLY, 0666);
+                if (ready < 0 || write(ready, "ready", 5) != 5 || close(ready)) fail("held ready");
+            }
             if (*immutable != 's') return 3;
             *mapped = ++count;
             mapped[1] = nonce;
             char line[64];
             int length = snprintf(line, sizeof(line), "%llu %llu\n", (unsigned long long)count, (unsigned long long)nonce);
             if (pwrite(counter, line, (size_t)length, 0) != length || ftruncate(counter, length)) fail("counter");
+            if (listener >= 0) {
+                int client = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
+                if (client >= 0) {
+                    struct pollfd p = {.fd=client, .events=POLLIN};
+                    char request[16384] = {0};
+                    if (poll(&p, 1, 500) > 0 && read(client, request, sizeof(request)-1) > 0) {
+                        if (strstr(request, " /slow ")) usleep(500000);
+                        if (strstr(request, " /large ")) {
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: 70000\r\nConnection: close\r\n\r\n");
+                        } else if (strstr(request, " /binary ")) {
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n");
+                            (void)send(client, "\xff", 1, MSG_NOSIGNAL);
+                        } else if (strstr(request, " /headers-large ")) {
+                            char header[20000]; memset(header, 'a', sizeof(header));
+                            dprintf(client, "HTTP/1.1 200 OK\r\nX-Large: ");
+                            (void)send(client, header, sizeof(header), MSG_NOSIGNAL);
+                            dprintf(client, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        } else if (strstr(request, " /redirect ")) {
+                            dprintf(client, "HTTP/1.1 302 Found\r\nLocation: http://198.18.0.2:18080/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        } else {
+                            char response[17000];
+                            int length = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(request), request);
+                            if (length > 0) (void)send(client, response, (size_t)length, MSG_NOSIGNAL);
+                        }
+                    }
+                    close(client);
+                }
+            }
             usleep(100000);
         }
     }
@@ -71,10 +160,16 @@ int main(int argc, char **argv) {
         if (unlink(path)) fail("unlink");
         return 0;
     }
-    if (!strcmp(argv[1], "isolation")) {
+    if (!strcmp(argv[1], "isolation") || !strcmp(argv[1], "network-isolation")) {
         if (getuid() != 65534 || getgid() != 65534 || getpid() == 1) return 4;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int fd = socket(!strcmp(argv[1], "network-isolation") ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (fd >= 0 || errno != EPERM) return 5;
+        if (!strcmp(argv[1], "network-isolation")) {
+            for (int family=0; family<2; family++) {
+                fd = socket(family ? AF_PACKET : AF_INET, family ? SOCK_RAW : SOCK_DGRAM, 0);
+                if (fd >= 0 || errno != EPERM) return 5;
+            }
+        }
         if (!access("/sys", F_OK) || !access("/dev/nvidia0", F_OK)) return 6;
         return read_file("/proc/self/status");
     }

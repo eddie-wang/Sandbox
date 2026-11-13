@@ -2,8 +2,12 @@
 
 A small Rust controller/scheduler and Linux node worker for stateful tool execution.
 
+**[Current architecture and implementation status](plans/container-architecture-eddie-wang-2026-11-12.md)**
+
 **Status: experimental real-runtime implementation; the bounded native lifecycle
 smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This includes
+IPv4 TCP allowlists and text application HTTP inside a disposable outer test netns,
+restored listening sockets/fresh connections, and the existing lifecycle cases:
 cold create, capture/source recovery, independent warm restore, overlapping commands,
 private writes/whiteouts, idempotent retry, TTL/delete and crash/restart cleanup.
 This is a targeted functional result, **not production isolation, general workload
@@ -47,12 +51,12 @@ RBAC, built-in TLS or Internet-facing connection defense.
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
   65534, empty capabilities, `no_new_privs`, a default-deny seccomp syscall profile
   and cgroup-v2 memory/swap/CPU/pids limits installed before launch.
-- Only **fully isolated, deny-all networking** is implemented: no veth, route,
-  external interface, host networking or network socket syscall. No host firewall
-  or sysctl changes. CRIU uses temporary nftables locks only in the owned netns.
-  Destination/port egress allowlists are **not implemented**;
-  requests cannot enable them. This is deliberately narrower than a general
-  container application profile.
+- Fully isolated networking remains the default. Opt-in immutable templates can
+  use **IPv4 TCP literal destination/port allowlists**, bounded by operator policy.
+  A worker-owned routing namespace per sandbox enforces default-drop nftables
+  rules and SNAT before launch/restore; every guest has the same private address.
+  The operator provisions a stable-MAC bridge, gateway and exclusive address pool.
+  No global firewall, routing or sysctl repair; no DNS, UDP, IPv6 or host-network mode.
 - One durable admission/state coordinator per worker, a fixed bounded pool for
   parallel runtime I/O across sandboxes, per-sandbox exclusion, separate restore
   slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic records,
@@ -75,21 +79,22 @@ RBAC, built-in TLS or Internet-facing connection defense.
 - `runc exec` with argv, bounded output/deadline and durable results. A bound
   violation conservatively terminates the **whole sandbox**, not just its runc
   client. Each exec uses an owned child cgroup and cleans descendants even after
-  a successful parent exit. Application HTTP is a distinct, **unimplemented** interface; there is
-  no arbitrary upstream proxy.
+  a successful parent exit. Application HTTP is a distinct bounded, asynchronous operation: a tracked helper
+  reaches only that sandbox's fixed guest address and template-approved service port.
+  Text-only requests/results, no arbitrary upstream, redirects or management credentials.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting
   unverified running state. Shared layers outlive individual sandboxes.
 
-See [API](docs/api.md), [serialized contracts](docs/contracts.md) and the
+See [network architecture](docs/network.md), [API](docs/api.md), [serialized contracts](docs/contracts.md) and the
 [explicitly privileged qualification recipe](docs/runtime.md). The latter builds
 an original tiny static C fixture locally; it downloads no rootfs and never runs
 from the nonprivileged smoke. No unit tests are added. No license has been selected.
 
 ## Deferred qualification and features
 
-No two-node, S3, application HTTP, egress allowlist, broad application compatibility
+No two-node, S3, broad application compatibility
 or performance result is claimed. Fork and user-facing pause/resume remain out of
 scope. The worker root needs operator-controlled disk capacity/quota; sandbox disk
 quotas and an automatic artifact retention policy are not implemented.

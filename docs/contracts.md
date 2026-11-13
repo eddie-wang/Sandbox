@@ -62,13 +62,13 @@ must provision an appropriately bounded dedicated filesystem/quota and monitor f
 space. A filesystem failure stops admission; old durable ownership still permits
 termination/cleanup.
 
-## Manifest v1
+## Manifest v2
 
 Strict JSON fields (unknown fields are rejected):
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Exactly `1` |
+| `schema_version` | Exactly `2`; v1 is rejected, not silently migrated |
 | `template_id`, `generation` | Validated immutable publication and capture-generation IDs |
 | `runtime` | Exactly `runc_criu` |
 | `compatibility` | Architecture, exact kernel release, SHA-256 of CPU feature string, exact runc and CRIU version output, fixed mount/network/seccomp layout version |
@@ -77,12 +77,13 @@ Strict JSON fields (unknown fields are rejected):
 | `init_argv` | Trusted absolute in-container executable + argv; not an OCI config/host executable |
 | `memory_mib`, `vcpus` | Null cold; exact required resource settings warm |
 | `pids_max` | Exact configured pids limit |
-| `oci_config_sha256` | Null cold; warm SHA-256 of canonical worker-generated OCI JSON, with only private cgroup and CRIU-config paths replaced by fixed reconstruction markers |
-| `network`, `uid`, `gid` | Exactly `isolated`, `65534`, `65534` |
+| `oci_config_sha256` | Null cold; warm SHA-256 of canonical worker-generated OCI JSON, with private cgroup, guest-netns and CRIU-config paths replaced by fixed reconstruction markers |
+| `network` | Strict tagged `isolated` or `tcp_allowlist` policy; see API. Endpoints remain fixed across capture. |
+| `uid`, `gid` | Exactly `65534`, `65534` |
 
 `compatibility` is emitted by read-only `preflight` and has exactly:
 `architecture`, `kernel`, `cpu_features_sha256`, `runc_version`, `criu_version`,
-`layout`. `layout` is `erofs-overlay-upper-v1-isolated-seccomp-v1`. The local fixture
+`layout`. The OCI network-policy digest annotation is preserved during normalization. `layout` is `erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v2`. The local fixture
 script demonstrates complete cold publication; do not guess compatibility strings.
 Exact matching deliberately rejects more hosts than might technically work. Version
 matching is necessary, **not sufficient proof of CRIU portability**.
@@ -108,7 +109,12 @@ asks runc to restore into the new container ID. CRIU runs from host authority, w
 `mntns-compat-mode` and file-lock handling. Cgroup restoration uses runc's target
 cgroup setup with CRIU manage mode `ignore`, not source-cgroup adoption. It does not
 use TCP-established/external-Unix-socket/link-remap options to waive unsupported
-application state. Unlinked open files and broader runtime state may be rejected.
+application state. Unlinked open files and broader runtime state may be rejected. Networked guests
+join a separately reconstructed, worker-pinned external netns with the same guest
+IPv4 address. Listening TCP sockets may restore; active TCP connections must be
+quiesced and are rejected by a precheck/CRIU. Peer and router conntrack state are
+not checkpoint artifacts. Fresh post-restore connections get the child slot's
+independent SNAT identity.
 
 **Directory archives do not preserve host inode numbers.** The implementation keeps
 upper/lower roles stable and relies on the supported runc/CRIU mount/file reopening
@@ -140,11 +146,18 @@ Caller-chosen sandbox/operation IDs make ambiguous response retries idempotent.
 Result bytes/counts and tombstones are bounded and retained; no automatic pruning
 can silently reopen an ID for execution.
 
-Network isolation and cgroup limits precede runc launch. The workload has UID/GID
+Network policy and cgroup limits precede runc launch and restore. A slot index is
+reserved in the durable record before network side effects. Unique root/sandbox
+namespace names, an exclusive private ownership marker and bounded helper cgroups
+cover creation, cancellation and restart; unexplained namespace state fails closed.
+Cleanup retains the reservation/marker on failures, including delayed kernel link
+destruction, and retries without global flushes. See [network details](network.md). The workload has UID/GID
 65534, empty capabilities, no_new_privs, minimal /dev, its own proc/PID/mount/net/IPC/
 UTS/cgroup namespaces and an explicit default-errno seccomp allowlist. Namespace
 creation via clone is filtered; clone3 returns ENOSYS for libc fallback; mount,
-setns/unshare, ptrace, bpf, perf, io_uring and socket operations are not allowed.
+setns/unshare, ptrace, bpf, perf, io_uring are not allowed. Isolated templates still prohibit sockets; the opt-in
+network profile permits only AF_INET/SOCK_STREAM with TCP or protocol zero, plus
+stream operations. IPv6/UDP/raw/packet/netlink/Unix socket creation stays denied.
 Host authority, not workload privilege, performs checkpoints. This profile is
 intentionally narrow and unqualified for general applications.
 

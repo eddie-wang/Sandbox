@@ -2,7 +2,7 @@
 //! Each sandbox has at most one in-flight job. HTTP cancellation never owns jobs.
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path, sync::{Arc, RwLock, mpsc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
-use crate::{config::WorkerConfig, model::{CaptureRequest, CreateRequest, ExecRequest, Runtime, RuntimeCapability, Usage, WorkerStatus}, native::{Native, Preflight}, process::{self, Result}, storage};
+use crate::{config::WorkerConfig, model::{CaptureRequest, CreateRequest, ExecRequest, HttpRequest, Runtime, RuntimeCapability, Usage, WorkerStatus}, native::{Native, Preflight}, process::{self, Result}, storage};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +12,8 @@ pub struct Operation {
     pub state: String,
     pub error: Option<String>,
     pub output: Option<process::Output>,
+    #[serde(default)]
+    pub http_output: Option<crate::model::HttpOutput>,
     pub template_id: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
@@ -24,6 +26,10 @@ pub struct Record {
     pub expires_at: u64,
     #[serde(default)]
     pub delete_requested: bool,
+    #[serde(default)]
+    pub network_slot: Option<usize>,
+    #[serde(default)]
+    pub network_policy: Option<crate::model::NetworkPolicy>,
     pub operations: BTreeMap<String, Operation>,
 }
 impl Record {
@@ -39,17 +45,17 @@ pub struct Snapshot {
 pub struct Handle { pub snapshot: Arc<RwLock<Snapshot>>, pub preflight: Preflight, pub sender: Option<mpsc::SyncSender<Work>> }
 pub type Ack = tokio::sync::oneshot::Sender<Result<()>>;
 pub enum Work {
-    Create(CreateRequest, Ack), Exec(String, ExecRequest, Ack), Capture(String, CaptureRequest, Ack), Delete(String, Ack),
+    Create(CreateRequest, Ack), Http(String, HttpRequest, Ack), Exec(String, ExecRequest, Ack), Capture(String, CaptureRequest, Ack), Delete(String, Ack),
     Complete(usize, Box<Record>), Exited(String), Stop(mpsc::Sender<Result<()>>),
 }
-enum Action { Create, Exec(ExecRequest), Capture(CaptureRequest), Delete }
+enum Action { Create, Http(HttpRequest), Exec(ExecRequest), Capture(CaptureRequest), Delete }
 struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool> }
 struct Flight { slot: usize, restore: bool, output_bytes: usize, template: Option<String>, cancelled: Arc<AtomicBool> }
 struct Lower { manifest: storage::Manifest, done: mpsc::Sender<Result<()>> }
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 pub fn fingerprint<T: Serialize>(input: &T) -> String { storage::digest(&serde_json::to_vec(input).expect("serialize validated input")) }
 fn output_bytes(record: &Record) -> usize {
-    record.operations.values().filter_map(|o| o.output.as_ref()).map(|o| serde_json::to_vec(o).map_or(usize::MAX / 2, |v| v.len())).sum()
+    record.operations.values().map(|o| serde_json::to_vec(&(&o.output, &o.http_output)).map_or(usize::MAX / 2, |v| v.len())).sum()
 }
 
 impl Handle {
@@ -179,7 +185,7 @@ impl Engine {
     fn idle_slot(&self) -> Option<usize> { (0..self.pool.len()).find(|slot| !self.flights.values().any(|f| f.slot == *slot)) }
     fn launch(&mut self, id: &str, action: Action, slot: usize) {
         let restore = matches!(action, Action::Create | Action::Capture(_));
-        let output_bytes = match &action { Action::Exec(r) => r.max_output_bytes as usize * 6 + 4096, _ => 0 };
+        let output_bytes = match &action { Action::Exec(r) => r.max_output_bytes as usize * 6 + 4096, Action::Http(r) => r.max_response_bytes as usize * 6 + 8192, _ => 0 };
         let template = match &action { Action::Capture(r) => Some(r.template_id.clone()), _ => None };
         let cancelled = Arc::new(AtomicBool::new(false));
         self.flights.insert(id.into(), Flight { slot, restore, output_bytes, template, cancelled: cancelled.clone() });
@@ -211,6 +217,7 @@ impl Engine {
         match work {
             Work::Delete(id, ack) => { let result = self.request_delete(&id); let _ = ack.send(result); },
             Work::Create(r, ack) => { if self.healthy { self.create(r, ack); } else { let _ = ack.send(Err("worker_unavailable")); } },
+            Work::Http(id, r, ack) => { if self.healthy { self.operation(&id, Action::Http(r), ack); } else { let _ = ack.send(Err("worker_unavailable")); } },
             Work::Exec(id, r, ack) => { if self.healthy { self.operation(&id, Action::Exec(r), ack); } else { let _ = ack.send(Err("worker_unavailable")); } },
             Work::Capture(id, r, ack) => { if self.healthy { self.operation(&id, Action::Capture(r), ack); } else { let _ = ack.send(Err("worker_unavailable")); } },
             _ => unreachable!(),
@@ -226,15 +233,18 @@ impl Engine {
         let admitted = request.architecture == s.architecture && request.memory_mib <= s.capacity.memory_mib.saturating_sub(u.memory_mib)
             && request.vcpus <= s.capacity.vcpus.saturating_mul(s.cpu_overcommit).saturating_sub(u.vcpus) && u.sandboxes < s.capacity.max_sandboxes;
         if !self.native.resources_absent(&id) { let _ = ack.send(Err("resource_name_conflict")); return; }
+        let network_slot = self.native.config.network.as_ref().and_then(|n| (0..n.addresses.len()).find(|slot| !self.records.values().any(|r| r.reserved() && r.network_slot == Some(*slot))));
+        let admitted = admitted && (self.native.config.network.is_none() || network_slot.is_some());
         let error = if !admitted { Some("admission_exhausted") } else { None };
         self.records.insert(id.clone(), Record { schema_version: 1, expires_at: now() + request.ttl_seconds as u64, request, state: if error.is_none() { "creating" } else { "failed" }.into(),
-            error: error.map(str::to_owned), delete_requested: false, operations: BTreeMap::new() });
+            error: error.map(str::to_owned), delete_requested: false, network_slot, network_policy: None, operations: BTreeMap::new() });
         let saved = self.save(&id);
         if saved.is_ok() && error.is_none() { self.launch(&id, Action::Create, slot); }
         let _ = ack.send(saved);
     }
     fn operation(&mut self, id: &str, action: Action, ack: Ack) {
         let (op_id, hash, kind) = match &action {
+            Action::Http(r) => (r.operation_id.clone(), fingerprint(r), "http"),
             Action::Exec(r) => (r.operation_id.clone(), fingerprint(r), "exec"),
             Action::Capture(r) => (r.operation_id.clone(), fingerprint(r), "capture"), _ => unreachable!(),
         };
@@ -247,15 +257,15 @@ impl Engine {
             let limit = self.snapshot.read().expect("snapshot poisoned").status.capacity.max_concurrent_restores;
             if self.usage().restores >= limit || self.flights.values().any(|f| f.template.as_deref() == Some(&r.template_id)) { let _ = ack.send(Err("busy")); return; }
         }
-        if let Action::Exec(r) = &action {
-            let reserved = r.max_output_bytes as usize * 6 + 4096;
+        let reserved = match &action { Action::Exec(r) => r.max_output_bytes as usize * 6 + 4096, Action::Http(r) => r.max_response_bytes as usize * 6 + 8192, _ => 0 };
+        if reserved != 0 {
             if self.records.values().map(output_bytes).sum::<usize>() + self.flights.values().map(|f| f.output_bytes).sum::<usize>() + reserved > self.native.config.max_retained_output_bytes
                 || output_bytes(record) + reserved > 8388608 { let _ = ack.send(Err("result_limit")); return; }
         }
         let running = record.state == "running" && record.expires_at > now() && !record.delete_requested;
         let record = self.records.get_mut(id).unwrap();
         record.operations.insert(op_id, Operation { fingerprint: hash, kind: kind.into(), state: if running { "pending" } else { "failed" }.into(),
-            error: (!running).then(|| "sandbox_not_running".into()), output: None, template_id: None });
+            error: (!running).then(|| "sandbox_not_running".into()), output: None, http_output: None, template_id: None });
         if running && kind == "capture" { record.state = "capturing".into(); }
         let saved = self.save(id);
         if saved.is_ok() && running { self.launch(id, action, slot); }
@@ -292,8 +302,10 @@ impl Engine {
             if crate::model::sandbox_owner(id) != Some(node.as_str()) || path.extension().is_none_or(|e| e != "json") { return Err("invalid_record_name"); }
             let r: Record = storage::read_json(&path, 16777216)?;
             if r.schema_version != 1 || r.request.sandbox_id != id || !r.request.valid() || self.records.len() >= self.native.config.max_records { return Err("invalid_record"); }
+            if r.network_slot.is_some_and(|slot| slot >= 256 || (r.reserved() && self.records.values().any(|other| other.reserved() && other.network_slot == Some(slot)))) { return Err("invalid_network_slot_record"); }
             self.records.insert(id.into(), r);
         }
+        self.native.verify_network_names(self.records.keys().map(String::as_str))?;
         for name in ["private", "runc"] {
             for entry in fs::read_dir(self.native.root().join(name)).map_err(|_| "private_scan_failed")? {
                 if !entry.map_err(|_| "private_scan_failed")?.file_name().to_str().is_some_and(|id| self.records.contains_key(id)) { return Err("untracked_private_state"); }
@@ -329,7 +341,7 @@ impl Runner<'_> {
         if self.cancelled.load(Ordering::Relaxed) || self.record.expires_at <= now() { Err("sandbox_cancelled_or_expired") } else { Ok(()) }
     }
     fn perform(&mut self, action: Action) {
-        match action { Action::Create => self.create(), Action::Exec(r) => self.exec(r), Action::Capture(r) => self.capture(r), Action::Delete => self.delete() }
+        match action { Action::Create => self.create(), Action::Http(r) => self.http(r), Action::Exec(r) => self.exec(r), Action::Capture(r) => self.capture(r), Action::Delete => self.delete() }
     }
     fn delete(&mut self) {
         let result = self.native.cleanup(&self.record.request.sandbox_id, &self.record.exec_operations());
@@ -340,11 +352,12 @@ impl Runner<'_> {
         let result = (|| -> Result<()> {
             self.active()?;
             let manifest = self.native.template(&self.record.request.template_id)?;
+            self.record.network_policy = Some(manifest.network.clone());
             let (tx, rx) = mpsc::channel();
             self.lowers.send(Lower { manifest: manifest.clone(), done: tx }).map_err(|_| "lower_worker_unavailable")?;
             rx.recv().map_err(|_| "lower_worker_unavailable")??;
             self.active()?;
-            self.native.prepare(&self.record.request, &manifest, self.record.expires_at, &self.cancelled)
+            self.native.prepare(&self.record.request, &manifest, self.record.network_slot, self.record.expires_at, &self.cancelled)
         })();
         if let Err(e) = result { self.delete(); if self.record.state == "deleted" { self.record.state = "failed".into(); self.record.error = Some(e.into()); } }
         else { self.record.state = "running".into(); }
@@ -373,6 +386,14 @@ impl Runner<'_> {
             Err(e) => { self.delete(); self.finish(&request.operation_id, Some(e)); }
         }
     }
+    fn http(&mut self, request: HttpRequest) {
+        let result = self.active().and_then(|_| self.record.network_policy.as_ref().ok_or("network_policy_unavailable")).and_then(|policy|
+            self.native.application_http(&self.record.request.sandbox_id, &request, policy, self.record.expires_at.saturating_sub(now()).saturating_mul(1000)));
+        match result {
+            Ok(output) => { self.record.operations.get_mut(&request.operation_id).unwrap().http_output = Some(output); self.finish(&request.operation_id, None); },
+            Err(e) => self.finish(&request.operation_id, Some(e)),
+        }
+    }
     fn recover(&self, images: &Path) -> Result<()> {
         self.active()?;
         self.native.forget_stopped(&self.record.request.sandbox_id)?;
@@ -394,6 +415,7 @@ impl Runner<'_> {
             storage::exclusive_private_dir(&stage)?;
             stage_owned = true;
             let images = stage.join("images"); storage::private_dir(&images)?;
+            self.native.capture_network_ready(&id, self.record.network_policy.as_ref())?;
             checkpoint_attempted = true;
             self.native.checkpoint(&id, &images)?;
             checkpoint_completed = true;

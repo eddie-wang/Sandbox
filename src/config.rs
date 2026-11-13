@@ -180,6 +180,32 @@ pub struct NativeConfig {
     pub max_retained_output_bytes: usize,
     pub max_artifact_bytes: u64,
     pub command_timeout_seconds: u64,
+    #[serde(default)]
+    pub network: Option<NetworkConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    pub bridge: String,
+    pub gateway: std::net::Ipv4Addr,
+    pub prefix: u8,
+    pub addresses: Vec<std::net::Ipv4Addr>,
+    pub egress: Vec<crate::model::TcpDestination>,
+    pub service_ports: Vec<u16>,
+}
+impl NetworkConfig {
+    fn valid(&self) -> bool {
+        if self.bridge.is_empty() || self.bridge.len() > 15 || !self.bridge.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            || !(8..=30).contains(&self.prefix) || self.addresses.is_empty() || self.addresses.len() > 256
+            || self.egress.len() > 64 || self.service_ports.len() > 16 || self.service_ports.contains(&0) { return false; }
+        let mask = u32::MAX << (32 - self.prefix);
+        let network = u32::from(self.gateway) & mask;
+        let valid_ip = |ip| crate::model::TcpDestination { ip, port: 1 }.valid()
+            && u32::from(ip) & mask == network && u32::from(ip) & !mask != 0 && u32::from(ip) & !mask != !mask;
+        valid_ip(self.gateway) && self.addresses.iter().enumerate().all(|(i, ip)| valid_ip(*ip) && *ip != self.gateway && !self.addresses[..i].contains(ip))
+            && self.egress.iter().all(|e| e.valid() && !self.addresses.contains(&e.ip))
+    }
 }
 
 fn default_retained_output() -> usize { 16777216 }
@@ -196,6 +222,7 @@ impl NativeConfig {
                 return Err("native paths must be clean absolute paths");
             }
         }
+        if self.network.as_ref().is_some_and(|n| !n.valid()) { return Err("invalid native network policy or address pool"); }
         if self.root == "/" || !self.cgroup_parent.starts_with("/sys/fs/cgroup/")
             || !(1..=16).contains(&self.cpu_overcommit)
             || !(16..=65536).contains(&self.pids_max)
@@ -218,6 +245,7 @@ impl WorkerConfig {
         }
         if let Some(native) = &self.native {
             native.validate()?;
+            if native.network.as_ref().is_some_and(|n| n.addresses.len() < self.capacity.max_sandboxes as usize) { return Err("network slots must cover sandbox capacity"); }
             if self.capacity.max_concurrent_restores as usize > native.max_concurrent_operations {
                 return Err("restore slots must fit the bounded operation pool");
             }

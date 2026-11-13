@@ -5,6 +5,8 @@ with runc 1.3.6 and CRIU 4.3.** The real script exercised shared EROFS/private O
 capture/source recovery, independent restored memory/file state, overlapping exec,
 admission, bounded commands, TTL/delete and crash/restart cleanup. Compilation and
 the nonprivileged HTTP smoke also passed, but are not substitutes for this gate.
+The network variant also passed inside a disposable outer network/mount namespace,
+including policy, application HTTP, listening-socket restore and helper cleanup.
 General hostile-workload isolation, host trust, other kernels/applications,
 cross-node portability and capacity remain unqualified.
 
@@ -101,7 +103,7 @@ Hard validation budgets are **at most three simultaneously admitted containers,
 CPU-overcommit factor 3, two active restores, four fixed operation threads, 64 MiB per
 artifact and 30-second host tool deadlines. No capacity/load benchmark, cluster job, package installation,
 host veth/route/firewall/sysctl change, module loading or external network traffic
-is part of the command. `nsenter ... ip ... link show` only inspects an owned netns.
+is part of the isolated command. `nsenter ... ip ... link show` only inspects an owned netns.
 Workload namespaces are created by runc/CRIU; there is no host-network mode.
 
 ## Gate assertions
@@ -187,8 +189,9 @@ no automatic eviction at all).
 
 ## Explicit remaining boundaries
 
-- No destination IP/port egress allowlist, DNS, usable network sockets or application
-  HTTP. Unsupported input is rejected; deny-all is not advertised as allowlist support.
+- Literal IPv4 TCP allowlists and bounded text application HTTP are implemented;
+  DNS, UDP, IPv6, domain/CIDR policy, per-create endpoint overrides and arbitrary
+  established external TCP connection cloning remain unsupported.
 - No S3 client, remote template transport, signed publisher provenance or two-node
   qualification. The local digest-bound layout is the serialized transfer boundary.
 - No per-sandbox writable-disk quota, automatic artifact GC or tombstone pruning.
@@ -196,3 +199,59 @@ no automatic eviction at all).
   broad isolation, general workload suitability, performance or capacity. Independent
   review and per-deployment qualification are still required. The future two-node/512 GB
   budget scope and latency threshold remain unresolved.
+
+
+## Disposable network qualification
+
+Opt-in networking additionally requires an operator-provisioned bridge with a
+**stable, explicitly assigned MAC**, its configured IPv4 gateway address/prefix,
+and an exclusive pool of unused addresses sufficient for worker sandbox capacity.
+The worker preflight inspects bridge kind and address/prefix, validates pool/policy
+bounds, and never provisions or repairs host networking. Operator routing beyond
+that bridge and address allocation exclusivity are deployment prerequisites, not
+inferred from a successful preflight. Without a fixed bridge MAC, bridge port
+churn can change the gateway MAC and strand cached neighbor entries. Use a trusted
+bridge dedicated to worker uplinks; do not attach untrusted host peers.
+
+After the same explicit privilege approval and cgroup/tool preparation, use:
+
+```sh
+python3 scripts/network_smoke.py --allow-privileged-runtime \
+  --binary target/debug/sandboxd \
+  --root /var/lib/sandbox-validation \
+  --cgroup-parent /sys/fs/cgroup/sandbox-validation \
+  --tools-dir /var/lib/sandbox-tools
+```
+
+This harness enters a disposable **outer network and mount namespace** before
+creating the bridge, gateway/fixture addresses, local HTTP fixture servers or any
+worker. `/run/netns` is a private tmpfs inside that mount namespace. No public
+network, downloads or actual default-namespace interfaces/routes/rules/sysctls are
+changed; before/after default namespace topology/stateless-rules/forwarding
+inventories are compared. Existing `/run/netns` is required. Only three containers,
+64 MiB/one vCPU/64 pids each, remain the limit. No additional installed helper is
+needed; the existing verified `ip` enters namespaces for same-binary helpers.
+
+The network variant retains relevant previous lifecycle cases and adds positive
+exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
+socket creation, HTTP authentication/header stripping/path validation, text body,
+redirect refusal, timeout/output bounds, quiescent capture rejection of established
+TCP, source and child restored listening sockets/fresh egress, delayed namespace
+FD cleanup retry and HTTP-helper crash/restart cleanup. Namespace rules, addresses,
+identities and operation results are retained under the test-owned root. Fixtures
+are original local code, not downloaded images. Test harness helpers are drained
+before pins/staging are discarded. Functional qualification on a development host
+does not establish hardened-host isolation or a production network deployment.
+
+
+The network gate also routes bounded 64 KiB TCP payloads through a 1280-byte hop
+inside the disposable outer topology. The guest and fixture peer start at MTU 1500,
+DF is required, and guest TCP black-hole probing must be disabled. A second case
+lowers only the owned slot uplink to 1280 to exercise slot-generated errors. The
+fixture validates every payload byte and acknowledges completion; socket PMTU and
+narrow-rule counters prove that both forwarded and locally generated IPv4
+fragmentation-needed messages reached the guest. The gate repeats payloads after
+source recovery and independent child restore and retains denied destinations and
+ports. No MTU, route or forwarding sysctl on the actual host/default namespace is
+changed. This is targeted PMTU transport qualification, not a general routed-network
+or performance result.

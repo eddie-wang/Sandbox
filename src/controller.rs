@@ -9,7 +9,7 @@ use crate::{
     config::{ControllerConfig, WorkerEndpoint},
     http::{self, ApiError},
     lifecycle,
-    model::{CaptureRequest, CreateRequest, ExecRequest, WorkerStatus, sandbox_owner, valid_id},
+    model::{CaptureRequest, CreateRequest, ExecRequest, HttpRequest, WorkerStatus, sandbox_owner, valid_id},
     scheduler,
 };
 
@@ -108,6 +108,12 @@ async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathReject
     if !request.valid() { return Err(http::invalid_input()); }
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
 }
+async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = path_id(path)?;
+    let request = http::json(input)?;
+    if !request.valid() { return Err(http::invalid_input()); }
+    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
+}
 async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     let request = http::json(input)?;
@@ -166,6 +172,7 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         .route("/v1/sandboxes", post(create))
         .route("/v1/sandboxes/{id}", get(get_sandbox).delete(delete))
         .route("/v1/sandboxes/{id}/exec", post(exec))
+        .route("/v1/sandboxes/{id}/http", post(application_http))
         .route("/v1/sandboxes/{id}/capture", post(capture))
         .route("/v1/sandboxes/{id}/operations/{op}", get(operation))
         .with_state(controller.clone());

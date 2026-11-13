@@ -1,6 +1,6 @@
 # EXPERIMENTAL: explicit administrator enablement; no qualification claim.
 # Provision root and an exclusive empty delegated cgroup-v2 parent first.
-# No service action installs tools, loads modules, enables controllers or changes sysctls.
+# No service action installs tools, loads modules, enables controllers or changes host sysctls. Opt-in network sysctls are slot/guest-local.
 node_id = "node-a"
 runtimes = ["runc_criu"]
 
@@ -35,3 +35,15 @@ max_concurrent_operations = 4  # 1..64 fixed threads; restore slots must fit
 max_retained_output_bytes = 16777216 # 1 MiB..256 MiB; excludes fixed metadata
 max_artifact_bytes = 67108864   # 1 MiB..1 TiB per artifact, NOT a disk quota
 command_timeout_seconds = 30   # 10..300, each host tool invocation
+
+# Optional operator-provisioned network. Omit for fully isolated templates only.
+# The bridge needs a stable explicitly assigned MAC and this gateway/prefix.
+# Reserve unused addresses exclusively for this worker; at least max_sandboxes.
+# The worker creates only owned veths/netns and slot-local routes/NAT/filter state.
+# [native.network]
+# bridge = "sandbox0"
+# gateway = "198.18.0.1"
+# prefix = 24
+# addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
+# egress = [{ip = "198.51.100.20", port = 8443}]
+# service_ports = [8080]
