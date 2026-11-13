@@ -40,6 +40,7 @@ fn failure(code: &'static str) -> ApiError {
         "admission_exhausted" => (StatusCode::SERVICE_UNAVAILABLE, "Worker capacity is exhausted; nothing was started or recorded"),
         "record_limit" => (StatusCode::SERVICE_UNAVAILABLE, "Durable record limit reached; nothing was started"),
         "worker_unavailable" => (StatusCode::SERVICE_UNAVAILABLE, "Worker is not admitting work; nothing was started"),
+        "erofs_loop_devices_exhausted" => (StatusCode::INTERNAL_SERVER_ERROR, "EROFS loop devices are exhausted; no free visible loop nodes remain"),
         "cleanup_failed" => (StatusCode::INTERNAL_SERVER_ERROR, "Cleanup failed; capacity stays reserved and cleanup retries automatically"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "Operation failed; read sandbox state, which may be terminated"),
     };
@@ -220,6 +221,16 @@ async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRe
     call(&handle, millis(handle.deadlines.capture_ms), |reply| Work::Capture(id, request, std::time::Instant::now(), reply)).await
 }
 
+// Return the cached worker state and, for loop fallback, a fresh advisory capacity snapshot. All
+// device reads happen off request threads and outside the shared state lock.
+async fn status(State(handle): State<Handle>) -> Result<Json<crate::model::WorkerStatus>, ApiError> {
+    let mut status = handle.snapshot.read().map_err(|_| unavailable())?.status.clone();
+    if let Some(erofs) = status.erofs.as_mut().filter(|e| e.file_backed != Some(true)) {
+        erofs.loop_devices = tokio::task::spawn_blocking(crate::native::loop_capacity).await.map_err(|_| unavailable())?;
+    }
+    Ok(Json(status))
+}
+
 // Initialize preflight and lifecycle ownership away from request handling, then serve protected
 // management routes and the path-form app proxy; accepted connections send without Nagle delay. On a
 // termination signal, stop admission and cancel live work, finish serving, then wait for engine-owned
@@ -232,7 +243,7 @@ pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str
     }).await.map_err(|_| "runtime_initialization_failed")??;
     let router = Router::new()
         .route("/healthz", get(|| async { Json(Health { service: "worker", live: true }) }))
-        .route("/v1/status", get(|State(h): State<Handle>| async move { Json(h.snapshot.read().expect("snapshot poisoned").status.clone()) }))
+        .route("/v1/status", get(status))
         .route("/v1/preflight", get(|State(h): State<Handle>| async move { Json(h.preflight.clone()) }))
         .route("/v1/sandboxes", post(create))
         .route("/v1/sandboxes/{id}", get(get_sandbox).delete(delete))

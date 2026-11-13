@@ -21,8 +21,10 @@ An operator must separately provision and approve:
 - Root/host authority, including mount/namespaces, ptrace, cgroup, mknod, ownership,
   UID/GID/capability setup and resource-limit capabilities. A rootless/containerized
   shell with missing capabilities is not enough.
-- EROFS and OverlayFS **already available** in the kernel; loop control already
-  available. No module loading or package installation is done by the service/script.
+- EROFS and OverlayFS **already available** in the kernel. File-backed EROFS needs
+  Linux 6.12+ with `CONFIG_EROFS_FS_BACKED_BY_FILE`; older kernels need available
+  loop device nodes for the shared lowers. No module loading or package installation
+  is done by the service/script.
 - Trusted standard `runc`, `criu`, `mount`, `umount`, GNU `tar`, `mkfs.erofs`, `ip`,
   `nft`, `iptables`, `iptables-save`, `iptables-restore`, `ip6tables-save`,
   `ip6tables-restore`, `gzip` and a **statically linked `tini`** (preflight rejects a
@@ -234,8 +236,12 @@ authentication, profiles per-phase times and measures 16-byte/1-MiB replies dire
 in the routing slot, through the worker and through the controller. These are
 informational release-build measurements on one host, not a capacity qualification.
 A final batch creates 32 sandboxes from distinct tiny EROFS images to exercise
-first-use lower mounts and loop-device allocation; it keeps the same fixture bound.
-This does not exhaust global host loop devices or change their allocation limits.
+first-use lower mounts at full concurrency; it checks mountinfo sources and
+`/sys/block/loop*/loop/backing_file` before/after. File-backed mode must add zero
+loop associations for this worker; forced fallback must use loop sources. The
+normal runtime gate also retains 32 distinct lowers while deleting each sandbox,
+without exceeding its three-container bound. These do not exhaust global host
+loop devices or change their allocation limits.
 
 Host tools are run with their output on nonblocking pipes. Once a tool has exited,
 everything it wrote is already in its pipes, so the worker reads what is there and
@@ -252,6 +258,31 @@ runc's direct/checked paths (detached diagnostics come from its log), and CRIU's
 CPU check. Guest command output is delivered to its caller, not copied to worker
 logs. Logs can contain workload paths or tool diagnostics; protect them.
 
+### EROFS mount selection
+
+Worker startup, after acquiring its root lock and draining old helpers, builds a
+tiny plain EROFS image under `erofs-probe`, mounts and reads it once, then removes
+it. This active probe is separate from the read-only CLI `preflight`. The cached
+worker preflight and status expose its result (`erofs` in [api.md](api.md)).
+Direct backing uses `mount(2)` with the image path, type `erofs`, and
+`ro,nodev,nosuid` in a tracked, deadline-bound helper. Some util-linux versions
+silently allocate a loop even without `-o loop`; the direct call avoids that.
+Like [composefs's EROFS mount path](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-mount.c),
+only `ENOTBLK` from this known valid probe selects loop fallback;
+permission, I/O, helper or cleanup errors fail startup. Later image-mount failures
+never switch modes. `SANDBOX_EROFS_FORCE_LOOP=1` explicitly selects the old loop
+path for validation; it does not claim the kernel lacks file backing.
+
+Both forms verify the EROFS type, mount flags and expected image before reuse or
+unmount: direct mountinfo source is the image path, while loop mounts resolve the
+backing file from the mount's device number. Restart cleans interrupted probe state
+and old lowers using the same checks, regardless of the new selected mode. There
+is no change to artifact compatibility, private overlays or capture semantics.
+Loop fallback reports free existing visible block nodes, unknown nodes and scan
+truncation in status; counts are advisory, not reservations. No free nodes yields
+`erofs_loop_devices_exhausted`, including a mount failure whose post-failure scan
+confirms exhaustion. Other mount failures keep their original static error.
+
 A failed EROFS lower mount also emits `lower_mount_diagnostic`: image checksum,
 actual superblock compatibility/incompatibility bits and block-size shift, current
 kernel and its advertised EROFS features, loop-control open errno, counts of
@@ -260,7 +291,8 @@ and the local `mkfs.erofs --version`. Optional trusted `losetup`, discovered und
 the same tool-directory policy, supplies a bounded read-only device list and its
 stderr/exit status. Missing losetup does not change readiness. Diagnostics never
 allocate/detach a device, infer the image's build tool, or replace the original
-failure. Existing free-device counts are not a proof of available loop capacity.
+failure (loop exhaustion is classified separately by the mount path). Existing
+free-device counts are not a proof of available loop capacity.
 
 DELETE cancellation is checked for both buffered and streamed exec results. Their
 end events now pass through the engine after it publishes deletion state, avoiding
@@ -271,7 +303,8 @@ operation, sandbox ID, result, total milliseconds and completed phase durations.
 Create/restore separates admission wait, manifest, layer verification, lower and
 overlay mounts, cgroup, guest/slot network, OCI spec, runc and running verification.
 `first_ready` is elapsed time to the running result, not application readiness;
-uncompleted steps on a failure have no successful-step duration. Capture and
+uncompleted steps are recorded as `failed_step` before recovery or cleanup, not
+charged to `kill`. Capture records thaw/running checks as `recovery`. Capture and
 delete similarly expose sealing/checkpoint/publication and cleanup steps. Status
 carries the bounded cumulative histograms described in [api.md](api.md).
 

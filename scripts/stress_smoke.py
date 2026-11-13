@@ -35,7 +35,7 @@ import time
 import types
 
 from network_smoke import inventory, run
-from runtime_smoke import cold_manifest, preflight_compatibility, publish_layer, write_template
+from runtime_smoke import cold_manifest, erofs_observation, preflight_compatibility, publish_layer, write_template
 from smoke import eventually, exchange, expect, port, request as smoke_request
 
 BATCH = 16
@@ -161,7 +161,8 @@ def summary(values, digits=3):
 
 # Set up a worker and controller in the session root, run the create/restore/delete bursts and the
 # hop measurement, and require zero errors, no failed host tool, phase histograms in worker status,
-# no owned mounts or cgroups afterwards and no credentials in the logs.
+# no owned mounts or cgroups afterwards and no credentials in the logs. Check mount sources and
+# loop backing counts before and after the full-concurrency distinct-lower batch.
 def lifecycle(args, root):
     prepared = json.loads((root / "stress-prepared.json").read_text())
 
@@ -386,8 +387,11 @@ url = "http://127.0.0.1:{worker_port}"
         observations["hops"] = {"small_16_bytes": hops(bench["sandbox"], slot, "/sized/16/97", 200), "large_1_mib": hops(bench["sandbox"], slot, "/sized/1048576/97", 40)}
         print("HOPS " + json.dumps(observations["hops"]), flush=True)
         assert delete_once(bench["sandbox"])["error"] is None
+        observations["erofs_before_distinct"] = erofs_observation(root, expect(request(worker_port, "/v1/status", worker_token), 200)["erofs"])
         assert burst("distinct-lowers-32", [f"distinct-{index}" for index in range(WIDE)]), "distinct EROFS lower mounts failed"
-        print("PASS 32 distinct EROFS bases mounted for simultaneous first-use creates", flush=True)
+        observations["erofs_after_distinct"] = erofs_observation(root, expect(request(worker_port, "/v1/status", worker_token), 200)["erofs"])
+        assert len(observations["erofs_after_distinct"]["lower_sources"]) - len(observations["erofs_before_distinct"]["lower_sources"]) == 32
+        print("PASS 32 distinct EROFS bases mounted for simultaneous first-use creates; backing counts " + json.dumps(observations["erofs_after_distinct"]), flush=True)
         status = expect(request(worker_port, "/v1/status", worker_token, timeout=4), 200)
         assert all(status["phases"].get(f"{op}.total", {}).get("count", 0) > 0 for op in ("create", "restore", "delete", "capture")), sorted(status["phases"])
         assert 0 < len(status["phases"]) <= 160

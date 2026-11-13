@@ -175,10 +175,45 @@ def unsupported_cpuinfo(image):
     return image[:8] + len(changed).to_bytes(4, "little") + changed + image[12 + size:]
 
 
-# Run the privileged gate on fixture templates through a real worker and controller: creates, execs
-# and bounds, rejections (including CRIU's CPU check), disconnects, DELETE waits, captures (failed,
-# interrupted, dead source, chained), warm restores, layer verification across restarts, TTL and crash
-# cleanup; --network adds policy networking and the app proxy (with a small-call latency bound).
+# Snapshot existing loop backing files without allocating devices; tolerate unrelated detach races.
+def loop_backings():
+    found = {}
+    for path in Path("/sys/block").glob("loop*/loop/backing_file"):
+        try:
+            found[path.parts[-3]] = path.read_text().strip()
+        except FileNotFoundError:
+            pass
+    return found
+
+
+# Check every shared lower's source against the selected mode and record loop backing counts. A
+# file-backed worker must use no loop for any image in its root, including the startup probe.
+def erofs_observation(root, status):
+    loops = loop_backings()
+    owned = {name: image for name, image in loops.items() if image.lstrip("/").startswith(str(root).lstrip("/") + "/")}
+    sources = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split()
+        if not fields[4].startswith(str(root / "lowers") + "/"):
+            continue
+        separator = fields.index("-")
+        assert fields[separator + 1] == "erofs", line
+        image = str(root / "layers" / (Path(fields[4]).name + ".erofs"))
+        source = fields[separator + 2]
+        assert source == image if status["file_backed"] is True else source.startswith("/dev/loop"), line
+        sources.append(source)
+    assert status["file_backed"] is not None or status["forced_loop"], status
+    if status["file_backed"] is True:
+        assert not owned, owned
+        assert status["loop_devices"] is None, status
+    else:
+        assert status["loop_devices"] is not None, status
+    return dict(status=status, loop_backings_total=len(loops), owned_loop_backings=owned, lower_sources=sources)
+
+
+# Run real fixture lifecycle, rejection, bounds, capture/restore and restart gates, plus 32 retained
+# distinct lowers, with at most three live containers. Check failed-step timing separately from kill.
+# --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -238,7 +273,7 @@ cgroup_parent = {json.dumps(str(cgroup))}
 {('tools_dir = ' + json.dumps(str(Path(args.tools_dir).resolve(strict=True)))) if args.tools_dir else ''}
 cpu_overcommit = 3
 pids_max = 64
-max_records = 48
+max_records = 96
 max_concurrent_operations = 4
 max_execs_per_sandbox = 3
 max_artifact_bytes = 67108864
@@ -333,6 +368,7 @@ url = "http://127.0.0.1:{worker_port}"
         else:
             (directory / "manifest.json").write_text(json.dumps(invalid))
         (directory / "manifest.sha256").write_text(hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest() + "\n")
+    loop_before = loop_backings()
     processes = []
     worker = None
     controller = None
@@ -502,7 +538,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert tracked_connections(name) == 0, name
 
     # Return how many bytes the worker process has read so far (rchar in /proc/<pid>/io). Hashing a
-    # layer reads its whole image; reads through a loop-mounted layer are not counted.
+    # layer reads its whole image; kernel reads through a mounted layer are not counted.
     def worker_read_bytes():
         return int(next(line for line in Path(f"/proc/{worker.pid}/io").read_text().splitlines() if line.startswith("rchar:")).split()[1])
 
@@ -948,8 +984,8 @@ url = "http://127.0.0.1:{worker_port}"
         # the dump fails.
         stopped = {}
         # Find the sandbox's runc checkpoint process among the worker's helpers and stop it. With
-        # `kill_source`, also kill every process of the sandbox, wait until none is left, then let
-        # the helper continue.
+        # `kill_source`, delay a second, kill every sandbox process, wait until none is left, then
+        # continue the helper. The delay must be timed as failed_step, never cleanup's kill.
         def stop_checkpoint(sandbox, kill_source):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -967,6 +1003,7 @@ url = "http://127.0.0.1:{worker_port}"
                             os.kill(int(pid), signal.SIGSTOP)
                             stopped[sandbox] = int(pid)
                             if kill_source:
+                                time.sleep(1)
                                 (cgroup / sandbox / "cgroup.kill").write_text("1")
                                 eventually(lambda: "populated 0" in (cgroup / sandbox / "cgroup.events").read_text(), timeout=10)
                                 os.kill(int(pid), signal.SIGCONT)
@@ -1001,6 +1038,11 @@ url = "http://127.0.0.1:{worker_port}"
         assert get(source)["state"] == "running" and get(isolated)["state"] == "running"
         observations["interrupted_checkpoint_keeps_running_source"] = dict(stopped_pid=stopped[kept], capture_s=round(interrupted_seconds, 3))
         observations["failed_capture_deletes_dead_source"] = dict(stopped_pid=stopped[dead], capture_s=round(dead_seconds, 3))
+        dead_phases = [json.loads(line.removeprefix("sandboxd: phases ")) for log in root.glob("worker-*.log")
+                       for line in log.read_text().splitlines() if line.startswith("sandboxd: phases ")]
+        dead_phases = next(line["phases"] for line in dead_phases if line["op"] == "capture" and line["sandbox_id"] == dead)
+        assert dead_phases["failed_step"] >= 900 and dead_phases["kill"] < dead_phases["failed_step"], dead_phases
+        observations["failed_step_not_charged_to_kill"] = dead_phases
         isolated_nonce = int(execute(isolated, "counter").split()[1])
         # The source keeps running during capture except while frozen (pause to resume).
         stop_watch = threading.Event()
@@ -1270,6 +1312,22 @@ url = "http://127.0.0.1:{worker_port}"
             gone(proxy_restart)
             observations["restart_inflight_proxy_reconciled"] = True
         print("PASS worker crash during exec/capture/proxy: host-helper drain and cleanup before ready; retained-template restore")
+        erofs = expect(request(worker_port, "/v1/preflight", worker_token), 200)["erofs"]
+        assert erofs["forced_loop"] == (os.environ.get("SANDBOX_EROFS_FORCE_LOOP") == "1"), erofs
+        observations["erofs_before"] = dict(before_worker_loop_backings_total=len(loop_before), **erofs_observation(root, erofs))
+        # After restart has cleared earlier lowers, retain 32 distinct mounts while deleting each
+        # sandbox. This stays within three live containers and does not add the normal suite's
+        # earlier lowers to the fallback device budget.
+        distinct_image = root / "distinct.erofs"
+        for index in range(32):
+            (rootfs / "layer-id").write_text(str(index))
+            subprocess.run(["mkfs.erofs", str(distinct_image), str(rootfs)], check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            write_template(root, dict(manifest, template_id=f"distinct-{index}", base=publish_layer(root, distinct_image)))
+            distinct = create(f"distinct-{index}")
+            remove(distinct)
+        observations["erofs_after_32"] = erofs_observation(root, expect(request(worker_port, "/v1/status", worker_token), 200)["erofs"])
+        assert len(observations["erofs_after_32"]["lower_sources"]) == 32
+        print("PASS 32 distinct retained EROFS lowers; mode and loop backing counts " + json.dumps(observations["erofs_after_32"]), flush=True)
     finally:
         if helpers.exists():
             (helpers / "cgroup.freeze").write_text("0")

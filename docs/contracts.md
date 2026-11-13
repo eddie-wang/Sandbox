@@ -60,7 +60,10 @@ worker-produced and extracted by GNU tar with its default traversal/symlink
 protections. There is no user-supplied archive or executable host path.
 
 Lower mounts are shared by digest and are read-only, nodev/nosuid. Only these shared
-EROFS images use the standard mount/loop facility. Each sandbox gets sibling
+EROFS images prefer file-backed mounts, selected by a tiny startup probe under the
+worker root lock. Unsupported kernels use the standard loop facility; a failed
+individual image never triggers fallback. Both forms verify mount flags and the
+image source before reuse or restart cleanup. Each sandbox gets sibling
 upper/work directories on the same supported local filesystem; OverlayFS uses
 `lowerdir=<sealed layers, newest first>:<base>` and
 `index=off,metacopy=off,redirect_dir=off,xino=off,nodev,nosuid`. No lower layer is
@@ -332,7 +335,9 @@ Read-only preflight checks tools/versions, UID/capabilities, advertised filesyst
 namespace/seccomp interfaces, supported upper filesystem family and an existing
 empty delegated cgroup domain with cpu/memory/pids enabled. It does **not** write an
 xattr probe, run `criu check`, create a mount/namespace, enable a controller or prove
-runtime behavior. XFS ftype/xattr details, EROFS options, actual seccomp compatibility,
+runtime behavior. Worker startup separately mounts and reads a tiny EROFS image
+once to select file backing or loop fallback, then removes the probe; the cached
+worker preflight and status record that result. XFS ftype/xattr details, EROFS options, actual seccomp compatibility,
 restore cgroup placement and lifecycle/isolation/cleanup claims require the
 privileged gate. The static-fixture local gate passed, including independently
 overlapping commands, final worker admission, rejected template compatibility/digest/

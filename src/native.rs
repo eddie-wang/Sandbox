@@ -2,7 +2,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::Read, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, sync::{Condvar, Mutex, PoisonError}, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use crate::{config::NativeConfig, model::SandboxSpec, phases::Phases, process::{self, Result}, storage::{self, Artifact, Compatibility, FileIdentity, Manifest}};
+use crate::{config::NativeConfig, model::{ErofsStatus, LoopCapacity, SandboxSpec}, phases::Phases, process::{self, Result}, storage::{self, Artifact, Compatibility, FileIdentity, Manifest}};
 
 #[derive(Clone, Serialize)]
 pub struct Check { pub name: String, pub ok: bool }
@@ -12,6 +12,7 @@ pub struct Preflight {
     pub qualification: &'static str,
     pub checks: Vec<Check>,
     pub compatibility: Option<Compatibility>,
+    pub erofs: ErofsStatus,
 }
 
 pub struct Native {
@@ -22,6 +23,8 @@ pub struct Native {
     pub helpers: process::Helpers,
     // Whether sandbox overlays are mounted `volatile` (kernel 5.10 or later; see prepare).
     volatile_overlay: bool,
+    // Chosen once by a tiny active probe under the root lock; never changed after a lower failure.
+    pub erofs: ErofsStatus,
     // Layer digests whose shared lower this worker mounted and checked (see mount_lower); a create
     // whose layers are all here skips the serialized lower-mount thread. Never held across I/O.
     mounted_lowers: Mutex<BTreeSet<String>>,
@@ -66,6 +69,41 @@ fn load_verified(root: &Path) -> BTreeMap<String, VerifiedLayer> {
     if state.schema_version != VERIFIED_STATE_SCHEMA
         || state.layers.iter().any(|l| !storage::hex_digest(&l.sha256) || l.bytes != l.file.size) { return BTreeMap::new(); }
     state.layers.into_iter().map(|l| (l.sha256.clone(), l)).collect()
+}
+
+// Count visible loop block nodes and their free backing slots without allocating anything. Unknown
+// entries and a bounded scan are explicit: this is a snapshot, never a capacity reservation.
+pub fn loop_capacity() -> Option<LoopCapacity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let entries = fs::read_dir("/dev").ok()?;
+    let mut capacity = LoopCapacity { device_nodes: 0, free_nodes: 0, unknown_nodes: 0, scan_truncated: false };
+    for (index, entry) in entries.enumerate() {
+        if index == 4096 { capacity.scan_truncated = true; break; }
+        let entry = entry.ok()?;
+        if !entry.file_name().to_str().is_some_and(|n| n.strip_prefix("loop").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))) { continue; }
+        let meta = entry.metadata().ok()?;
+        if !meta.file_type().is_block_device() || libc::major(meta.rdev()) != 7 { continue; }
+        capacity.device_nodes += 1;
+        let sys = PathBuf::from(format!("/sys/dev/block/7:{}", libc::minor(meta.rdev())));
+        match fs::read_to_string(sys.join("loop/backing_file")) {
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && sys.is_dir() => capacity.free_nodes += 1,
+            Err(_) => capacity.unknown_nodes += 1,
+        }
+    }
+    Some(capacity)
+}
+
+// Mount an image directly, without util-linux's implicit loop allocation. Like composefs, only
+// ENOTBLK selects loop fallback (exit 2); permission, image and I/O errors must not change mode.
+pub fn erofs_mount_helper(image: &std::ffi::OsStr, target: &std::ffi::OsStr) -> Result<()> {
+    let image = std::ffi::CString::new(image.as_encoded_bytes()).map_err(|_| "invalid_image_path")?;
+    let target = std::ffi::CString::new(target.as_encoded_bytes()).map_err(|_| "invalid_mount_path")?;
+    if unsafe { libc::mount(image.as_ptr(), target.as_ptr(), c"erofs".as_ptr(), libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID, std::ptr::null()) } == 0 { return Ok(()); }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOTBLK) => std::process::exit(2),
+        _ => Err("erofs_file_mount_failed"),
+    }
 }
 
 // Size limit of a template's cpuinfo.img (CRIU's description of the capturing host's CPU).
@@ -197,7 +235,7 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
 
 // Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
 // creating runtime state. Collect compatibility fingerprints and report readiness only if every check
-// passes; qualification stays unvalidated.
+// passes; qualification stays unvalidated. EROFS file backing is probed only by worker startup.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
     let search_path = tool_search_path(&tools);
@@ -206,7 +244,6 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     add("linux", std::env::consts::OS == "linux");
     add("supported_architecture", matches!(std::env::consts::ARCH, "x86_64" | "aarch64"));
     add("namespaces", ["pid", "mnt", "net", "ipc", "uts", "cgroup"].iter().all(|n| Path::new("/proc/self/ns").join(n).exists()));
-    add("loop_control", Path::new("/dev/loop-control").exists());
     add("explicitly_enabled", config.is_some_and(|c| c.enabled));
     add("root", unsafe { libc::geteuid() } == 0);
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
@@ -263,14 +300,15 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
             init_sha256: init.sha256, layout: "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1".to_owned() })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
-    Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility }
+    let erofs = ErofsStatus { file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };
+    Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs }
 }
 
 impl Native {
     // Require successful preflight and exclusive ownership of the runtime root. Verify tools, drain old
     // helper processes before touching runtime state, create private storage directories (including
     // the slot-pool ownership directory) and drop half-unpacked checkpoint cache entries. Unknown cache
-    // entries fail closed. Load the saved verified-layer state (an unusable file means rehashing).
+    // entries fail closed. Load verified-layer state and probe direct EROFS mounting once under the lock.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -295,8 +333,56 @@ impl Native {
         }
         let verified = load_verified(root);
         let volatile_overlay = volatile_overlay_supported(&fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
-        Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, volatile_overlay, mounted_lowers: Mutex::new(BTreeSet::new()),
-            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock })
+        let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, volatile_overlay, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
+            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock };
+        native.clear_erofs_probe()?;
+        if !native.erofs.forced_loop { native.erofs.file_backed = Some(native.probe_file_erofs()?); }
+        native.erofs.loop_devices = if native.erofs.file_backed == Some(true) { None } else { loop_capacity() };
+        Ok(native)
+    }
+    // Remove only the known probe mount and private files, including a probe interrupted by restart.
+    // Verify either source type before unmounting; an unexpected mount is never removed.
+    fn clear_erofs_probe(&self) -> Result<()> {
+        self.helpers.ensure_healthy()?;
+        let probe = self.root().join("erofs-probe");
+        let target = probe.join("mount");
+        if storage::mounted(&target)? {
+            storage::verify_lower(&target, &probe.join("image.erofs"))?;
+            self.command("umount", vec!["--internal-only".into(), target.display().to_string()])?;
+        }
+        storage::remove_private(&probe)
+    }
+    // Try the known tiny plain image once. Only an unsupported-kernel answer selects loop fallback;
+    // every other failure stops startup, and cleanup is required even after a failed mount.
+    fn probe_file_erofs(&self) -> Result<bool> {
+        let probe = self.root().join("erofs-probe");
+        let result = (|| {
+            storage::exclusive_private_dir(&probe)?;
+            storage::private_dir(&probe.join("source"))?;
+            storage::private_dir(&probe.join("mount"))?;
+            fs::write(probe.join("source/probe"), b"erofs probe\n").map_err(|_| "erofs_probe_write_failed")?;
+            self.command("mkfs.erofs", vec![probe.join("image.erofs").display().to_string(), probe.join("source").display().to_string()])?;
+            let mounted = self.mount_file_erofs(&probe.join("image.erofs"), &probe.join("mount"))?;
+            if mounted {
+                storage::verify_lower(&probe.join("mount"), &probe.join("image.erofs"))?;
+                if fs::read(probe.join("mount/probe")).map_err(|_| "erofs_probe_read_failed")? != b"erofs probe\n" { return Err("erofs_probe_content_mismatch"); }
+            }
+            Ok(mounted)
+        })();
+        self.clear_erofs_probe()?;
+        result
+    }
+    // Run the direct-mount helper with normal helper tracking and bounds. Return false only for an
+    // unsupported file-backed mount; the caller may use that answer only during the tiny startup probe.
+    fn mount_file_erofs(&self, image: &Path, target: &Path) -> Result<bool> {
+        let output = self.helpers.run(&format!("/proc/{}/exe", std::process::id()),
+            &["internal-erofs-mount".into(), image.display().to_string(), target.display().to_string()],
+            Duration::from_secs(self.config.command_timeout_seconds), 4096, false, &self.search_path, None)?;
+        match (output.interrupted, output.exit_code) {
+            (false, Some(0)) => Ok(true),
+            (false, Some(2)) => Ok(false),
+            _ => Err("erofs_file_mount_failed"),
+        }
     }
     // Return the configured root of this worker's runtime storage.
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
@@ -469,7 +555,7 @@ impl Native {
     // Mount one immutable EROFS layer (a template base or a sealed capture layer) if needed. The create
     // job verified it first (see verify_layers); an untrusted layer is refused, never hashed here. Check
     // the mount flags and backing image on every use, including reuse of an existing mount, and
-    // remember the layer as mounted.
+    // remember the layer as mounted. Use the startup-selected source type; never fallback per image.
     pub fn mount_lower(&self, layer: &Artifact) -> Result<()> {
         if !self.layer_trusted(layer)? { return Err("layer_not_verified"); }
         let image = self.layer_image(&layer.sha256);
@@ -477,10 +563,14 @@ impl Native {
         if !lower.exists() { storage::private_dir(&lower)?; }
         storage::trusted_directory(&lower)?;
         if !storage::mounted(&lower)? {
-            if let Err(error) = self.command("mount", vec!["--internal-only".into(), "-t".into(), "erofs".into(), "-o".into(), "loop,ro,nodev,nosuid".into(), image.display().to_string(), lower.display().to_string()]) {
-                self.lower_mount_diagnostic(&image, &layer.sha256);
-                return Err(error);
-            }
+            let result = if self.erofs.file_backed == Some(true) {
+                self.mount_file_erofs(&image, &lower).and_then(|mounted| if mounted { Ok(()) } else { Err("erofs_file_mount_failed") })
+            } else {
+                if loop_capacity().is_some_and(|c| c.free_nodes == 0 && c.unknown_nodes == 0 && !c.scan_truncated) { return Err("erofs_loop_devices_exhausted"); }
+                self.command("mount", vec!["--internal-only".into(), "-t".into(), "erofs".into(), "-o".into(), "loop,ro,nodev,nosuid".into(), image.display().to_string(), lower.display().to_string()])
+                    .map_err(|e| if e == "tool_failed" && loop_capacity().is_some_and(|c| c.free_nodes == 0 && c.unknown_nodes == 0 && !c.scan_truncated) { "erofs_loop_devices_exhausted" } else { e })
+            };
+            if let Err(error) = result { self.lower_mount_diagnostic(&image, &layer.sha256); return Err(error); }
         }
         storage::verify_lower(&lower, &image)?;
         self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner).insert(layer.sha256.clone());

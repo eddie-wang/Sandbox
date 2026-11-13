@@ -110,19 +110,25 @@ fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = 
 impl Handle {
     // Fail closed if disabled or preflight fails; otherwise reconcile and start admission, operation,
     // lower-mount, CPU-check and expiry workers. Work survives HTTP disconnects. Shutdown waits for
-    // jobs, commands and per-sandbox cleanup, then removes shared mounts and the slot pool.
-    pub fn start(config: &WorkerConfig, report: Preflight) -> Result<Self> {
+    // jobs, commands and per-sandbox cleanup, then removes shared mounts and the slot pool. Startup
+    // records the active EROFS probe separately from the read-only prerequisite checks.
+    pub fn start(config: &WorkerConfig, mut report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
+        let native = if enabled {
+            let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
+            report.erofs = native.erofs.clone();
+            Some(native)
+        } else { None };
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
             capacity: config.capacity.clone(), usage: enabled.then_some(Usage { memory_mib: 0, vcpus: 0, sandboxes: 0, restores: 0 }), admission_ready: false, phases: BTreeMap::new(),
             runtimes: vec![RuntimeCapability { runtime: Runtime::RuncCriu, ready: false, reason: if enabled { "reconciling" } else if config.native.as_ref().is_some_and(|c| c.enabled) { "preflight_failed" } else { "runtime_disabled" }.into() }],
-            cpu_overcommit: config.native.as_ref().map_or(1, |c| c.cpu_overcommit), qualification: "unvalidated".into() };
+            cpu_overcommit: config.native.as_ref().map_or(1, |c| c.cpu_overcommit), qualification: "unvalidated".into(), erofs: Some(report.erofs.clone()) };
         let snapshot = Arc::new(RwLock::new(Snapshot { status, records: BTreeMap::new(), cancels: BTreeMap::new(), proxy_close: BTreeMap::new() }));
         let proxy_permits = Arc::new(tokio::sync::Semaphore::new(config.server.proxy.max_connections));
         let handle = |sender, native| Self { snapshot: snapshot.clone(), preflight: report.clone(), sender, deadlines: config.server.operation_deadlines.clone(),
             native, proxy: config.server.proxy.clone(), proxy_permits: proxy_permits.clone() };
         if !enabled { return Ok(handle(None, None)); }
-        let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
+        let native = native.ok_or("native_config_missing")?;
         let (tx, rx) = mpsc::sync_channel(32);
         // CRIU's CPU check of a warm template runs here, never on the admission coordinator, which
         // answers the waiting creates when the result arrives (see Engine::await_cpu_check).
@@ -682,7 +688,8 @@ impl Runner<'_> {
     }
     // Save ownership, recheck the manifest/CPU, verify untrusted layers, obtain shared lower mounts
     // and cached checkpoint images, then start or restore, timing each step. Already-mounted layers
-    // skip the lower queue but are still checked in prepare. Failures clean up and retain their state.
+    // skip the lower queue but are still checked in prepare. Time the failed step separately before
+    // cleanup, retaining its error and final state.
     fn create(&mut self) -> Result<Outcome> {
         let result = (|| -> Result<()> {
             // Durable before any resource of the sandbox exists.
@@ -713,6 +720,7 @@ impl Runner<'_> {
         match result {
             Ok(()) => { self.record.state = "running".into(); Ok(Outcome::Created(self.record.view())) }
             Err(e) => {
+                self.phases.mark("failed_step");
                 self.delete();
                 if self.record.state == "deleted" { self.record.state = "failed".into(); self.record.error = Some(e.into()); }
                 Err(e)
@@ -720,9 +728,9 @@ impl Runner<'_> {
         }
     }
     // Capture in AgentENV order: save CPU info, freeze, seal files, checkpoint leaving it running,
-    // thaw, then archive and publish matching files/process state. Time each step.
-    // Even an interrupted dump thaws and keeps a running source; frozen, dead or cancelled sources
-    // are deleted. Success means a published template and running source.
+    // thaw, archive and publish matching state. Time failed steps and recovery apart from cleanup.
+    // Even an interrupted dump keeps a running source; frozen, dead or cancelled sources are deleted.
+    // Success means a published template and running source.
     fn capture(&mut self, request: CaptureRequest, generation: String) -> Result<Outcome> {
         let id = self.record.request.sandbox_id.clone();
         let max = self.native.config.max_artifact_bytes;
@@ -779,12 +787,14 @@ impl Runner<'_> {
             self.phases.mark("publish");
             Ok(())
         })();
+        if result.is_err() { self.phases.mark("failed_step"); }
         // CRIU leaves the dumped tasks alive, so a failed step needs only a thaw. A
         // resume error is not final: runc state decides (a paused source is not running).
         // As in AgentENV, an interrupted dump is handled the same way; its own error code
         // tells the caller, who may delete a source that a killed dump could have degraded.
         if paused { let _ = self.native.resume(&id); }
         let recovery = self.active().and_then(|_| self.native.ensure_running(&id));
+        self.phases.mark("recovery");
         if recovery.is_ok() { self.record.state = "running".into(); } else { self.delete(); }
         let cleanup = if stage_owned { self.native.helpers.ensure_healthy().and_then(|_| storage::remove_private(&stage)) } else { Ok(()) };
         // Success means both publication and a running source.

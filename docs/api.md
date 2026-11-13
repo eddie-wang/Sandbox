@@ -139,7 +139,7 @@ Records are retained as tombstones; IDs are never reused.
 | --- | --- |
 | `GET /healthz` | `200 {"service":"worker" or "controller","live":true}`; not readiness |
 | `GET /v1/status` | Worker: configured budgets, reserved usage, CPU overcommit, admission/runtime status and `qualification:"unvalidated"`. Controller: cached validated nodes and freshness; `lifecycle_implemented:true` describes dispatch code, not runtime qualification. |
-| `GET /v1/preflight` | Worker only: cached read-only startup checks, versions/compatibility fingerprint; authenticated |
+| `GET /v1/preflight` | Worker only: cached read-only prerequisites, versions/compatibility fingerprint, plus worker-start EROFS probe result; authenticated |
 | `POST /v1/sandboxes` | Blocking create/restore; `201` with the sandbox view once running. No caller ID, rootfs/config/path fields |
 | `GET /v1/sandboxes/{id}` | `200` view: `sandbox_id`, `template_id`, `state`, static `error`, absolute Unix `expires_at` |
 | `DELETE /v1/sandboxes/{id}` | Blocking; `200` view after cleanup (`deleted`, or `failed` for a never-launched ID); `500 cleanup_failed` otherwise |
@@ -398,7 +398,9 @@ Operations are create, restore, capture, delete and exec; phases absent on a pat
 are omitted. `first_ready` measures request arrival to the confirmed running
 create/restore result, not application HTTP readiness. It overlaps step durations
 and must not be added to them. Pre-launch rejections and repeated/coalesced requests
-do not start another operation histogram. `usage` counts reservations, not measured utilization;
+do not start another operation histogram. `failed_step` records the unfinished step
+before recovery/cleanup; `recovery` records capture thaw/running checks, so neither
+is charged to cleanup's `kill`. `usage` counts reservations, not measured utilization;
 null means disabled/failed preflight, not zero. `vcpus` in usage sums quotas, compared
 with configured physical/admission `capacity.vcpus * cpu_overcommit` (factor 1–16).
 The fixed operation pool bounds parallel create/capture/delete jobs.
@@ -407,8 +409,19 @@ cannot exceed that pool. Commands run outside the pool, bounded per sandbox and 
 worker. Deletes cancel active work and commands, then perform per-sandbox serialized
 cleanup; another sandbox's long command/restore does not block admission or an
 available operation slot.
-`ready:true` means explicit experimental enablement, read-only preflight and
-reconciliation passed. The API's **qualification remains unvalidated** because it
+`erofs` records `file_backed` (`true` after a successful worker-start probe, `false`
+for an unsupported kernel, `null` before probing or when forced off), `forced_loop`
+and `loop_devices`. The latter is null in file-backed mode; otherwise status reads
+an advisory snapshot of `device_nodes`, `free_nodes`, `unknown_nodes` and
+`scan_truncated` off the request thread. Only existing visible loop block nodes are
+counted; no devices are allocated, and free nodes are not a reservation. Read-only
+CLI preflight leaves `file_backed` null. `/v1/preflight` retains the startup snapshot;
+`/v1/status` refreshes loop counts. `SANDBOX_EROFS_FORCE_LOOP=1` disables the probe
+and selects loop mounts for fallback validation. Loop exhaustion returns static
+`erofs_loop_devices_exhausted` (500, not a pre-launch failover refusal).
+
+`ready:true` means explicit experimental enablement, read-only prerequisites,
+EROFS mount selection and reconciliation passed. The API's **qualification remains unvalidated** because it
 does not attest an installation from a separately run smoke.
 
 Controller polls at bounded fanout, with 64 KiB responses, total per-call deadlines

@@ -111,7 +111,7 @@ One shared EROFS image and read-only mount on the node
 
 Each sandbox reads unchanged files from the shared base. Its own new files and changes go into its private directory. Modifying a base file can cause OverlayFS to copy that file into the private directory. Deleting a base file records a private deletion; it does not remove the file for other sandboxes.
 
-The private directory that stores changes is called `upper`. OverlayFS also needs a private working directory, called `work`. These are ordinary directories, not a disk image per sandbox. The shared EROFS image is mounted through Linux's standard loop-device mechanism.
+The private directory that stores changes is called `upper`. OverlayFS also needs a private working directory, called `work`. These are ordinary directories, not a disk image per sandbox. The shared EROFS image is mounted directly from its file when the kernel supports it (Linux 6.12 or newer with file-backed EROFS enabled). A tiny startup mount-and-read probe selects this once per worker. Unsupported kernels use Linux's standard loop-device mechanism instead; status reports free visible loop nodes and a clear error names loop exhaustion. An explicit environment switch selects the loop path for validation. Both forms are checked before reuse and removed safely after a restart. This is built, not a future storage backend.
 
 A template references **one base image** plus, for a warm template, the layers its captures sealed (newest first). Each layer is stored once per node under its checksum and shared by every template and sandbox that uses it. Separate, independently selectable application/data/toolkit layers are not implemented.
 

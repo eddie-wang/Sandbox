@@ -62,8 +62,11 @@ RBAC, built-in TLS or Internet-facing connection defense.
   saves the result with the image file's identity, so it is trusted again after a
   worker restart until the file changes; **ordinary private
   OverlayFS upper/work directories**, a fresh empty upper per sandbox, no
-  per-container block devices or storage daemon. Only the shared EROFS mounts use
-  loop devices.
+  per-container block devices or storage daemon. Shared EROFS mounts prefer direct
+  file backing (Linux 6.12+ with `CONFIG_EROFS_FS_BACKED_BY_FILE`), selected by a tiny
+  startup probe. Unsupported kernels use loop devices; status reports their free
+  visible nodes, and exhaustion returns `erofs_loop_devices_exhausted`. See
+  [runtime selection and its forced-loop validation switch](docs/runtime.md#erofs-mount-selection).
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
   65534, empty capabilities, `no_new_privs` and cgroup-v2 memory/swap/CPU/pids
   limits installed before launch. Seccomp follows the AgentENV container pattern:

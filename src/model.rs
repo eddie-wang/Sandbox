@@ -43,6 +43,25 @@ pub struct RuntimeCapability {
     pub reason: String,
 }
 
+// EROFS startup selection: None means the active probe has not run (or was disabled).
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErofsStatus {
+    pub file_backed: Option<bool>,
+    pub forced_loop: bool,
+    pub loop_devices: Option<LoopCapacity>,
+}
+
+// Existing visible loop nodes only; availability is advisory and can change before mounting.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoopCapacity {
+    pub device_nodes: usize,
+    pub free_nodes: usize,
+    pub unknown_nodes: usize,
+    pub scan_truncated: bool,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerStatus {
@@ -56,6 +75,8 @@ pub struct WorkerStatus {
     pub runtimes: Vec<RuntimeCapability>,
     pub cpu_overcommit: u32,
     pub qualification: String,
+    #[serde(default)]
+    pub erofs: Option<ErofsStatus>,
     // Cumulative per-step durations of this worker's operations since it started, keyed
     // `<operation>.<step>` (see phases.rs).
     #[serde(default)]

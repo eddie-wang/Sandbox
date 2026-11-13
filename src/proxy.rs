@@ -218,7 +218,8 @@ type SocketRequest = (PathBuf, tokio::sync::oneshot::Sender<Option<OwnedFd>>);
 
 // Start bounded socket-making threads on first use. Each enters only the requested namespace,
 // creates a socket and returns home, never retaining a released slot while idle. Failed entry
-// returns no socket; failed return ends the thread. No shared runtime thread changes namespace.
+// returns no socket; failed return ends the thread. Namespace files open only on connector threads;
+// no shared runtime thread changes namespace or performs file I/O.
 fn connectors() -> Option<&'static std::sync::mpsc::SyncSender<SocketRequest>> {
     static MAILBOX: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<SocketRequest>>> = std::sync::OnceLock::new();
     MAILBOX.get_or_init(|| {
@@ -226,19 +227,21 @@ fn connectors() -> Option<&'static std::sync::mpsc::SyncSender<SocketRequest>> {
         let rx = Arc::new(Mutex::new(rx));
         for index in 0..CONNECTORS {
             let rx = rx.clone();
-            let home = File::open("/proc/thread-self/ns/net").ok()?;
-            std::thread::Builder::new().name(format!("sandbox-proxy-netns-{index}")).spawn(move || loop {
-                let next = rx.lock().unwrap_or_else(PoisonError::into_inner).recv();
-                let Ok((netns, reply)) = next else { return };
-                let mut entered = false;
-                let socket = File::open(&netns).ok().and_then(|namespace| {
-                    if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return None; }
-                    entered = true;
-                    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
-                    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
-                });
-                let _ = reply.send(socket);
-                if entered && unsafe { libc::setns(home.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return; }
+            std::thread::Builder::new().name(format!("sandbox-proxy-netns-{index}")).spawn(move || {
+                let Ok(home) = File::open("/proc/thread-self/ns/net") else { return };
+                loop {
+                    let next = rx.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                    let Ok((netns, reply)) = next else { return };
+                    let mut entered = false;
+                    let socket = File::open(&netns).ok().and_then(|namespace| {
+                        if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return None; }
+                        entered = true;
+                        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+                        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+                    });
+                    let _ = reply.send(socket);
+                    if entered && unsafe { libc::setns(home.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return; }
+                }
             }).ok()?;
         }
         Some(tx)
