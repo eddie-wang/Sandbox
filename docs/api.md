@@ -178,8 +178,11 @@ comes only from the trusted template, never from a create request. Warm restore
 requires the captured memory/vCPU/pids/config and host compatibility.
 
 During admission the worker checks the template manifest (digest sidecar, strict
-fields, exact host compatibility including architecture, network policy and pids);
-failure is a pre-launch `422 template_unavailable`. The create job itself hashes
+fields, exact host compatibility including architecture, network policy and pids)
+and, for a warm template, CRIU's own CPU check of its saved `cpuinfo.img` on this
+host (`criu cpuinfo check`, once per template per worker; see contracts.md);
+failure is a pre-launch `422 template_unavailable`, so the controller tries another
+node. CPU compatibility can be one-directional between two hosts. The create job itself hashes
 each layer image this worker does not yet trust (creates hash in parallel; two
 creates of the same new layer hash it once; creates whose layers are trusted never
 wait behind a hash) and a warm template's checkpoint archive the first time it is
@@ -356,7 +359,11 @@ becomes `192.0.2.2:<port>`, and `X-Forwarded-Host` (the client's host) and
 asking to upgrade (`Connection: upgrade`, `Upgrade: websocket`) gets the
 application's `101` and then a byte tunnel both ways. Redirects are returned, not
 followed. CONNECT is refused. A request without an `Accept` header reaches the
-application with `Accept: */*`, added by the controller's HTTP client.
+application with `Accept: */*`, added by the controller's HTTP client. Both services
+turn off Nagle's algorithm (`TCP_NODELAY`) on every accepted connection, and the
+hops to the worker and to the guest set it too, so the last piece of a small answer
+is sent at once instead of waiting for the client's delayed acknowledgement (before
+this, every small call on a kept-alive connection took about 40 ms).
 
 Bounds (`[server.proxy]` on each service): `max_connections` open exchanges
 (default 256; `503 busy` beyond it, held until the response or tunnel ends) and

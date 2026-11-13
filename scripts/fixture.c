@@ -168,7 +168,17 @@ int main(int argc, char **argv) {
             char line[64];
             int length = snprintf(line, sizeof(line), "%llu %llu\n", (unsigned long long)count, (unsigned long long)nonce);
             if (pwrite(counter, line, (size_t)length, 0) != length || ftruncate(counter, length)) fail("counter");
-            if (listener >= 0) {
+            /* Wait out the 100 ms tick, answering each HTTP client as soon as it connects. */
+            struct timespec tick;
+            if (clock_gettime(CLOCK_MONOTONIC, &tick)) fail("tick clock");
+            for (;;) {
+                struct timespec now;
+                if (clock_gettime(CLOCK_MONOTONIC, &now)) fail("tick clock");
+                long left = 100 - ((now.tv_sec-tick.tv_sec)*1000 + (now.tv_nsec-tick.tv_nsec)/1000000);
+                if (left <= 0) break;
+                if (listener < 0) { usleep((useconds_t)left*1000); break; }
+                struct pollfd incoming = {.fd=listener, .events=POLLIN};
+                if (poll(&incoming, 1, (int)left) <= 0) continue;
                 int client = accept4(listener, NULL, NULL, SOCK_NONBLOCK);
                 if (client >= 0) {
                     struct pollfd p = {.fd=client, .events=POLLIN};
@@ -278,7 +288,6 @@ int main(int argc, char **argv) {
                     close(client);
                 }
             }
-            usleep(100000);
         }
     }
     if (!strcmp(argv[1], "counter")) return read_file("/workspace/counter");

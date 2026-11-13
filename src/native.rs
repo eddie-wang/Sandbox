@@ -32,6 +32,9 @@ pub struct Native {
     unpacked: Condvar,
     // State of each pooled routing slot this worker built (see network.rs); never held across I/O.
     pub(crate) slots: Mutex<BTreeMap<usize, crate::network::SlotState>>,
+    // CRIU's answer, by cpuinfo.img digest, to whether this host's CPU can run a warm template's
+    // processes (see cpu_compatible); only clear answers are kept.
+    cpu_checks: Mutex<BTreeMap<String, bool>>,
     _lock: File,
 }
 
@@ -59,6 +62,11 @@ fn load_verified(root: &Path) -> BTreeMap<String, VerifiedLayer> {
         || state.layers.iter().any(|l| !storage::hex_digest(&l.sha256) || l.bytes != l.file.size) { return BTreeMap::new(); }
     state.layers.into_iter().map(|l| (l.sha256.clone(), l)).collect()
 }
+
+// Size limit of a template's cpuinfo.img (CRIU's description of the capturing host's CPU).
+const CPUINFO_MAX_BYTES: u64 = 1 << 20;
+// Deadline of one `criu cpuinfo check`, which runs while a create is being admitted.
+const CPU_CHECK_SECONDS: u64 = 5;
 
 // Where the reaping init (the trusted static tini) is bind-mounted read-only in every sandbox.
 const INIT_PATH: &str = "/.sandbox-init";
@@ -201,13 +209,12 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let output = process::version(tools.get(name)?, search_path.as_ref().ok()?).ok()?;
         (!output.interrupted && output.exit_code == Some(0)).then(|| output.stdout.trim().to_owned())
     };
+    // CPU features are not fingerprinted here: CRIU checks them per warm template (cpu_compatible).
     let compatibility = (|| {
-        let cpu = fs::read_to_string("/proc/cpuinfo").ok()?;
-        let features = cpu.lines().find(|l| l.starts_with("flags") || l.starts_with("Features"))?.split_once(':')?.1.trim();
         // Restored processes map the init executable, so its exact bytes are part of compatibility.
         let init = storage::artifact(Path::new(tools.get("tini")?), 1 << 26).ok()?;
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
-            cpu_features_sha256: storage::digest(features.as_bytes()), runc_version: version("runc")?, criu_version: version("criu")?,
+            runc_version: version("runc")?, criu_version: version("criu")?,
             init_sha256: init.sha256, layout: "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1".to_owned() })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
@@ -243,7 +250,7 @@ impl Native {
         }
         let verified = load_verified(root);
         Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers,
-            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), _lock: lock })
+            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock })
     }
     // Return the configured root of this worker's runtime storage.
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
@@ -252,8 +259,11 @@ impl Native {
     // Return the verified executable path, or fail if that tool was not discovered.
     pub fn tool(&self, name: &str) -> Result<&str> { self.tools.get(name).map(String::as_str).ok_or("tool_missing") }
     // Run a verified host tool with the configured deadline and tracked helper cleanup, requiring success.
+    // A failure is also written to the worker's error output as the tool name and error code only.
     pub(crate) fn command(&self, tool: &str, args: Vec<String>) -> Result<()> {
-        process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers)
+        let result = process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers);
+        if let Err(code) = result { eprintln!("sandboxd: host tool {tool} failed: {code}"); }
+        result
     }
     // Run runc against this worker's private state with the supplied deadline and output limit. Detached
     // cold runs and restores get /dev/null stdio, which the workload inherits and CRIU can restore (a
@@ -271,20 +281,56 @@ impl Native {
         else if out.exit_code != Some(0) { Err("runc_failed") } else { Ok(()) }
     }
     // Cheap check before each create or capture: load the manifest (digest sidecar, strict fields, host
-    // compatibility) and require operator-approved networking and the configured process limit. Return
-    // the manifest and its digest. Artifact contents are not hashed here; see verify_layers and
+    // compatibility) and require operator-approved networking, the configured process limit and, for a
+    // warm template, CRIU's acceptance of this CPU (checked once per template). Return the manifest
+    // and its digest. Artifact contents are not hashed here; see verify_layers and
     // checkpoint_images for the once-per-node checks.
     pub fn template_manifest(&self, id: &str) -> Result<(Manifest, String)> {
         let (m, digest) = storage::load_manifest(self.root(), id, &self.compatibility)?;
         self.template_usable(&m)?;
         Ok((m, digest))
     }
-    // Require the template's network policy to be operator-approved and its process limit to match this
-    // worker's configuration.
+    // Require the template's network policy to be operator-approved, its process limit to match this
+    // worker's configuration and, for a warm template, CRIU to accept this host's CPU.
     fn template_usable(&self, m: &Manifest) -> Result<()> {
         self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
+        if let Some(cpuinfo) = &m.cpuinfo { self.cpu_compatible(&m.template_id, cpuinfo)?; }
         Ok(())
+    }
+    // Decide with CRIU's own check (`criu cpuinfo check`, default capabilities) whether this host's CPU
+    // can run the processes of a warm template, from the cpuinfo.img saved at its capture (its digest
+    // is verified first). The answer is remembered per digest; a check that could not finish is not.
+    // CRIU may accept a template from host A on host B but not the reverse.
+    fn cpu_compatible(&self, template: &str, cpuinfo: &Artifact) -> Result<()> {
+        let known = self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).get(&cpuinfo.sha256).copied();
+        let compatible = match known {
+            Some(answer) => answer,
+            None => {
+                let dir = self.root().join("templates").join(template);
+                storage::verify(&dir.join("cpuinfo.img"), cpuinfo, CPUINFO_MAX_BYTES)?;
+                let args = vec!["cpuinfo".into(), "check".into(), "--images-dir".into(), dir.display().to_string()];
+                let out = self.helpers.run(self.tool("criu")?, &args, Duration::from_secs(CPU_CHECK_SECONDS), 65536, false, &self.search_path)?;
+                if out.interrupted || out.exit_code.is_none() { return Err("cpu_check_interrupted"); }
+                let answer = out.exit_code == Some(0);
+                self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).insert(cpuinfo.sha256.clone(), answer);
+                answer
+            }
+        };
+        if compatible { Ok(()) } else { Err("cpu_incompatible") }
+    }
+    // Write CRIU's description of this host's CPU (`criu cpuinfo dump`) as cpuinfo.img into a capture's
+    // staging directory, owner-only, and return its digest; this host is remembered as compatible.
+    // CRIU describes x86-64 CPUs only, so on other architectures there is nothing to save.
+    pub fn save_cpuinfo(&self, dir: &Path) -> Result<Option<Artifact>> {
+        use std::os::unix::fs::PermissionsExt;
+        if !storage::CPUINFO_SAVED { return Ok(None); }
+        self.command("criu", vec!["cpuinfo".into(), "dump".into(), "--images-dir".into(), dir.display().to_string()]).map_err(|_| "cpuinfo_dump_failed")?;
+        let file = dir.join("cpuinfo.img");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).map_err(|_| "artifact_permissions_failed")?;
+        let cpuinfo = storage::artifact(&file, CPUINFO_MAX_BYTES)?;
+        self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).insert(cpuinfo.sha256.clone(), true);
+        Ok(Some(cpuinfo))
     }
     // Check that no network, private storage, runtime state or resource group already uses this sandbox
     // ID.

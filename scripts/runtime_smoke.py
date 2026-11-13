@@ -23,6 +23,7 @@ import time
 
 import socket
 import stat
+import statistics
 import threading
 
 from smoke import eventually, exchange, exec_events, expect, port, request as smoke_request
@@ -120,11 +121,65 @@ def write_template(root, manifest):
     return template
 
 
+# Return a copy of CRIU's x86-64 CPU description (cpuinfo.img: 8 magic bytes, then one
+# length-prefixed CpuinfoEntry) whose x86 entry also requires extended-state feature bit 50, which
+# no CPU has, so `criu cpuinfo check` must reject it on any host.
+def unsupported_cpuinfo(image):
+    def varint(data, at):
+        value = shift = 0
+        while True:
+            byte = data[at]
+            at += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value, at
+
+    def encode_varint(value):
+        out = bytearray()
+        while True:
+            low, value = value & 0x7F, value >> 7
+            out.append(low | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+    def fields(data):
+        at, found = 0, []
+        while at < len(data):
+            key, at = varint(data, at)
+            kind = key & 7
+            if kind == 0:
+                value, at = varint(data, at)
+            elif kind == 2:
+                size, at = varint(data, at)
+                value, at = data[at:at + size], at + size
+            else:
+                size = 8 if kind == 1 else 4
+                value, at = data[at:at + size], at + size
+            found.append((key, value))
+        return found
+
+    def encode(found):
+        out = bytearray()
+        for key, value in found:
+            out += encode_varint(key)
+            out += encode_varint(value) if key & 7 == 0 else (encode_varint(len(value)) + value if key & 7 == 2 else value)
+        return bytes(out)
+
+    size = int.from_bytes(image[8:12], "little")
+    entry = fields(image[12:12 + size])
+    assert entry and entry[0][0] == (1 << 3 | 2), "no x86 CPU entry"
+    x86 = [(key, value | 1 << 50) if key == (8 << 3) else (key, value) for key, value in fields(entry[0][1])]
+    assert any(key == (8 << 3) for key, _ in x86), "no xfeatures mask"
+    changed = encode([(entry[0][0], encode(x86))] + entry[1:])
+    return image[:8] + len(changed).to_bytes(4, "little") + changed + image[12 + size:]
+
+
 # Run the privileged gate on fixture templates through a real worker and controller: creates, execs
-# and bounds, rejections, disconnects, DELETE waits, captures (failed, interrupted, dead source,
-# chained), warm restores, layer verification across restarts, TTL and crash cleanup; --network adds
-# policy networking and the app proxy. Retain the root and observations; require no owned state to
-# remain.
+# and bounds, rejections (including CRIU's CPU check), disconnects, DELETE waits, captures (failed,
+# interrupted, dead source, chained), warm restores, layer verification across restarts, TTL and crash
+# cleanup; --network adds policy networking and the app proxy (with a small-call latency bound).
+# Retain the root and observations; require no owned state to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -787,6 +842,20 @@ url = "http://127.0.0.1:{worker_port}"
                     fnv = ((fnv ^ byte) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
                 status, _, body = proxy_call(sandbox, "POST", "/count", upload, {"Content-Type": "application/octet-stream"})
                 assert status == 200 and body == f"bytes={len(upload)} fnv={fnv:016x}".encode(), body
+                # Small calls on one kept-alive client connection, through the controller and the worker,
+                # are not held back by Nagle's algorithm (about 40 ms each without TCP_NODELAY). The
+                # guest answers chunked, so its data and final chunk reach the hops as separate pieces.
+                small = http.client.HTTPConnection("127.0.0.1", controller_port, timeout=10)
+                small_calls = []
+                for _ in range(40):
+                    started = time.perf_counter()
+                    small.request("GET", f"/v1/sandboxes/{sandbox}/proxy/8080/chunked/1/0", headers={"Authorization": "Bearer " + token})
+                    reply = small.getresponse()
+                    assert reply.status == 200 and reply.read() == b"part-0\n"
+                    small_calls.append(time.perf_counter() - started)
+                small.close()
+                small_call_p50 = statistics.median(small_calls)
+                assert small_call_p50 < 0.010, f"small proxied call p50 {small_call_p50 * 1000:.1f} ms"
                 # Every proxied connection was opened inside the routing slot: none in this namespace.
                 assert not any(row.split()[2] == "020200C0:1F90" for row in Path("/proc/net/tcp").read_text().splitlines()[1:]), "guest connection in the worker namespace"
                 # Nothing for longer than the worker idle timeout (3 s) is a 504; the sandbox keeps running.
@@ -807,6 +876,7 @@ url = "http://127.0.0.1:{worker_port}"
                 assert {box["result"][0] for _, box in held} <= {200, 504}
                 eventually(lambda: proxy_call(sandbox, "GET", "/")[0] == 200, timeout=40)
                 observations.setdefault("proxy_full", {})[sandbox] = dict(chunk_arrivals_s=[at for at, _ in arrivals], download_bytes=size, upload_bytes=len(upload),
+                    small_call_p50_ms=round(small_call_p50 * 1000, 3), small_call_max_ms=round(max(small_calls) * 1000, 3),
                     held_results=sorted(box["result"][0] for _, box in held))
                 assert get(sandbox)["state"] == "running"
             return True
@@ -956,7 +1026,20 @@ url = "http://127.0.0.1:{worker_port}"
         warm_manifest = json.loads((root / "templates" / "warm" / "manifest.json").read_text())
         layer = warm_manifest["layers"][0]["sha256"]
         assert warm_manifest["schema_version"] == 3 and len(warm_manifest["layers"]) == 1 and (root / "layers" / f"{layer}.erofs").is_file()
-        assert sorted(p.name for p in (root / "templates" / "warm").iterdir()) == ["checkpoint.tar", "manifest.json", "manifest.sha256"]
+        assert sorted(p.name for p in (root / "templates" / "warm").iterdir()) == ["checkpoint.tar", "cpuinfo.img", "manifest.json", "manifest.sha256"]
+        # CRIU's own CPU check (not an exact feature match) decides warm compatibility. A copy of the
+        # template whose saved CPU description CRIU rejects here is refused before launch, so a
+        # controller would try another node; no ID, record or runtime state is created.
+        cpuinfo = (root / "templates" / "warm" / "cpuinfo.img").read_bytes()
+        assert warm_manifest["cpuinfo"] == {"sha256": hashlib.sha256(cpuinfo).hexdigest(), "bytes": len(cpuinfo)}
+        unsupported = unsupported_cpuinfo(cpuinfo)
+        cpu_template = write_template(root, dict(warm_manifest, template_id="cpu-unsupported", cpuinfo={"sha256": hashlib.sha256(unsupported).hexdigest(), "bytes": len(unsupported)}))
+        (cpu_template / "cpuinfo.img").write_bytes(unsupported)
+        (cpu_template / "cpuinfo.img").chmod(0o600)
+        before_dirs = {name: sorted(p.name for p in (root / name).iterdir()) for name in ("private", "runc", "records")}
+        rejected = expect(create_call(dict(template_id="cpu-unsupported", ttl_seconds=60)), 422, "template_unavailable")
+        assert "sandbox_id" not in rejected and before_dirs == {name: sorted(p.name for p in (root / name).iterdir()) for name in ("private", "runc", "records")}
+        observations["criu_cpu_check_rejects_before_launch"] = "cpu-unsupported"
         remove(isolated)
         expect(create_call(dict(template_id="warm", ttl_seconds=60, memory_mib=128)), 422, "template_resource_mismatch")
         child = create("warm")

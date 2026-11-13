@@ -219,8 +219,9 @@ async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRe
 }
 
 // Initialize preflight and lifecycle ownership away from request handling, then serve protected
-// management routes and the path-form app proxy. On a termination signal, stop admission and cancel
-// live work, finish serving, then wait for engine-owned cleanup before returning.
+// management routes and the path-form app proxy; accepted connections send without Nagle delay. On a
+// termination signal, stop admission and cancel live work, finish serving, then wait for engine-owned
+// cleanup before returning.
 pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str> {
     let server = config.server.clone();
     let handle = tokio::task::spawn_blocking(move || {
@@ -252,7 +253,7 @@ pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str
             let _ = tokio::task::spawn_blocking(move || sender.send(Work::Stop(stopped_tx))).await;
         }
     };
-    let result = axum::serve(listener, app).with_graceful_shutdown(stop).await;
+    let result = axum::serve(axum::serve::ListenerExt::tap_io(listener, http::no_delay), app).with_graceful_shutdown(stop).await;
     if let Some(sender) = handle.sender {
         tokio::task::spawn_blocking(move || stopped_rx.recv().or_else(|_| {
             // The server ended without a termination signal: stop it now.

@@ -10,7 +10,6 @@ use crate::{model::valid_id, process::{self, Result}};
 pub struct Compatibility {
     pub architecture: String,
     pub kernel: String,
-    pub cpu_features_sha256: String,
     pub runc_version: String,
     pub criu_version: String,
     pub init_sha256: String,
@@ -32,6 +31,9 @@ pub struct Manifest {
     pub base: Artifact,
     pub layers: Vec<Artifact>,
     pub checkpoint: Option<Artifact>,
+    // A warm template's CPU description written by `criu cpuinfo dump` on the capturing host
+    // (cpuinfo.img, x86-64 only); each worker checks it with `criu cpuinfo check` before restoring.
+    pub cpuinfo: Option<Artifact>,
     pub init_argv: Vec<String>,
     pub memory_mib: Option<u64>,
     pub vcpus: Option<u32>,
@@ -47,6 +49,8 @@ pub struct Manifest {
 pub const MANIFEST_SCHEMA: u32 = 3;
 // Sealed capture layers a template may stack above its base (chained captures add one each).
 pub const MAX_LAYERS: usize = 16;
+// Whether warm templates carry CRIU's CPU description (cpuinfo.img). CRIU writes one for x86-64 only.
+pub const CPUINFO_SAVED: bool = cfg!(target_arch = "x86_64");
 
 // Return the SHA-256 fingerprint of the supplied bytes.
 pub fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
@@ -166,8 +170,9 @@ pub fn verify_identified(path: &Path, expected: &Artifact, max: u64) -> Result<F
 }
 
 // Load a template manifest with bounded manifest-only checks (digest sidecar, strict fields, exact
-// host compatibility), cheap enough for every create. Artifact contents are not read. Return the
-// manifest and its digest, which keys the node's checkpoint cache.
+// host compatibility of architecture, kernel, runc, CRIU, init and layout), cheap enough for every
+// create. The CPU check of a warm template is done by the worker (Native::cpu_compatible). Artifact
+// contents are not read. Return the manifest and its digest, which keys the node's checkpoint cache.
 pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Result<(Manifest, String)> {
     if !valid_id(id) { return Err("invalid_template_id"); }
     let dir = root.join("templates").join(id);
@@ -189,12 +194,12 @@ pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Re
         // Warm templates require exact resources; cold ones may declare create defaults.
         || (warm && (m.memory_mib.is_none() || m.vcpus.is_none()))
         || m.memory_mib.is_some_and(|v| !(1..=1_048_576).contains(&v)) || m.vcpus.is_some_and(|v| !(1..=4_096).contains(&v))
-        || warm != m.oci_config_sha256.is_some()
+        || warm != m.oci_config_sha256.is_some() || (warm && CPUINFO_SAVED) != m.cpuinfo.is_some()
         || m.oci_config_sha256.as_ref().is_some_and(|d| !hex_digest(d))
         || m.init_argv.is_empty() || m.init_argv.len() > 64
         || m.init_argv.iter().any(|a| a.len() > 4096 || a.contains('\0')) || !m.init_argv[0].starts_with('/')
     { return Err("incompatible_template"); }
-    if !std::iter::once(&m.base).chain(&m.layers).chain(&m.checkpoint).all(|a| hex_digest(&a.sha256)) { return Err("invalid_artifact_descriptor"); }
+    if !std::iter::once(&m.base).chain(&m.layers).chain(&m.checkpoint).chain(&m.cpuinfo).all(|a| hex_digest(&a.sha256)) { return Err("invalid_artifact_descriptor"); }
     Ok((m, expected))
 }
 

@@ -314,9 +314,10 @@ async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &st
 }
 
 // Start protected management routes, the app proxy (path form, plus host routing below the configured
-// proxy domain) and bounded worker polling, with redirects and environment proxies disabled. On
-// shutdown, stop accepting, let open requests finish for at most the longest management route wait
-// (plus one request_timeout_ms per hop), then cut any still-open streams and cancel the poller.
+// proxy domain) and bounded worker polling, with redirects and environment proxies disabled; accepted
+// connections send without Nagle delay. On shutdown, stop accepting, let open requests finish for at
+// most the longest management route wait (plus one request_timeout_ms per hop), then cut any
+// still-open streams and cancel the poller.
 pub async fn run(config: ControllerConfig, token: String, worker_token: String) -> Result<(), &'static str> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -366,7 +367,7 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
     let poller = tokio::spawn(poll(controller, config, client, worker_token));
     println!("controller listening; controller-assigned placement and ID-prefix routing enabled");
     let (signaled, shutdown_started) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move { http::shutdown().await; let _ = signaled.send(()); });
+    let server = axum::serve(axum::serve::ListenerExt::tap_io(listener, http::no_delay), app).with_graceful_shutdown(async move { http::shutdown().await; let _ = signaled.send(()); });
     let result = tokio::select! {
         result = async { server.await } => result,
         _ = async { if shutdown_started.await.is_ok() { tokio::time::sleep(grace).await } else { std::future::pending().await } } => {

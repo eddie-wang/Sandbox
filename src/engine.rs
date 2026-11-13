@@ -338,9 +338,11 @@ impl Engine {
         if u.restores >= s.capacity.max_concurrent_restores { let _ = reply.send(Err("busy")); return; }
         // Bounded manifest read on this dedicated thread (never Tokio). A template this
         // worker cannot launch is rejected before any record, so the controller may
-        // place the create elsewhere. The job hashes each layer image once per node
-        // (first use, kept across restarts while the file is unchanged) and each
-        // checkpoint archive once (first unpack).
+        // place the create elsewhere; that includes a warm template whose CPU CRIU
+        // rejects here (one short `criu cpuinfo check` per template, then remembered).
+        // The job hashes each layer image once per node (first use, kept across
+        // restarts while the file is unchanged) and each checkpoint archive once (first
+        // unpack).
         let Ok((manifest, _)) = self.native.template_manifest(&request.template_id) else { let _ = reply.send(Err("template_unavailable")); return; };
         let warm = manifest.checkpoint.is_some();
         let resolve = |explicit: Option<u64>, template: Option<u64>| match (explicit, template) {
@@ -593,9 +595,10 @@ impl Runner<'_> {
             }
         }
     }
-    // Capture a running sandbox as a new warm template without stopping it (AgentENV order): freeze it,
-    // flush and seal its upper directory into an EROFS layer, checkpoint it with CRIU leaving it running,
-    // then thaw it. Afterwards archive the images, write the manifest and publish the layer and template.
+    // Capture a running sandbox as a new warm template without stopping it (AgentENV order): save CRIU's
+    // description of this host's CPU, freeze it, flush and seal its upper directory into an EROFS layer,
+    // checkpoint it with CRIU leaving it running, then thaw it. Afterwards archive the images, write the
+    // manifest and publish the layer and template.
     // On any failure, including a dump stopped at its deadline (`checkpoint_interrupted`), thaw the
     // source and keep it if it runs (AgentENV recover); a source that stays frozen, is not running
     // or was cancelled is deleted. Success means publication and a running source.
@@ -615,6 +618,8 @@ impl Runner<'_> {
             if manifest.layers.len() >= storage::MAX_LAYERS { return Err("template_layer_limit"); }
             storage::exclusive_private_dir(&stage)?;
             stage_owned = true;
+            // Saved before the freeze so it does not lengthen the frozen window.
+            let cpuinfo = self.native.save_cpuinfo(&stage)?;
             let images = stage.join("images"); storage::private_dir(&images)?;
             let sealed = stage.join("layer.erofs");
             // Frozen window: the sealed files and the process images describe one instant.
@@ -630,6 +635,7 @@ impl Runner<'_> {
             manifest.template_id = request.template_id.clone(); manifest.generation = generation.clone();
             manifest.layers.insert(0, layer.clone());
             manifest.checkpoint = Some(storage::artifact(&stage.join("checkpoint.tar"), max)?);
+            manifest.cpuinfo = cpuinfo;
             manifest.memory_mib = Some(self.record.request.memory_mib); manifest.vcpus = Some(self.record.request.vcpus);
             manifest.oci_config_sha256 = Some(self.native.spec_digest(&id)?);
             storage::write_manifest(&stage, &manifest)?;

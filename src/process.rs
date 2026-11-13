@@ -116,7 +116,7 @@ fn stream_child(mut child: std::process::Child, stdout: std::process::ChildStdou
                     total += keep;
                     if n > keep { stopped.get_or_insert("exec_output_limit"); }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
                 Err(_) => *slot = None,
             }
         }
@@ -220,9 +220,33 @@ fn nonblocking_pipes(child: &mut std::process::Child) -> Result<(std::process::C
     Ok((stdout, stderr))
 }
 
+// Read what is already in one pipe of an exited command into `buffer`, keeping at most `limit` bytes
+// there. Stop at end of file or as soon as the pipe is empty: everything the command itself wrote is
+// already in the pipe when it exits, and a pipe that is empty but still open is held by a descendant
+// or by another command being started at that moment, which is not a failure and is never waited
+// for. A descendant that keeps writing is cut at the limit, so this always ends quickly. Return
+// whether the output was cut at the limit or failed to read.
+fn drain_exited(pipe: &mut dyn Read, buffer: &mut Vec<u8>, limit: usize) -> bool {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(n) => {
+                let remaining = limit.saturating_sub(buffer.len());
+                buffer.extend_from_slice(&chunk[..n.min(remaining)]);
+                if n > remaining { return true; }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
 // Start a host command with a cleared environment, parent-death protection and output/time bounds.
-// While monitoring, deadline, read or output failures trigger a command-group kill attempt. Final
-// draining or size checks can also mark results interrupted without killing the group. Return exit
+// While monitoring, deadline, read or output failures trigger a command-group kill attempt. After the
+// command exits, its remaining output is read without waiting for descendants (see drain_exited);
+// that read or the size check can mark results interrupted without killing the group. Return exit
 // status and output; Helpers::run separately cleans up tracked descendants.
 fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, quiet: bool, search_path: &str, helper_procs: Option<RawFd>) -> Result<Output> {
     let mut child = spawn(program, args, quiet, search_path, helper_procs)?;
@@ -260,7 +284,7 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
                     buffer.extend_from_slice(&chunk[..n.min(remaining)]);
                     if n > remaining { interrupted = true; }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {},
                 Err(_) => interrupted = true,
             }
         }
@@ -271,13 +295,9 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
             break child.wait().map_err(|_| "tool_wait_failed")?;
         }
         if let Some(status) = child.try_wait().map_err(|_| "tool_wait_failed")? {
-            // Drain the remaining bounded pipe data without waiting for descendants.
+            // An empty pipe that is still held open ends the read; it is not an interruption.
             for (pipe, buffer) in [(&mut stdout as &mut dyn Read, &mut out), (&mut stderr as &mut dyn Read, &mut err)] {
-                let mut tail = Vec::new();
-                if pipe.take((limit.saturating_sub(buffer.len()) + 1) as u64).read_to_end(&mut tail).is_err() { interrupted = true; }
-                let remaining = limit.saturating_sub(buffer.len());
-                if tail.len() > remaining { interrupted = true; }
-                buffer.extend_from_slice(&tail[..tail.len().min(remaining)]);
+                interrupted |= drain_exited(pipe, buffer, limit);
             }
             break status;
         }

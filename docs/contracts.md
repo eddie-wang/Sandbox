@@ -36,6 +36,7 @@ exclusive to that worker; operators must not share it between worker roots.
   templates/<template-id>/
     manifest.json manifest.sha256
     checkpoint.tar                present only for warm templates
+    cpuinfo.img                   warm templates on x86-64: CRIU's CPU description
   staging/<template-id>/          unpublished capture; exclusively created by the
                                   one in-flight capture reserving that template ID;
                                   a failed removal blocks that ID until restart
@@ -117,10 +118,11 @@ Strict JSON fields (unknown fields are rejected):
 | `schema_version` | Exactly `3`; v1/v2 (per-create `upper.tar`) templates are rejected, not silently migrated |
 | `template_id`, `generation` | Validated immutable publication ID and worker-generated capture-generation ID |
 | `runtime` | Exactly `runc_criu` |
-| `compatibility` | Architecture, exact kernel release, SHA-256 of CPU feature string, exact runc and CRIU version output, fixed mount/network/seccomp layout version |
+| `compatibility` | Architecture, exact kernel release, exact runc and CRIU version output, init digest, fixed mount/network/seccomp layout version (no CPU fingerprint; see `cpuinfo`) |
 | `base` | `{ "sha256": "...", "bytes": ... }` for `layers/<digest>.erofs` |
 | `layers` | Sealed capture layers above the base, newest first, each a descriptor for `layers/<digest>.erofs`; empty for cold, 1–16 for warm (a capture of a warm child adds one) |
 | `checkpoint` | Null for cold, or the descriptor of `checkpoint.tar` (CRIU images) from the same frozen instant as `layers[0]` |
+| `cpuinfo` | Null for cold; for warm templates on x86-64, the descriptor of `cpuinfo.img`, CRIU's description of the capturing host's CPU (`criu cpuinfo dump`, written just before the freeze). On other architectures CRIU writes none and the field is null |
 | `init_argv` | Trusted absolute in-container executable + argv; not an OCI config/host executable |
 | `memory_mib`, `vcpus` | Cold: optional create defaults (1–1,048,576 MiB, 1–4,096); warm: required, exact captured resources |
 | `pids_max` | Exact configured pids limit |
@@ -129,7 +131,7 @@ Strict JSON fields (unknown fields are rejected):
 | `uid`, `gid` | Exactly `65534`, `65534` |
 
 `compatibility` is emitted by read-only `preflight` and has exactly:
-`architecture`, `kernel`, `cpu_features_sha256`, `runc_version`, `criu_version`,
+`architecture`, `kernel`, `runc_version`, `criu_version`,
 `init_sha256` (SHA-256 of the trusted static `tini` the worker bind-mounts as PID 1;
 restored processes map it), `layout`. The OCI network-policy digest annotation is
 preserved during normalization; the init's host path is normalized like the other
@@ -142,12 +144,26 @@ script demonstrates complete cold publication; do not guess compatibility string
 Exact matching deliberately rejects more hosts than might technically work. Version
 matching is necessary, **not sufficient proof of CRIU portability**.
 
+CPU compatibility of a warm template is CRIU's own decision, as AgentENV leaves it
+(AgentENV fingerprints no CPU features): before a create of a warm template is
+admitted, the worker verifies `cpuinfo.img` against its descriptor and runs
+`criu cpuinfo check --images-dir templates/<id>` (default capability set) with a
+5 s deadline. A failing check is a pre-launch `template_unavailable` (no ID, no
+record), so the controller tries another node. The answer is remembered per
+`cpuinfo.img` digest for the worker's lifetime (a check that could not finish is
+not remembered); a capture remembers its own host as compatible. The check can be
+**one-directional**: CRIU may accept a template captured on host A when restoring
+on host B, but refuse the reverse (for example when only A has `xsaves`). CRIU's
+restore repeats its own check.
+
 ## Capture, file identity and recovery
 
 The worker excludes overlapping mutations of the same sandbox; different sandboxes
 run on a bounded operation pool. Capture follows the AgentENV container backend and
 **never stops the source**:
 
+0. Before the freeze, `criu cpuinfo dump` writes the host's CPU description as
+   `cpuinfo.img` into the staging directory (x86-64; see `cpuinfo` above).
 1. `runc pause` freezes the source's cgroup.
 2. While frozen: read each task's `/proc/<pid>/maps` for a `[uprobes]` mapping (left
    by a host tracing/security agent), `syncfs` the overlay and build an EROFS image

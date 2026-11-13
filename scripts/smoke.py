@@ -20,6 +20,7 @@ from pathlib import Path
 import secrets
 import select
 import socket
+import statistics
 import subprocess
 import tempfile
 import threading
@@ -64,6 +65,24 @@ def exchange(port_number, method, path, headers=None, body=None, timeout=10):
         return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
     finally:
         connection.close()
+
+
+# Time `count` small proxied POSTs sent one after another over one kept-alive connection and return
+# each round trip in seconds. A reply held back by Nagle's algorithm until the client's delayed
+# acknowledgement shows up as about 40 ms per call.
+def small_call_latencies(port_number, path, headers, count=60):
+    connection = http.client.HTTPConnection("127.0.0.1", port_number, timeout=10)
+    seconds = []
+    try:
+        for _ in range(count):
+            started = time.perf_counter()
+            connection.request("POST", path, body=b"ping", headers=headers)
+            response = connection.getresponse()
+            assert response.status == 200 and response.read() == b"ping", response.status
+            seconds.append(time.perf_counter() - started)
+    finally:
+        connection.close()
+    return seconds
 
 
 # Run a streaming exec (server-sent events) and return the HTTP status with either the error body or
@@ -160,9 +179,10 @@ class RoutingDouble:
                         self.rfile.readline()
                 return self.rfile.read(int(self.headers.get("Content-Length") or 0))
 
-            # Answer a proxied app request forwarded by the controller (no runtime): echo the request,
-            # return a chosen status with hop-by-hop headers, stream chunks or a trickle, send a
-            # binary pattern, wait before answering, or switch to a raw echo tunnel on upgrade.
+            # Answer a proxied app request forwarded by the controller (no runtime): echo the request
+            # (at once, or chunked with its end sent apart), return a chosen status with hop-by-hop
+            # headers, stream chunks or a trickle, send a binary pattern, wait before answering, or
+            # switch to a raw echo tunnel on upgrade.
             def proxy(self):
                 app = self.path.split("/proxy/", 1)[1].split("/", 1)[1] if "/" in self.path.split("/proxy/", 1)[1] else ""
                 route = "/" + app
@@ -177,6 +197,19 @@ class RoutingDouble:
                         self.send_header(name, value)
                     self.end_headers()
                     self.wfile.write(data)
+                elif route == "/split":
+                    # Echo the body chunked, sending the head with the data and then the final chunk a
+                    # moment later (no Nagle delay on this side), as an application server may do.
+                    data = self.body_bytes()
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self.protocol_version = "HTTP/1.1"
+                    self.send_response(200)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                    time.sleep(0.002)
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.close_connection = True
                 elif route.startswith("/status/"):
                     self.send_response(int(route.split("/")[2]))
                     for name, value in (("X-Custom", "kept"), ("Connection", "X-Hop"), ("X-Hop", "dropped"), ("Content-Length", "6")):
@@ -727,6 +760,11 @@ command_timeout_seconds = 10
                         while len(echoed) < len(message):
                             echoed += tunnel.recv(65536)
                         assert echoed == message
+                # Small calls on one kept-alive connection are not held back by Nagle's algorithm.
+                latencies = small_call_latencies(placing_port, prefix + "/split", bearer)
+                small_call_p50 = statistics.median(latencies)
+                assert small_call_p50 < 0.010, f"small proxied call p50 {small_call_p50 * 1000:.1f} ms"
+                print(f"INFO small proxied call through the controller: p50 {small_call_p50 * 1000:.2f} ms, max {max(latencies) * 1000:.2f} ms over {len(latencies)} calls")
                 # A streaming exec's events pass through as the owner sends them.
                 status, events = exec_events(placing_port, f"/v1/sandboxes/{first}/exec", controller_token, execution)
                 assert status == 200 and [name for _, name, _ in events] == ["start", "stdout", "stdout", "stdout", "exit"], events
@@ -744,7 +782,7 @@ command_timeout_seconds = 10
                 assert exchange(placing_port, "GET", prefix + "/echo", bearer)[0] == 200
                 expect(request(placing_port, prefix + "/echo"), 401, "unauthorized")
                 print("PASS controller proxy hop: owner routing, worker credential, forwarded host, raw paths, 4 MiB uploads (length and chunked), "
-                      "real status/headers, 8 MiB binary, streamed chunks, host form, upgrade tunnel, streaming exec, idle and connection bounds")
+                      "real status/headers, 8 MiB binary, streamed chunks, host form, upgrade tunnel, small-call p50 under 10 ms, streaming exec, idle and connection bounds")
 
                 settle({"stub-a": 1, "stub-b": 1})
                 doubles[0].mode = "busy"

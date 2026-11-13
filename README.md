@@ -16,7 +16,9 @@ stopped at its deadline, layer verification kept across worker restarts, a reapi
 only themselves, private writes/whiteouts, blocking inline results, cleanup after
 client disconnect mid-exec and mid-create, waiting concurrent DELETEs, TTL/delete
 and crash/restart cleanup. A real-image check (`python:3.12-slim`, including a
-WebSocket echo through the proxy) passed too.
+WebSocket echo through the proxy) passed too, and so did a local concurrency stress
+gate: 16 cold creates at once, 16 warm restores at once, then 16 of each together
+(32 concurrent creates), each batch deleted concurrently, with zero errors.
 This is a targeted functional result, **not production isolation, general workload
 readiness, cross-node portability or capacity qualification**. The validation host's
 indirect system-library/shell trust was not established; see the operator recipe.
@@ -118,7 +120,13 @@ RBAC, built-in TLS or Internet-facing connection defense.
   fixture. That fixture passed; arbitrary open-file/application states and other
   host configurations are **not assumed compatible**.
 - Local immutable template repository with bounded artifact verification and
-  exact kernel/CPU/architecture/runc/CRIU/config compatibility. All published
+  exact kernel/architecture/runc/CRIU/init/config compatibility. CPU compatibility
+  is CRIU's own check, not a feature fingerprint (AgentENV has none): a capture
+  saves `criu cpuinfo dump` output with the template, and before admitting a warm
+  restore the worker runs `criu cpuinfo check` against it (once per template); a
+  refusal is a pre-launch `template_unavailable`, so the controller tries another
+  node. That check can pass in one direction between two hosts and fail in the
+  other. All published
   templates/layers are retained; automatic cache eviction/GC and S3 transfer are
   not implemented.
 - `runc exec` with argv, bounded output/deadline, a blocking mode (one JSON result)
@@ -138,7 +146,13 @@ RBAC, built-in TLS or Internet-facing connection defense.
   exchanges are bounded, end when the sender stays silent for the idle timeout
   (a client that stops reading is not timed out) or when the sandbox is deleted
   (also while still connecting); there is no total deadline, and controller
-  shutdown waits for them only up to the longest management deadline.
+  shutdown waits for them only up to the longest management deadline. Both
+  services set `TCP_NODELAY` on accepted connections, so a small answer is not
+  held back about 40 ms waiting for the client's delayed acknowledgement.
+- Host tools run with bounded output and deadlines; once a tool exits, its output is
+  read without waiting for anything that still holds its pipes (a descendant, or a
+  concurrently started tool), so fast tools under concurrent creates are not
+  misreported as interrupted.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting

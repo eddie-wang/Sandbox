@@ -85,7 +85,7 @@ Run the nonprivileged checks first:
 ```sh
 cargo build --locked
 python3 scripts/smoke.py --binary target/debug/sandboxd
-python3 -m py_compile scripts/runtime_smoke.py scripts/image_e2e.py
+python3 -m py_compile scripts/runtime_smoke.py scripts/image_e2e.py scripts/stress_smoke.py
 cc -static -O2 -Wall -Wextra -Werror scripts/fixture.c -o target/smoke-fixture
 ```
 
@@ -166,7 +166,10 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    unchanged interval are recorded), and its loopback connection keeps working. A new container restores the same memory
    nonce, continues the loopback connection, sees the filesystem delta/whiteout, and
    writes independently of the source. The published template has a sealed EROFS layer
-   and `checkpoint.tar` but no upper archive; the mounted layer holds a whiteout for
+   and `checkpoint.tar` but no upper archive, plus the capturing host's `cpuinfo.img`
+   (its digest in the manifest); a copy whose `cpuinfo.img` requires a CPU feature no
+   host has (extended-state bit 50) is refused by `criu cpuinfo check` as a pre-launch
+   `422 template_unavailable` with no ID, record or runtime state; the mounted layer holds a whiteout for
    the deleted base file and the modified base file with its owner, mode and `user.`
    xattr, and the child's upper starts empty. The child's restore unpacks the node
    checkpoint cache once; it is unchanged by that restore and reused unchanged by a
@@ -214,6 +217,32 @@ The script does not prove hostile-workload containment, full memory-pressure/pid
 exhaustion behavior, system-wide host cleanup under every crash point, arbitrary
 application compatibility, S3 transfer or two-node portability. Extend approved
 integration qualification after this first gate; no unit-test substitute is used.
+
+## Local concurrency stress gate
+
+`scripts/stress_smoke.py` takes the same arguments as the lifecycle smoke and runs
+in the host network namespace with isolated sandboxes only (each still gets its own
+worker-created guest network namespace). Through a real controller and worker with
+the tiny fixture (64 MiB, one vCPU and 64 pids per sandbox), it starts **16 cold
+creates at once, then 16 warm restores of one capture at once, then 16 of each at
+the same moment (32 concurrent creates and guest namespaces)**, and deletes each
+batch concurrently. Every create and delete must succeed on its first attempt (no
+retry, no failover, no error code at all) and the worker must log no host tool
+failure; the usual no-leftover checks follow. It reports per-batch error counts and
+create/delete timings. The recorded run used an owned cgroup of 4 GiB and 4,096
+pids (peak about 190 MiB). It is a local burst check on one host, not a capacity or
+performance result.
+
+Host tools are run with their output on nonblocking pipes. Once a tool has exited,
+everything it wrote is already in its pipes, so the worker reads what is there and
+stops at the first empty read: a pipe still held open by a descendant, or briefly by
+another tool that is being started at that moment (a forked child holds copies of
+the worker's descriptors until it executes its program), is neither waited for nor
+an interruption. Before this, such a pipe made a fast tool look interrupted
+(`tool_deadline_or_output_limit`, and as `guest_namespace_create_failed` or
+`cleanup_failed` through their callers); concurrent creates hit it routinely. The
+output limit and deadline are unchanged. A failing host tool is written to the
+worker's error output as the tool's name and error code only.
 
 ## Failure and cleanup procedure
 
@@ -315,7 +344,9 @@ and the app proxy through the controller and worker: path and host forms, the
 management token absent from the forwarded request, Host and X-Forwarded-Host,
 authentication, an unapproved port (`403`), a returned redirect, a 20,000-byte
 response header, chunked parts arriving as sent, two concurrent 32 MiB binary
-downloads, an 8 MiB binary upload counted by the guest, the worker idle timeout
+downloads, an 8 MiB binary upload counted by the guest, 40 small calls on one
+kept-alive client connection through the controller and the worker with a median
+under 10 ms (no Nagle wait; see the API's app proxy section), the worker idle timeout
 (`504 upstream_timeout`, gate value 3 s), the worker connection limit (`503 busy`
 with four connections ESTABLISHED inside the slot and none in the worker's
 namespace), a stream ended by DELETE, and a worker crash during an open stream.
