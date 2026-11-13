@@ -154,7 +154,7 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
-    // Check the operation ID, nonempty command, argument sizes and output/deadline bounds.
+    // Check for a nonempty command, argument count/size limits and output/deadline bounds.
     pub fn valid(&self) -> bool {
         !self.argv.is_empty() && self.argv.len() <= 64 && !self.argv[0].is_empty()
             && self.argv.iter().all(|arg| arg.len() <= 4_096 && !arg.contains('\0'))
