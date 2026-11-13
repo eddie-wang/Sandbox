@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -36,10 +37,24 @@ static int read_file(const char *path) {
     close(fd);
     return 0;
 }
-/* Dispatch the smoke workload modes: persistent counter/mappings and optional HTTP service, file */
-/* operations, process-group, isolation and syscall-guard checks, TCP connect and path-MTU transfer, */
-/* or deliberate delay/output/descendant cases. Return each check's result; init and stress modes */
-/* keep running until stopped. */
+/* Open a connected loopback TCP pair on port 9000 (listener, client and accepted end), each with a */
+/* one-second receive timeout. The pair stays ESTABLISHED for the init's lifetime. */
+static void loopback_pair(int *client, int *server) {
+    struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(9000), .sin_addr={.s_addr=htonl(INADDR_LOOPBACK)}};
+    struct timeval timeout = {.tv_sec=1};
+    int one = 1, listener = socket(AF_INET, SOCK_STREAM, 0);
+    *client = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0 || *client < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))
+        || bind(listener, (struct sockaddr *)&a, sizeof(a)) || listen(listener, 1)
+        || connect(*client, (struct sockaddr *)&a, sizeof(a)) || (*server = accept(listener, NULL, NULL)) < 0) fail("loopback pair");
+    close(listener);
+    if (setsockopt(*client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))
+        || setsockopt(*server, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) fail("loopback timeout");
+}
+/* Dispatch the smoke workload modes: persistent counter/mappings, a loopback TCP round trip and */
+/* optional HTTP service, file operations, process-group, PID 1, zombie, isolation and syscall-guard */
+/* checks, TCP connect and path-MTU transfer, or deliberate delay/output/descendant cases. Return */
+/* each check's result; init and stress modes keep running until stopped. */
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     if (!strcmp(argv[1], "process-group")) {
@@ -100,10 +115,15 @@ int main(int argc, char **argv) {
             int one=1;
             if (listener < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) || bind(listener, (struct sockaddr *)&a, sizeof(a)) || listen(listener, 16)) fail("listen");
         }
-        signal(SIGCHLD, SIG_IGN);
-        /* Keep upper and immutable-lower descriptors AND mappings open over
+        /* No SIGCHLD handling: reaping orphans is the job of the PID 1 init.
+           Keep upper and immutable-lower descriptors AND mappings open over
            capture. The counter starts in memory, never from the filesystem. */
         int counter = open("/workspace/counter", O_CREAT | O_RDWR, 0666);
+        int loopback = open("/workspace/loopback", O_CREAT | O_RDWR, 0666);
+        int client = -1, server = -1, loopback_error = 0;
+        uint64_t roundtrips = 0;
+        if (loopback < 0) fail("loopback file");
+        loopback_pair(&client, &server);
         int state = open("/workspace/mapped", O_CREAT | O_RDWR, 0666);
         int seed = open("/seed", O_RDONLY);
         if (counter < 0 || state < 0 || seed < 0 || ftruncate(state, 4096)) fail("init files");
@@ -113,8 +133,16 @@ int main(int argc, char **argv) {
         volatile uint64_t count = 0;
         uint64_t nonce;
         if (getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce)) fail("getrandom");
-        int held = -1;
+        int held = -1, uffd = -1;
         for (;;) {
+            /* While /workspace/hold-uffd exists, hold a userfaultfd, a file CRIU cannot
+               dump, so a capture fails after the source was frozen. */
+            if (!access("/workspace/hold-uffd", F_OK) ? uffd < 0 : uffd >= 0) {
+                if (uffd < 0) uffd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
+                else { close(uffd); uffd = -1; }
+                int status = open("/workspace/uffd-status", O_CREAT | O_TRUNC | O_WRONLY, 0666);
+                if (status < 0 || dprintf(status, uffd >= 0 ? "held\n" : "released %d\n", errno) < 0 || close(status)) fail("uffd status");
+            }
             if (listener >= 0 && held < 0 && !access("/workspace/hold-external", F_OK)) {
                 held = socket(AF_INET, SOCK_STREAM, 0);
                 struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(18080)};
@@ -123,6 +151,17 @@ int main(int argc, char **argv) {
                 if (ready < 0 || write(ready, "ready", 5) != 5 || close(ready)) fail("held ready");
             }
             if (*immutable != 's') return 3;
+            /* One byte each way over the same ESTABLISHED connection on every tick;
+               a restore that broke it records the error instead of reconnecting. */
+            if (!loopback_error) {
+                char ping = 'p', pong = 0;
+                if (send(client, &ping, 1, MSG_NOSIGNAL) != 1 || recv(server, &ping, 1, 0) != 1
+                    || send(server, "q", 1, MSG_NOSIGNAL) != 1 || recv(client, &pong, 1, 0) != 1 || pong != 'q') loopback_error = errno ? errno : -1;
+                else roundtrips++;
+                char status[64];
+                int size = snprintf(status, sizeof(status), "roundtrips=%llu error=%d\n", (unsigned long long)roundtrips, loopback_error);
+                if (pwrite(loopback, status, (size_t)size, 0) != size || ftruncate(loopback, size)) fail("loopback status");
+            }
             *mapped = ++count;
             mapped[1] = nonce;
             char line[64];
@@ -198,6 +237,52 @@ int main(int argc, char **argv) {
         }
     }
     if (!strcmp(argv[1], "counter")) return read_file("/workspace/counter");
+    if (!strcmp(argv[1], "loopback")) {
+        /* The init's status line, then the ESTABLISHED (state 01) sockets on port 9000 (0x2328). */
+        char line[512]; unsigned local = 0, remote = 0, state = 0; int established = 0;
+        FILE *tcp = fopen("/proc/net/tcp", "r");
+        if (!tcp) fail("tcp table");
+        while (fgets(line, sizeof(line), tcp))
+            if (sscanf(line, " %*d: %*8x:%x %*8x:%x %x", &local, &remote, &state) == 3 && state == 1 && (local == 9000 || remote == 9000)) established++;
+        fclose(tcp);
+        read_file("/workspace/loopback");
+        printf("established=%d\n", established);
+        return 0;
+    }
+    if (!strcmp(argv[1], "init-name")) {
+        /* argv[0] of PID 1 in this sandbox's PID namespace. */
+        char name[256] = {0};
+        int fd = open("/proc/1/cmdline", O_RDONLY);
+        if (fd < 0 || read(fd, name, sizeof(name) - 1) < 0) fail("pid 1 cmdline");
+        printf("%s\n", name);
+        return 0;
+    }
+    if (!strcmp(argv[1], "orphan-exit")) {
+        /* The child outlives this command and is reparented to PID 1, which must reap it. */
+        pid_t child = fork();
+        if (child < 0) fail("fork");
+        if (!child) { usleep(100000); _exit(0); }
+        return 0;
+    }
+    if (!strcmp(argv[1], "zombies")) {
+        /* Count zombie (state Z) processes visible in this PID namespace. */
+        int zombies = 0; struct dirent *entry; DIR *proc = opendir("/proc");
+        if (!proc) fail("proc");
+        while ((entry = readdir(proc))) {
+            char path[300], stat[512] = {0};
+            if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+            snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) continue;
+            ssize_t n = read(fd, stat, sizeof(stat) - 1);
+            close(fd);
+            char *end = n > 0 ? strrchr(stat, ')') : NULL;
+            if (end && end[1] == ' ' && end[2] == 'Z') zombies++;
+        }
+        closedir(proc);
+        printf("%d\n", zombies);
+        return 0;
+    }
     if (!strcmp(argv[1], "read") && argc == 3) {
         char path[256]; filename(path, sizeof(path), argv[2]); return read_file(path);
     }

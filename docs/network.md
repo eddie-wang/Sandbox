@@ -32,8 +32,14 @@ kind/address/prefix and serialized bounds, not end-to-end routing or remote serv
 readiness. External routing and avoiding pool overlap with other workers/peers are
 operator responsibilities. The worker never repairs global routing/firewall/sysctls.
 
-Manifest v2 contains the policy. `isolated` creates no external links (the guest
-netns has only loopback); this remains the default configuration. `tcp_allowlist`
+Manifest v3 contains the policy. `isolated` creates no external links: the worker
+still creates and owns the sandbox's guest netns (same ownership marker, names,
+cleanup and restart reconciliation as networked sandboxes), but brings up only
+loopback in it, adds no veth, address, route or router namespace, and disables IPv6.
+This remains the default configuration. The worker creates the namespace itself
+because runc checkpoints always treat the network namespace as empty: a namespace
+runc created would restore with loopback down, breaking restored loopback
+connections, while a worker-created one passed by path keeps it. `tcp_allowlist`
 permits only its operator-approved subset. No create-time endpoint override exists
 in this milestone: changing a tool endpoint requires a different immutable template.
 Policies are not a universal reusable-template destination abstraction.
@@ -62,9 +68,11 @@ and mounts; no_new_privs and cgroups remain in force.
    the durable sandbox record. Names incorporate root and sandbox digests.
 2. Before resource creation, verify names are absent and durably create an exclusive
    private ownership marker. Do not adopt unexplained existing namespaces/links.
-3. Create guest/router namespace pins and down veths through trusted bounded helpers.
-   Disable IPv6 only inside these namespaces. Install router nftables atomically;
-   configure addresses/routes and attach the unique uplink to the existing bridge.
+3. Create the guest namespace pin (loopback up, IPv6 disabled); isolated sandboxes
+   stop here. Otherwise create the router namespace pin and down veths through
+   trusted bounded helpers, disable IPv6 there too, install router nftables
+   atomically, configure addresses/routes and attach the unique uplink to the
+   existing bridge.
 4. Bring links up only after the filter succeeds, then run/restore runc. The guest
    OCI network namespace points to its worker-owned pin. Warm OCI normalization
    replaces only reconstruction paths; the network-policy digest stays bound.
@@ -81,19 +89,23 @@ sandboxes overlap; one sandbox's exec/capture/HTTP/delete do not race. HTTP call
 cancellation does not orphan an accepted task. Each mutating host process and its
 descendants joins an exclusive restart-discoverable helper cgroup before exec.
 
-## Capture is not external connection cloning
+## Capture and established connections
 
-Application listening sockets and **fresh** post-restore outbound connections are
-the contract. Close accepted/outbound TCP connections before capture. A bounded
-namespace TCP-state precheck rejects active/closing sockets before stopping; CRIU
-still rejects unsupported state/races, without TCP-established or external-socket
-waivers. Failed/uncertain dumps retain the existing conservative source-termination
-behavior. No external peer or router conntrack/NAT state is checkpointed. A restored
-child gets a newly constructed router and its own pool address, not the source's
-remote connection identity. A successful listening-socket fixture is not broad
-application or cross-host checkpoint qualification.
+Capture follows AgentENV: CRIU dumps and restores established TCP connections
+(`--tcp-established`), with `network-lock nftables` while the source is checkpointed
+and while a child restores, and the source keeps running (`--leave-running`). There
+is no TCP-state precheck. Connections not yet accepted by a frozen application are
+skipped (`skip-in-flight`); the source serves them after the thaw. Because every
+guest has the same address in its own worker-created namespace, a captured socket's
+local address exists in every child, so listening sockets and loopback connections
+inside the sandbox restore and keep working (gate-tested). A connection to an external
+peer is restored only on the child's side: no external peer, router conntrack/NAT
+state or SNAT address is checkpointed, and the child gets a newly constructed router
+and its own pool address, so the child's copy fails on first use while the source
+keeps the original. Fresh post-restore outbound connections work normally. A
+successful fixture is not broad application or cross-host checkpoint qualification.
 
-Manifest v1 and the old isolated layout fingerprint are deliberately incompatible.
+Manifest v1/v2 and older layout fingerprints are deliberately incompatible.
 The new schema/layout also applies to newly provisioned isolated templates; there
 is no silent interpretation of old deny-all artifacts as network-enabled images.
 

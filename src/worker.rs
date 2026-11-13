@@ -24,7 +24,7 @@ fn failure(code: &'static str) -> ApiError {
         "template_unavailable" => (StatusCode::UNPROCESSABLE_ENTITY, "Template is missing, invalid or incompatible with this worker; nothing was started"),
         "template_resource_mismatch" => (StatusCode::UNPROCESSABLE_ENTITY, "Warm template requires its captured memory_mib/vcpus; nothing was started"),
         "resources_required" => (StatusCode::UNPROCESSABLE_ENTITY, "Template declares no default memory_mib/vcpus; supply them"),
-        "template_already_exists" | "capture_requires_quiescent_tcp" => (StatusCode::CONFLICT, "Capture rejected before checkpoint; the source keeps running"),
+        "template_already_exists" => (StatusCode::CONFLICT, "Capture rejected before checkpoint; the source keeps running"),
         "service_port_not_authorized" => (StatusCode::FORBIDDEN, "Port is not an approved service port of this sandbox"),
         "application_http_failed_or_bounded" | "application_http_invalid_result" => (StatusCode::BAD_GATEWAY, "Application HTTP failed, timed out or exceeded a bound"),
         "busy" => (StatusCode::SERVICE_UNAVAILABLE, "Operation pool or restore slots are busy; nothing was started"),

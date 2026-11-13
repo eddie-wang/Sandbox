@@ -13,6 +13,7 @@ pub struct Compatibility {
     pub cpu_features_sha256: String,
     pub runc_version: String,
     pub criu_version: String,
+    pub init_sha256: String,
     pub layout: String,
 }
 
@@ -29,7 +30,7 @@ pub struct Manifest {
     pub runtime: String,
     pub compatibility: Compatibility,
     pub base: Artifact,
-    pub upper: Option<Artifact>,
+    pub layers: Vec<Artifact>,
     pub checkpoint: Option<Artifact>,
     pub init_argv: Vec<String>,
     pub memory_mib: Option<u64>,
@@ -40,6 +41,10 @@ pub struct Manifest {
     pub uid: u32,
     pub gid: u32,
 }
+
+pub const MANIFEST_SCHEMA: u32 = 3;
+// Sealed capture layers a template may stack above its base (chained captures add one each).
+pub const MAX_LAYERS: usize = 16;
 
 // Return the SHA-256 fingerprint of the supplied bytes.
 pub fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
@@ -118,8 +123,9 @@ pub fn verify(path: &Path, expected: &Artifact, max: u64) -> Result<()> {
 }
 
 // Load a template manifest with bounded manifest-only checks (digest sidecar, strict fields, exact
-// host compatibility), cheap enough for admission. Artifact digests are not read.
-pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Result<Manifest> {
+// host compatibility), cheap enough for every create. Artifact contents are not read. Return the
+// manifest and its digest, which keys the node's checkpoint cache.
+pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Result<(Manifest, String)> {
     if !valid_id(id) { return Err("invalid_template_id"); }
     let dir = root.join("templates").join(id);
     trusted_directory(&dir)?;
@@ -128,33 +134,25 @@ pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Re
     if !meta.is_file() || meta.len() != 65 || meta.uid() != 0 || meta.mode() & 0o022 != 0 { return Err("invalid_manifest_digest"); }
     let mut expected = String::new();
     digest_file.take(66).read_to_string(&mut expected).map_err(|_| "invalid_manifest_digest")?;
-    if !expected.ends_with('\n') || !hex_digest(expected.trim_end()) || artifact(&dir.join("manifest.json"), 65536)?.sha256 != expected.trim_end() { return Err("manifest_digest_mismatch"); }
+    let Some(expected) = expected.strip_suffix('\n').map(str::to_owned) else { return Err("invalid_manifest_digest"); };
+    if !hex_digest(&expected) || artifact(&dir.join("manifest.json"), 65536)?.sha256 != expected { return Err("manifest_digest_mismatch"); }
     let m: Manifest = read_json(&dir.join("manifest.json"), 65536)?;
-    if m.schema_version != 2 || m.template_id != id || !valid_id(&m.generation)
+    let warm = m.checkpoint.is_some();
+    if m.schema_version != MANIFEST_SCHEMA || m.template_id != id || !valid_id(&m.generation)
         || m.runtime != "runc_criu" || &m.compatibility != compatibility
         || !m.network.valid() || m.uid != 65534 || m.gid != 65534
-        || m.upper.is_some() != m.checkpoint.is_some()
+        // A warm template has its sealed upper layer(s) and checkpoint from one capture.
+        || warm == m.layers.is_empty() || m.layers.len() > MAX_LAYERS
         // Warm templates require exact resources; cold ones may declare create defaults.
-        || (m.upper.is_some() && (m.memory_mib.is_none() || m.vcpus.is_none()))
+        || (warm && (m.memory_mib.is_none() || m.vcpus.is_none()))
         || m.memory_mib.is_some_and(|v| !(1..=1_048_576).contains(&v)) || m.vcpus.is_some_and(|v| !(1..=4_096).contains(&v))
-        || m.upper.is_some() != m.oci_config_sha256.is_some()
+        || warm != m.oci_config_sha256.is_some()
         || m.oci_config_sha256.as_ref().is_some_and(|d| !hex_digest(d))
         || m.init_argv.is_empty() || m.init_argv.len() > 64
         || m.init_argv.iter().any(|a| a.len() > 4096 || a.contains('\0')) || !m.init_argv[0].starts_with('/')
     { return Err("incompatible_template"); }
-    if !hex_digest(&m.base.sha256) { return Err("invalid_artifact_descriptor"); }
-    Ok(m)
-}
-
-// Load a template manifest, then fully hash its base layer and any warm upper and checkpoint archives
-// against their recorded digests and sizes.
-pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> Result<Manifest> {
-    let m = load_manifest(root, id, compatibility)?;
-    let dir = root.join("templates").join(id);
-    verify(&root.join("layers").join(format!("{}.erofs", m.base.sha256)), &m.base, max)?;
-    if let Some(a) = &m.upper { verify(&dir.join("upper.tar"), a, max)?; }
-    if let Some(a) = &m.checkpoint { verify(&dir.join("checkpoint.tar"), a, max)?; }
-    Ok(m)
+    if !std::iter::once(&m.base).chain(&m.layers).chain(&m.checkpoint).all(|a| hex_digest(&a.sha256)) { return Err("invalid_artifact_descriptor"); }
+    Ok((m, expected))
 }
 
 // Durably write the manifest, exclusively create its digest file and sync the containing directory.
@@ -165,6 +163,25 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
         .open(dir.join("manifest.sha256")).map_err(|_| "manifest_digest_write_failed")?;
     file.write_all(format!("{hash}\n").as_bytes()).and_then(|_| file.sync_all()).map_err(|_| "manifest_digest_write_failed")?;
     File::open(dir).and_then(|f| f.sync_all()).map_err(|_| "manifest_sync_failed")
+}
+
+// Move a freshly sealed layer into the content-addressed store as layers/<sha256>.erofs without ever
+// replacing a published file. If that digest is already published, check the existing file fully
+// and drop the new copy. Sync the file and the store directory.
+pub fn publish_layer(staged: &Path, layers: &Path, layer: &Artifact, max: u64) -> Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let target = layers.join(format!("{}.erofs", layer.sha256));
+    fs::set_permissions(staged, fs::Permissions::from_mode(0o600)).map_err(|_| "artifact_permissions_failed")?;
+    File::open(staged).and_then(|f| f.sync_all()).map_err(|_| "artifact_sync_failed")?;
+    let from = CString::new(staged.as_os_str().as_bytes()).map_err(|_| "invalid_layer_path")?;
+    let to = CString::new(target.as_os_str().as_bytes()).map_err(|_| "invalid_layer_path")?;
+    // A loop-mounted layer must never be replaced underneath its mount.
+    if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) } != 0 {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err("layer_publish_failed"); }
+        verify(&target, layer, max)?;
+        fs::remove_file(staged).map_err(|_| "layer_publish_failed")?;
+    }
+    File::open(layers).and_then(|f| f.sync_all()).map_err(|_| "layer_sync_failed")
 }
 
 // Archive one filesystem tree with ownership, extended attributes, ACLs and sparse files preserved.

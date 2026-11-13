@@ -4,15 +4,18 @@
 Builds a cold template from an OCI image (layout directory or layout tar, optionally
 fetched first with regctl, skopeo or crane), then drives the controller's blocking
 API: cold create, wait for the in-container HTTP server, application HTTP call,
-exec, marker write, warm capture (the worker checkpoints the source and restores
-it; the source must be running and answering afterward), independent child
-restore, HTTP and marker checks in the child, source/child isolation, delete and
-cleanup checks. Printed timings are informational, not benchmarks.
+exec, reaping PID 1, marker write, warm capture (the worker freezes the source,
+seals its upper into an EROFS layer, checkpoints it leaving it running and thaws
+it; a probe shows the source answering except during the frozen window), two
+independent child restores (the second reuses the node's checkpoint cache), HTTP
+and marker checks in the children, source/child isolation, delete and cleanup
+checks. Printed timings are informational, not benchmarks.
 
 Networking runs entirely inside a disposable outer network/mount namespace, as in
 network_smoke.py. The template allows only the service port; no egress.
 """
 import argparse
+import concurrent.futures
 import gzip
 import hashlib
 import http.client
@@ -28,10 +31,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 
 from network_smoke import inventory, run
-from runtime_smoke import cold_manifest, preflight_compatibility, publish_layer, write_template
+from runtime_smoke import checkpoint_cache, watch_frozen, cold_manifest, preflight_compatibility, publish_layer, write_template
 from smoke import eventually, expect, port, request as smoke_request
 
 INDEX_TYPES = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
@@ -653,6 +657,41 @@ url = "http://127.0.0.1:{worker_port}"
             with log.open("rb") as source:
                 (target / f"{label}-{log.name}").write_bytes(source.read(262144))
 
+    # Starts a client in the sandbox's routing namespace that requests the service
+    # port every 20 ms (2 s timeout) and prints "start end ok" monotonic times,
+    # until the stop file exists. Returns the process and its output file.
+    def availability_probe(sandbox, label):
+        guest = Path(json.loads((session / "private" / sandbox / "config.json").read_text())["linux"]["namespaces"][2]["path"]).name
+        script = ("import socket, sys, time, os\n"
+                  "while not os.path.exists(sys.argv[3]):\n"
+                  "    t = time.monotonic(); ok = 0\n"
+                  "    try:\n"
+                  "        with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2) as c:\n"
+                  "            c.sendall(b'GET / HTTP/1.0\\r\\n\\r\\n'); ok = c.recv(12).startswith(b'HTTP/1.0 200')\n"
+                  "    except OSError:\n"
+                  "        pass\n"
+                  "    print(t, time.monotonic(), int(ok), flush=True); time.sleep(0.02)\n")
+        output = (session / f"probe-{label}.txt").open("w")
+        stop = session / f"probe-{label}.stop"
+        process = subprocess.Popen(["ip", "netns", "exec", guest.replace("-g-", "-s-"), sys.executable, "-c", script, "192.0.2.2", str(args.port), str(stop)],
+                                   stdout=output, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        return process, output, stop
+
+    # Stops a probe and summarizes its answers inside [started, finished]: successes,
+    # the longest interval without a completed successful answer and the slowest answer.
+    def probe_summary(probe, started, finished):
+        process, output, stop = probe
+        stop.touch()
+        process.wait(timeout=10)
+        output.close()
+        rows = [tuple(map(float, line.split())) for line in Path(output.name).read_text().splitlines()]
+        done = [end for start, end, ok in rows if ok and started <= end <= finished]
+        edges = [started, *done, finished]
+        return dict(probes=len(rows), successes_during_capture=len(done),
+                    longest_without_answer_s=round(max(b - a for a, b in zip(edges, edges[1:])), 3),
+                    slowest_answer_s=round(max((end - start for start, end, ok in rows if ok and started <= end <= finished), default=0), 3),
+                    failures=sum(1 for _, end, ok in rows if not ok and started <= end <= finished))
+
     # Requires that no per-sandbox runc state, private directory or cgroup remains.
     def gone(sandbox):
         assert not (session / "private" / sandbox).exists(), "private state remains"
@@ -680,30 +719,52 @@ url = "http://127.0.0.1:{worker_port}"
         exec_argv = json.loads(args.exec_argv) if args.exec_argv else ["python3", "-c", "import os; print('exec-ok', os.getuid(), os.getcwd())"]
         output = execute(source, exec_argv)
         assert args.exec_expect in output, output
+        # PID 1 is the read-only reaping init (the image server is its child). A
+        # background child killed with its exec is reparented to PID 1 and reaped.
+        assert Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0] == b"/.sandbox-init"
+        execute(source, [args.shell, "-c", "sleep 30 </dev/null >/dev/null 2>&1 & exit 0"])
+        time.sleep(1)
+        zombies = execute(source, ["python3", "-c", "import os; print(sum(open(f'/proc/{p}/stat').read().rsplit(')', 1)[1].split()[0] == 'Z' for p in os.listdir('/proc') if p.isdigit()))"])
+        assert zombies.strip() == "0", f"zombies remain under PID 1: {zombies}"
+        print("PASS PID 1 is the reaping init; an orphaned, killed exec child left no zombie")
         nonce = secrets.token_hex(8)
         execute(source, [args.shell, "-c", 'printf %s "$1" > "$2"', "sh", nonce, MARKER])
         assert execute(source, ["cat", MARKER]) == nonce
         print(f"PASS exec ({output.strip()!r}) and marker write")
 
+        # Live traffic during capture: the source answers except while frozen.
+        probe = availability_probe(source, "capture")
+        stop_freezer = threading.Event()
+        freezer = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(watch_frozen, cgroup / source / "cgroup.events", stop_freezer)
+        time.sleep(1)
         started = time.monotonic()
-        for _ in range(40):
-            code, captured = request(controller_port, f"/v1/sandboxes/{source}/capture", token, dict(template_id="image-warm", runtime="runc_criu"), "POST")
-            if code == 409 and captured.get("error", {}).get("code") == "capture_requires_quiescent_tcp":
-                time.sleep(0.25)  # a closed HTTP connection is still finishing its TCP close
-                continue
-            break
-        timings["capture_s"] = time.monotonic() - started
+        code, captured = request(controller_port, f"/v1/sandboxes/{source}/capture", token, dict(template_id="image-warm", runtime="runc_criu"), "POST")
+        finished = time.monotonic()
+        time.sleep(2)
+        stop_freezer.set()
+        availability = dict(probe_summary(probe, started, finished), **freezer.result(timeout=10), capture_started=round(started, 3), capture_finished=round(finished, 3))
+        timings["capture_s"] = finished - started
         if code != 200:
             diagnostics(source, "capture")
-        assert code == 200 and captured["state"] == "running" and captured["template_id"] == "image-warm", (code, captured)
+        assert code == 200 and captured["state"] == "running" and captured["template_id"] == "image-warm", (code, captured, availability)
         assert get(source)["state"] == "running"
+        observations["source_during_capture"] = availability
+        timings["capture_frozen_window_s"] = availability["frozen_s"]
+        timings["capture_longest_without_answer_s"] = availability["longest_without_answer_s"]
+        assert availability["freeze_periods"] >= 1 and 0 < availability["frozen_s"] < timings["capture_s"], availability
+        assert availability["successes_during_capture"] > 0 and availability["longest_without_answer_s"] < timings["capture_s"], availability
         warm = session / "templates" / "image-warm"
-        observations["warm_artifacts"] = {name: (warm / name).stat().st_size for name in ("upper.tar", "checkpoint.tar")}
+        warm_manifest = json.loads((warm / "manifest.json").read_text())
+        assert warm_manifest["schema_version"] == 3 and len(warm_manifest["layers"]) == 1 and not (warm / "upper.tar").exists()
+        observations["warm_artifacts"] = {"checkpoint.tar": (warm / "checkpoint.tar").stat().st_size, "sealed_layer": warm_manifest["layers"][0]}
         source_after, timings["source_http_after_capture_s"], _ = wait_http(source, 10)
-        print(f"PASS capture {timings['capture_s']:.2f}s (checkpoint {observations['warm_artifacts']['checkpoint.tar']} bytes, "
-              f"upper {observations['warm_artifacts']['upper.tar']} bytes); source running and answering")
+        print(f"PASS capture {timings['capture_s']:.2f}s without stopping the source: frozen {availability['frozen_s']:.3f}s; "
+              f"{availability['successes_during_capture']} probe answers during it, longest client-visible gap {availability['longest_without_answer_s']:.3f}s, "
+              f"slowest answer {availability['slowest_answer_s']:.3f}s; "
+              f"checkpoint {observations['warm_artifacts']['checkpoint.tar']} bytes, sealed layer {warm_manifest['layers'][0]['bytes']} bytes")
 
         child, timings["warm_restore_s"] = create("image-warm")
+        cache, cache_state = checkpoint_cache(session, "image-warm")
         started = time.monotonic()
         code, child_first = http_call(child)
         timings["first_call_after_restore_s"] = time.monotonic() - started
@@ -715,8 +776,16 @@ url = "http://127.0.0.1:{worker_port}"
         assert execute(child, ["cat", MARKER]) == nonce
         if args.http_path == "/" and args.expect_body == "Directory listing":
             assert Path(MARKER).name in child_first["body"], "child HTTP listing lacks the captured marker file"
-        print(f"PASS warm restore {timings['warm_restore_s']:.2f}s; first child HTTP call {timings['first_call_after_restore_s']:.3f}s; "
-              "captured marker present in child")
+        print(f"PASS warm restore {timings['warm_restore_s']:.2f}s (first on this node: unpacks the checkpoint cache); "
+              f"first child HTTP call {timings['first_call_after_restore_s']:.3f}s; captured marker present in child")
+        second, timings["warm_restore_cached_s"] = create("image-warm")
+        assert checkpoint_cache(session, "image-warm") == (cache, cache_state), "checkpoint cache was re-extracted or written"
+        second_first, _, _ = wait_http(second, 10)
+        assert args.expect_body in second_first["body"] and execute(second, ["cat", MARKER]) == nonce
+        result = expect(request(controller_port, f"/v1/sandboxes/{second}", token, method="DELETE"), 200)
+        assert result["state"] == "deleted"
+        gone(second)
+        print(f"PASS second warm restore {timings['warm_restore_cached_s']:.2f}s reused the node checkpoint cache unchanged")
 
         execute(child, [args.shell, "-c", 'printf child > "$1"', "sh", CHILD_ONLY])
         execute(source, [args.shell, "-c", 'test ! -e "$1"', "sh", CHILD_ONLY])

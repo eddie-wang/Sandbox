@@ -17,6 +17,7 @@ import tempfile
 import time
 
 import socket
+import stat
 import threading
 
 from smoke import eventually, expect, port, request as smoke_request
@@ -46,12 +47,61 @@ def publish_layer(root, image):
     return dict(sha256=digest.hexdigest(), bytes=target.stat().st_size)
 
 
-# Returns a cold (no checkpoint) template manifest the worker accepts: fixed
-# UID/GID 65534, the given base layer, init argv, network policy and defaults.
+# Returns a cold (no checkpoint, no sealed layers) schema-3 template manifest the
+# worker accepts: fixed UID/GID 65534, the given base layer, init argv, network
+# policy and defaults.
 def cold_manifest(template_id, compatibility, base, init_argv, network, memory_mib, vcpus, pids_max):
-    return dict(schema_version=2, template_id=template_id, generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
-                base=base, upper=None, checkpoint=None, init_argv=init_argv, memory_mib=memory_mib, vcpus=vcpus, pids_max=pids_max,
+    return dict(schema_version=3, template_id=template_id, generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
+                base=base, layers=[], checkpoint=None, init_argv=init_argv, memory_mib=memory_mib, vcpus=vcpus, pids_max=pids_max,
                 oci_config_sha256=None, network=network, uid=65534, gid=65534)
+
+
+# Returns the shared checkpoint-cache directory of a warm template (keyed by its
+# manifest digest) and a listing of (relative path, size, mtime_ns, inode) that
+# changes if anything re-extracts or writes into it.
+def checkpoint_cache(root, template_id):
+    key = (root / "templates" / template_id / "manifest.sha256").read_text().strip()
+    cache = root / "checkpoints" / key
+    listing = sorted((str(p.relative_to(cache)), p.lstat().st_size, p.lstat().st_mtime_ns, p.lstat().st_ino) for p in cache.rglob("*"))
+    return cache, (cache.stat().st_ino, listing)
+
+
+# Polls a sandbox cgroup's cgroup.events every 5 ms until stop is set. Returns the
+# number of freezer periods ("frozen 1") seen and their total and longest length:
+# the capture's frozen window (CRIU may briefly thaw and refreeze inside it).
+def watch_frozen(events, stop):
+    periods, since, frozen = [], None, False
+    while not stop.is_set():
+        try:
+            frozen = "frozen 1" in events.read_text()
+        except OSError:
+            frozen = False
+        now = time.monotonic()
+        if frozen and since is None:
+            since = now
+        elif not frozen and since is not None:
+            periods.append(now - since)
+            since = None
+        time.sleep(0.005)
+    if since is not None:
+        periods.append(time.monotonic() - since)
+    return dict(freeze_periods=len(periods), frozen_s=round(sum(periods), 3), longest_frozen_s=round(max(periods, default=0), 3))
+
+
+# Polls a source's counter file (as the host sees it in the upper directory)
+# until stop is set. Returns the samples, the longest interval without a change
+# (the frozen window plus one 100 ms tick at most) and whether it advanced.
+def watch_counter(path, stop):
+    samples = []
+    while not stop.is_set():
+        try:
+            samples.append((time.monotonic(), path.read_text()))
+        except OSError:
+            pass
+        time.sleep(0.01)
+    changes = [t for (t, value), (_, previous) in zip(samples[1:], samples) if value != previous]
+    edges = [samples[0][0], *changes, samples[-1][0]] if samples else []
+    return dict(samples=len(samples), changes=len(changes), longest_unchanged_s=round(max((b - a for a, b in zip(edges, edges[1:])), default=0), 3))
 
 
 # Writes manifest.json and its digest sidecar into a new template directory.
@@ -64,10 +114,11 @@ def write_template(root, manifest):
     return template
 
 
-# Run the privileged lifecycle gate on this host: build the fixture template, start a real worker and
-# controller, and drive cold create, exec, rejections, disconnects, capture, warm restore, bounds, TTL
-# and worker-restart cleanup through the blocking API. With --network, also check policy networking
-# and application HTTP. Retain the root and observations, then require no owned state to remain.
+# Run the privileged lifecycle gate: build the fixture template, start a real worker and controller,
+# and drive cold create, reaping PID 1, exec, rejections, disconnects, waiting DELETEs, non-stopping
+# capture with sealed layers and established loopback TCP, cached warm restore, bounds, TTL and restart
+# cleanup through the blocking API. --network adds policy networking and application HTTP. Retain the
+# root and observations, then require no owned state to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -170,6 +221,8 @@ url = "http://127.0.0.1:{worker_port}"
     for name in ("copied", "removed"):
         (rootfs / "workspace" / name).write_text("immutable-base")
         (rootfs / "workspace" / name).chmod(0o666)
+    # Copy-up and the sealed capture layer must keep this extended attribute.
+    os.setxattr(rootfs / "workspace" / "copied", "user.sandbox-test", b"base-xattr")
     (rootfs / "seed").write_bytes(b"seed\n" + bytes(4091))
     subprocess.run(["cc", "-static", "-O2", "-Wall", "-Wextra", "-Werror", str(Path(__file__).with_name("fixture.c")), "-o", str(rootfs / "fixture")], check=True, timeout=60)
     layer = root / "fixture.erofs"
@@ -178,7 +231,7 @@ url = "http://127.0.0.1:{worker_port}"
                              ({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}),
                              memory_mib=64, vcpus=1, pids_max=64)
     write_template(root, manifest)
-    for name in ("incompatible", "tampered", "symlinked", "unknown-metadata", "no-defaults") + (("policy-not-authorized", "unsupported-policy", "old-schema") if args.network else ()):
+    for name in ("incompatible", "tampered", "symlinked", "unknown-metadata", "no-defaults", "old-schema") + (("policy-not-authorized", "unsupported-policy") if args.network else ()):
         directory = root / "templates" / name
         directory.mkdir(mode=0o700)
         invalid = json.loads(json.dumps(manifest))
@@ -194,7 +247,10 @@ url = "http://127.0.0.1:{worker_port}"
         if name == "unsupported-policy":
             invalid["network"]["egress"][0]["protocol"] = "udp"
         if name == "old-schema":
-            invalid["schema_version"] = 1
+            # A schema-2 template (per-create upper.tar) is rejected, not migrated.
+            invalid["schema_version"] = 2
+            del invalid["layers"]
+            invalid["upper"] = None
         if name == "no-defaults":
             invalid["memory_mib"] = invalid["vcpus"] = None
         if name == "symlinked":
@@ -346,6 +402,12 @@ url = "http://127.0.0.1:{worker_port}"
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
         assert int(execute(source, "process-group")) >= 0
         observations["read_only_process_group_query"] = True
+        # PID 1 is the bind-mounted reaping init; the fixture init does not reap.
+        assert execute(source, "init-name") == "/.sandbox-init\n"
+        execute(source, "orphan-exit")
+        time.sleep(1)
+        assert execute(source, "zombies") == "0\n", "orphaned child was not reaped by PID 1"
+        observations["pid1_reaping_init"] = True
         isolated = create(memory_mib=64, vcpus=1)
         observations["create_explicit_and_template_default_resources"] = True
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -367,7 +429,7 @@ url = "http://127.0.0.1:{worker_port}"
         print("PASS blocking cold create, inline exec results, overlapping independent commands and immediate same-sandbox 409")
 
         before_dirs = {name: sorted(p.name for p in (root / name).iterdir()) for name in ("private", "runc")}
-        rejected_templates = ["incompatible", "symlinked", "unknown-metadata"] + (["policy-not-authorized", "unsupported-policy", "old-schema"] if args.network else [])
+        rejected_templates = ["incompatible", "symlinked", "unknown-metadata", "old-schema"] + (["policy-not-authorized", "unsupported-policy"] if args.network else [])
         for invalid_template in rejected_templates:
             rejected = expect(create_call(dict(template_id=invalid_template, ttl_seconds=60)), 422, "template_unavailable")
             assert "sandbox_id" not in rejected, "a pre-launch template rejection must not name an ID"
@@ -453,8 +515,33 @@ url = "http://127.0.0.1:{worker_port}"
         code, result = box["result"]
         assert code != 200 or result["sandbox_state"] != "running", result
         observations["delete_cancels_inflight_exec"] = {"delete_seconds": round(time.monotonic() - started, 3), "exec_status": code}
-        print("PASS client disconnect mid-exec (completion and bound-kill) and mid-create, and DELETE cancellation, leave no orphan")
+        # A second concurrent DELETE waits for the first cleanup and gets its result.
+        waited = create()
+        delete_call = lambda: request(controller_port, f"/v1/sandboxes/{waited}", token, method="DELETE")
+        (helpers / "cgroup.freeze").write_text("1")
+        try:
+            first_delete, first_box = in_background(delete_call)
+            eventually(lambda: any("populated 1" in p.read_text() for p in helpers.glob("command-*/cgroup.events")), timeout=10)
+            second_delete, second_box = in_background(delete_call)
+            time.sleep(1)
+            assert first_delete.is_alive() and second_delete.is_alive(), "a DELETE returned while cleanup was frozen"
+        finally:
+            (helpers / "cgroup.freeze").write_text("0")
+        first_delete.join(timeout=30)
+        second_delete.join(timeout=30)
+        for box in (first_box, second_box):
+            code, result = box["result"]
+            assert code == 200 and result["state"] == "deleted", (code, result)
+        gone(waited)
+        observations["second_delete_waits_for_first"] = True
+        print("PASS client disconnect mid-exec (completion and bound-kill) and mid-create, DELETE cancellation and a waiting second DELETE leave no orphan")
 
+        # Loopback round trips over one ESTABLISHED connection inside the sandbox.
+        # Return the round-trip count after checking both ends are established and no error occurred.
+        def loopback(sandbox):
+            fields = dict(item.split("=") for item in execute(sandbox, "loopback").split())
+            assert fields["error"] == "0" and fields["established"] == "2", fields
+            return int(fields["roundtrips"])
         execute(source, "write", "copied", "source-private")
         execute(source, "unlink", "removed")
         assert execute(isolated, "read", "copied") == "immutable-base"
@@ -480,6 +567,11 @@ url = "http://127.0.0.1:{worker_port}"
         # Examine links only inside owned netns; never change interfaces/rules.
         links = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "link", "show"], check=True, capture_output=True, timeout=5)
         assert sorted(link["ifname"] for link in json.loads(links.stdout)) == (["eth0", "lo"] if args.network else ["lo"])
+        if not args.network:
+            # The worker-created isolated guest namespace has loopback only: no routes either.
+            routes = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "route", "show", "table", "main"], check=True, capture_output=True, timeout=5)
+            assert json.loads(routes.stdout or b"[]") == []
+            assert Path(json.loads((root / "private" / source / "config.json").read_text())["linux"]["namespaces"][2]["path"]).exists()
         # Record owned network state and exercise allowed/denied TCP, path-MTU discovery and application
         # HTTP. With full, also check authentication, invalid and unapproved requests and bounded HTTP
         # failures while requiring the sandbox to remain running. Return True.
@@ -533,17 +625,25 @@ url = "http://127.0.0.1:{worker_port}"
             return True
         if args.network:
             observations["network_and_http_before_capture"] = network_gate(source, True)
+            # An ESTABLISHED external connection no longer blocks capture
+            # (--tcp-established). The source keeps it; a child restores its socket
+            # with the same fixed guest IP (the remote peer is not cloned).
             held = create()
             execute(held, "write", "hold-external", "1")
             time.sleep(0.3)
             assert execute(held, "read", "holding") == "ready"
-            expect(capture(held, "held-invalid"), 409, "capture_requires_quiescent_tcp")
-            assert get(held)["state"] == "running"
-            observations["established_connection_capture_rejected"] = True
+            captured(held, "held-warm")
+            assert get(held)["state"] == "running" and loopback(held) > 0
             remove(held)
-            # Close fixture connections before capture; remote TCP state is not cloned.
-            time.sleep(1)
+            held_child = create("held-warm")
+            time.sleep(0.3)
+            first_trips = loopback(held_child)
+            time.sleep(0.5)
+            assert loopback(held_child) > first_trips and get(held_child)["state"] == "running"
+            remove(held_child)
+            observations["established_external_connection_captured_and_restored"] = True
         before, nonce = map(int, execute(source, "counter").split())
+        source_trips = loopback(source)
         expect(capture(source, "fixture"), 409, "template_already_exists")
         assert get(source)["state"] == "running"
         # A capture must neither adopt nor clean an existing unacquired staging leaf.
@@ -555,7 +655,32 @@ url = "http://127.0.0.1:{worker_port}"
         (conflict / "sentinel").unlink()
         conflict.rmdir()
         observations["unacquired_staging_preserved"] = True
+        # A checkpoint that fails after the source was frozen (CRIU cannot dump a userfaultfd) thaws
+        # the source and keeps it: it stays running, its counter and loopback connection advance, and
+        # nothing is published.
+        # Read the init's userfaultfd status; empty until the init first writes it.
+        def uffd_status():
+            result = expect(exec_call(source, ["/fixture", "read", "uffd-status"]), 200)
+            return result["stdout"] if result["exit_code"] == 0 else ""
+        execute(source, "write", "hold-uffd", "1")
+        eventually(lambda: uffd_status() == "held\n", timeout=10)
+        frozen_counter = int(execute(source, "counter").split()[0])
+        failed_trips = loopback(source)
+        code, failed = capture(source, "uffd-fails")
+        assert code == 500 and failed["error"]["code"] == "checkpoint_failed", (code, failed)
+        assert get(source)["state"] == "running" and not (root / "templates" / "uffd-fails").exists() and not (root / "staging" / "uffd-fails").exists()
+        time.sleep(0.3)
+        assert int(execute(source, "counter").split()[0]) > frozen_counter and loopback(source) > failed_trips
+        execute(source, "unlink", "hold-uffd")
+        eventually(lambda: uffd_status().startswith("released"), timeout=10)
+        observations["failed_checkpoint_keeps_source_running"] = True
         isolated_nonce = int(execute(isolated, "counter").split()[1])
+        # The source keeps running during capture except while frozen (pause to resume).
+        stop_watch = threading.Event()
+        watchers = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        watcher = watchers.submit(watch_counter, root / "private" / source / "upper" / "workspace" / "counter", stop_watch)
+        freezer = watchers.submit(watch_frozen, cgroup / source / "cgroup.events", stop_watch)
+        capture_started = time.monotonic()
         # Freeze only the owned helper subtree to make concurrent staging observable.
         (helpers / "cgroup.freeze").write_text("1")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -568,9 +693,22 @@ url = "http://127.0.0.1:{worker_port}"
             finally:
                 (helpers / "cgroup.freeze").write_text("0")
             observations["capture_results"] = [first.result(timeout=200), second.result(timeout=200)]
+        capture_seconds = time.monotonic() - capture_started
+        stop_watch.set()
+        watched = dict(watcher.result(timeout=10), **freezer.result(timeout=10))
+        assert watched["changes"] > 0 and watched["longest_unchanged_s"] < capture_seconds, watched
+        assert watched["freeze_periods"] >= 1 and 0 < watched["frozen_s"] < capture_seconds, watched
+        observations["source_during_capture"] = dict(watched, capture_s=round(capture_seconds, 3))
         assert not any(p.exists() for p in stages)
         current, source_nonce = map(int, execute(source, "counter").split())
         assert source_nonce == nonce and current >= before
+        # The source's loopback connection kept working across its own checkpoint.
+        assert loopback(source) > source_trips
+        # The capture sealed the upper into a content-addressed EROFS layer; no upper archive.
+        warm_manifest = json.loads((root / "templates" / "warm" / "manifest.json").read_text())
+        layer = warm_manifest["layers"][0]["sha256"]
+        assert warm_manifest["schema_version"] == 3 and len(warm_manifest["layers"]) == 1 and (root / "layers" / f"{layer}.erofs").is_file()
+        assert sorted(p.name for p in (root / "templates" / "warm").iterdir()) == ["checkpoint.tar", "manifest.json", "manifest.sha256"]
         remove(isolated)
         expect(create_call(dict(template_id="warm", ttl_seconds=60, memory_mib=128)), 422, "template_resource_mismatch")
         child = create("warm")
@@ -578,9 +716,27 @@ url = "http://127.0.0.1:{worker_port}"
         restored, child_nonce = map(int, execute(child, "counter").split())
         assert child_nonce == nonce and restored >= before
         observations["warm_state"] = {"before_counter":before,"source_counter":current,"child_counter":restored,"source_nonce":source_nonce,"child_nonce":child_nonce}
+        # The restored child continues the captured ESTABLISHED loopback connection.
+        child_trips = loopback(child)
+        time.sleep(0.5)
+        assert loopback(child) > child_trips
+        observations["established_loopback_restored"] = {"child_roundtrips": [child_trips, loopback(child)]}
         assert execute(child, "read", "copied") == "source-private"
         missing = expect(exec_call(child, ["/fixture", "read", "removed"], timeout_ms=2000, max_output_bytes=1024), 200)
         assert missing["exit_code"] != 0 and not missing["interrupted"] and missing["sandbox_state"] == "running"
+        # Sealed layer, as mounted read-only on the host: a whiteout for the deleted base file and the
+        # modified base file with its ownership, mode and extended attribute.
+        sealed = root / "lowers" / layer / "workspace"
+        whiteout = sealed.joinpath("removed").lstat()
+        assert stat.S_ISCHR(whiteout.st_mode) and whiteout.st_rdev == 0
+        modified = sealed.joinpath("copied").lstat()
+        assert sealed.joinpath("copied").read_text() == "source-private" and (modified.st_uid, modified.st_gid, stat.S_IMODE(modified.st_mode)) == (0, 0, 0o666)
+        assert os.getxattr(sealed / "copied", "user.sandbox-test") == b"base-xattr"
+        assert os.getxattr(root / "private" / child / "rootfs" / "workspace" / "copied", "user.sandbox-test") == b"base-xattr"
+        assert not (root / "private" / child / "upper" / "workspace" / "copied").exists(), "child upper must start empty"
+        observations["sealed_layer"] = {"sha256": layer, "whiteout": True, "modified_owner_mode_xattr": True}
+        warm_cache, warm_cache_state = checkpoint_cache(root, "warm")
+        assert not any(p.name.endswith(".unpacking") for p in (root / "checkpoints").iterdir())
         execute(child, "write", "copied", "child-private")
         assert execute(source, "read", "copied") == "source-private"
         observations["restored_namespace_identities"] = {}
@@ -594,7 +750,10 @@ url = "http://127.0.0.1:{worker_port}"
         if args.network:
             observations["restored_listening_socket_and_fresh_egress"] = network_gate(child)
             observations["source_listening_socket_and_fresh_egress"] = network_gate(source)
-        print("PASS inline capture after publication and source recovery, warm restore with template resources, independent child")
+        # CRIU only read the shared images while restoring the child.
+        assert checkpoint_cache(root, "warm")[1] == warm_cache_state
+        print("PASS capture without stopping the source (frozen window only), sealed EROFS layer with whiteout/xattr, "
+              "warm restore with established loopback TCP, independent child")
         remove(child)
         other_child = create("isolated-warm", memory_mib=64, vcpus=1)
         assert int(execute(other_child, "counter").split()[1]) == isolated_nonce
@@ -631,6 +790,10 @@ url = "http://127.0.0.1:{worker_port}"
         retained = create("warm")
         time.sleep(0.3)
         assert int(execute(retained, "counter").split()[1]) == nonce
+        # A later restore of this manifest digest, after a worker restart: the node cache is
+        # reused, not re-extracted.
+        assert checkpoint_cache(root, "warm") == (warm_cache, warm_cache_state)
+        observations["checkpoint_cache_reused_after_restart"] = str(warm_cache.name)
         # Crash during a host checkpoint command, not just workload exec.
         (helpers / "cgroup.freeze").write_text("1")
         capture_thread, _ = in_background(lambda: capture(retained, "interrupted-warm"))
@@ -724,6 +887,9 @@ url = "http://127.0.0.1:{worker_port}"
     assert not any(str(root) in line.split()[4] for line in mountinfo.splitlines()), "owned mounts remain"
     assert not any(path.is_dir() for path in cgroup.iterdir()), "owned workload/helper cgroups remain"
     assert all(not (root / "private" / sandbox).exists() for sandbox in ids), "private state remains"
+    # Isolated and networked sandboxes alike leave no worker-owned namespace pin.
+    owned_prefix = "sb-" + hashlib.sha256(str(root).encode()).hexdigest()[:16] + "-"
+    assert not any(p.name.startswith(owned_prefix) for p in Path("/run/netns").iterdir()), "owned netns remain"
     if args.network:
         assert not any(p.name.startswith("sb-") and p.name != "sb-test-peer" for p in Path("/run/netns").iterdir()), "owned netns remain"
         assert not any(link["ifname"].startswith("sb") and link["ifname"] not in ("sb-test-br", "sb-pmtu-out") for link in json.loads(subprocess.check_output(["ip", "-j", "link"]))), "owned veth remain"

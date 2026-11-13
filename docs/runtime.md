@@ -2,7 +2,9 @@
 
 **Targeted functional gate passed on one explicitly approved Linux x86-64 host,
 with runc 1.3.6 and CRIU 4.3.** The real script exercised shared EROFS/private OverlayFS,
-capture/source recovery, independent restored memory/file state, overlapping exec,
+capture without stopping the source (pause, sealed EROFS layer, `--leave-running`),
+established loopback TCP and independent restored memory/file state, the node
+checkpoint cache, the reaping PID 1, overlapping exec, waiting concurrent DELETEs,
 admission, bounded commands, TTL/delete and crash/restart cleanup. Compilation and
 the nonprivileged HTTP smoke also passed, but are not substitutes for this gate.
 The network variant also passed inside a disposable outer network/mount namespace,
@@ -21,8 +23,14 @@ An operator must separately provision and approve:
   available. No module loading or package installation is done by the service/script.
 - Trusted standard `runc`, `criu`, `mount`, `umount`, GNU `tar`, `mkfs.erofs`, `ip`,
   `nft`, `iptables`, `iptables-save`, `iptables-restore`, `ip6tables-save`,
-  `ip6tables-restore` and `gzip`. CRIU uses namespace firewall-state helpers and gzip
-  for tmpfs images; these are not workload egress support. GNU tar also invokes its
+  `ip6tables-restore`, `gzip` and a **statically linked `tini`** (preflight rejects a
+  dynamic one: it is bind-mounted read-only into every sandbox as PID 1, so it must run
+  in any image; its SHA-256 is part of the template compatibility fingerprint). Take
+  `tini` from a trusted, verified package (for example the distribution's static tini
+  or the tini-based `docker-init` of an installed, signature-verified Docker package)
+  and stage it like the other tools; never download an unverified binary. CRIU uses
+  namespace firewall-state helpers and gzip for tmpfs images; these are not workload
+  egress support. GNU tar also invokes its
   fixed `/bin/sh`, and dynamic binaries depend on system libraries/loaders. Review
   administrator system CRIU configuration; request options do not replace host trust.
   For the smoke: Python 3, a C compiler with static libc, `nsenter`, and sandboxd.
@@ -103,8 +111,10 @@ Hard validation budgets are **at most three simultaneously admitted containers,
 CPU-overcommit factor 3, two active restores, four fixed operation threads, 64 MiB per
 artifact and 30-second host tool deadlines. No capacity/load benchmark, cluster job, package installation,
 host veth/route/firewall/sysctl change, module loading or external network traffic
-is part of the isolated command. `nsenter ... ip ... link show` only inspects an owned netns.
-Workload namespaces are created by runc/CRIU; there is no host-network mode.
+is part of the isolated command. The worker does create one owned, loopback-only
+network namespace pin per sandbox under the existing `/run/netns` and removes it on
+cleanup. `nsenter ... ip ... link show` only inspects an owned netns. Other workload
+namespaces are created by runc/CRIU; there is no host-network mode.
 
 ## Gate assertions
 
@@ -117,12 +127,14 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    intervals; a conflicting same-sandbox exec/capture gets an immediate
    `409 sandbox_busy`. A fourth reservation is rejected by the worker without writing
    a record, and the controller reports `no_capacity`. Incompatible, symlinked,
-   unknown-field and (network) unauthorized/old-schema templates are rejected before
-   any record; a digest-mismatched artifact is a failed create naming its ID. A client
-   that disconnects mid-exec leaves the command to finish (or, on a bound violation,
-   the sandbox to be terminated) with full cleanup; a client that disconnects
-   mid-create (host helpers frozen) gets its unlearnable sandbox deleted with
-   `create_response_lost`; DELETE cancels an in-flight exec.
+   unknown-field, schema-2 (old per-create upper archive) and (network) unauthorized
+   templates are rejected before any record; a digest-mismatched artifact is a failed
+   create naming its ID. PID 1 is `/.sandbox-init` (tini), and an orphaned exec child
+   leaves no zombie. A client that disconnects mid-exec leaves the command to finish
+   (or, on a bound violation, the sandbox to be terminated) with full cleanup; a
+   client that disconnects mid-create (host helpers frozen) gets its unlearnable
+   sandbox deleted with `create_response_lost`; DELETE cancels an in-flight exec; and
+   with cleanup frozen, a second DELETE waits and both return `deleted`.
 2. Private write/copy-up and lower whiteout isolation between two cold sandboxes.
 3. Distinct PID/mount/network namespaces from each other and the host, only loopback
    in the sandbox, UID/GID 65534, empty effective caps, no_new_privs and an active
@@ -131,12 +143,21 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    and IPv6 (and, when isolated, external IPv4) connects are unreachable. Host
    cgroup memory/swap/CPU/pids settings are inspected.
 4. A CRIU checkpoint with **open upper and lower descriptors/mappings**, an in-memory
-   counter and random nonce. Source recovery must preserve the nonce/state; a new
-   container restores the same memory nonce, filesystem delta/whiteout and private
-   network namespace, and writes independently of the source. Restored host PIDs
-   must be in their own cgroups. This is a targeted file-identity check, not blanket
-   CRIU compatibility for all filesystem/syscall/application states. Capture returns
-   only after publication and source recovery. Two captures run concurrently into
+   counter and random nonce, and an **ESTABLISHED loopback TCP connection** that the
+   init uses every 100 ms. The source must keep running: its counter advances during
+   the capture except while its cgroup is frozen (the frozen window is recorded), and
+   its loopback connection keeps working. A new container restores the same memory
+   nonce, continues the loopback connection, sees the filesystem delta/whiteout, and
+   writes independently of the source. The published template has a sealed EROFS layer
+   and `checkpoint.tar` but no upper archive; the mounted layer holds a whiteout for
+   the deleted base file and the modified base file with its owner, mode and `user.`
+   xattr, and the child's upper starts empty. The child's restore unpacks the node
+   checkpoint cache once; it is unchanged by that restore and reused unchanged by a
+   later restore after a worker restart. A checkpoint that fails after the freeze
+   (the fixture holds an undumpable userfaultfd) leaves the source running and
+   publishes nothing. Restored host PIDs must be in their own cgroups. This is a
+   targeted file-identity check, not blanket CRIU compatibility for all
+   filesystem/syscall/application states. Two captures run concurrently into
    distinct, exclusively created staging leaves and restore independently. A
    preexisting unacquired leaf must remain untouched by a failed capture, and a warm
    create with mismatching explicit resources is rejected.
@@ -206,9 +227,11 @@ no automatic eviction at all).
 - Seccomp follows the AgentENV container pattern: default-allow, with only io_uring
   (ENOSYS) and MPTCP sockets (EPROTONOSUPPORT) blocked because CRIU cannot dump them.
   Isolation relies on namespaces, empty capabilities, no_new_privs, cgroups and
-  network policy. CRIU runs without `--ext-unix-sk` or `--tcp-established`: Unix
-  sockets connected outside the dumped tree and established TCP (including loopback
-  connections in isolated sandboxes, which have no TCP precheck) fail capture closed.
+  network policy. CRIU runs with `--tcp-established --ext-unix-sk --file-locks`
+  (AgentENV's options): established and loopback TCP are captured and restored; a
+  child's copy of a connection to an external peer fails on first use. Other
+  unsupported state (for example a userfaultfd) fails the capture while the source
+  keeps running.
 - No S3 client, remote template transport, signed publisher provenance or two-node
   qualification. The local digest-bound layout is the serialized transfer boundary.
 - No per-sandbox writable-disk quota, automatic artifact GC or tombstone pruning.
@@ -252,8 +275,9 @@ needed; the existing verified `ip` enters namespaces for same-binary helpers.
 The network variant retains relevant previous lifecycle cases and adds positive
 exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
 socket creation, HTTP authentication/header stripping/path validation, text body,
-redirect refusal, timeout/output bounds, quiescent capture rejection of established
-TCP, source and child restored listening sockets/fresh egress, delayed namespace
+redirect refusal, timeout/output bounds, capture of a sandbox holding an established
+external TCP connection and restore of a child from it, source and child restored
+listening sockets/fresh egress, delayed namespace
 FD cleanup retry and HTTP-helper crash/restart cleanup. Adding `--http-limits`
 also exercises the opt-in large ceilings: an 8 MiB inline response, two concurrent
 worst-case JSON-escaped 8 MiB results, a 16 KiB escaped body, a 31-second application
@@ -271,7 +295,7 @@ lowers only the owned slot uplink to 1280 to exercise slot-generated errors. The
 fixture validates every payload byte and acknowledges completion; socket PMTU and
 narrow-rule counters prove that both forwarded and locally generated IPv4
 fragmentation-needed messages reached the guest. The gate repeats payloads after
-source recovery and independent child restore and retains denied destinations and
+capture on the source and after independent child restore and retains denied destinations and
 ports. No MTU, route or forwarding sysctl on the actual host/default namespace is
 changed. This is targeted PMTU transport qualification, not a general routed-network
 or performance result.
@@ -330,12 +354,19 @@ What the script does:
   1. Cold create, then retry the application HTTP operation until the server
      answers 200 with the expected body. Check the init process's UID,
      capabilities and no_new_privs.
-  2. Run an exec (`--exec-argv`/`--exec-expect`) and write a random marker file
-     with the image's shell (`--shell`).
-  3. Capture a warm template. The source must still be running and answering
-     afterward.
-  4. Create a child from the warm template and call its HTTP server on a fresh
-     connection. The marker must be present in the child.
+  2. Check that PID 1 is the reaping init and that a killed background exec child
+     leaves no zombie. Run an exec (`--exec-argv`/`--exec-expect`) and write a random
+     marker file with the image's shell (`--shell`).
+  3. Capture a warm template while a probe in the sandbox's routing namespace
+     requests the service port every 20 ms. The source must answer during the
+     capture outside the frozen window, which a host-side watch of its cgroup
+     freezer measures; the longest client-visible gap is recorded too. It must still
+     be running and answering afterward. The template has one sealed layer and no
+     upper archive.
+  4. Create a child from the warm template (the first restore on the node unpacks
+     the checkpoint cache) and call its HTTP server on a fresh connection. The marker
+     must be present in the child. A second child restores from the unchanged cache,
+     answers and is deleted.
   5. Write a file in the child that must not appear in the source, and check
      that the pid/mnt/net namespaces are distinct.
   6. Delete both. No runc state, private state, cgroups, network namespaces or
@@ -344,7 +375,8 @@ What the script does:
      not contain the tokens.
 - **Defaults.** 256 MiB, one vCPU and 128 pids per container, at most three
   containers. PASS lines print informational timings (cold create, first HTTP
-  ready, capture, warm restore, first call after restore). These are not
+  ready, capture and its frozen window, first and cached warm restore, first call
+  after restore). These are not
   benchmarks. The session root keeps `prepared.json`, `image-e2e.json` and the
   service logs for inspection.
 

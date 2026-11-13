@@ -19,14 +19,19 @@ exclusive to that worker; operators must not share it between worker roots.
   worker-status.json              durable shutdown cleanup error, if any
   records/<sandbox-id>.json        atomic lifecycle records (schema 2; metadata only)
   private/<node>.<id>/
-    upper/ work/ rootfs/           ordinary directories; rootfs is OverlayFS
+    upper/ work/ rootfs/           ordinary directories; rootfs is OverlayFS; upper
+                                   starts empty for cold and warm sandboxes alike
     config.json exec.json         worker-authored OCI/process input
-    criu.conf images/ criu-work/   protected runtime/checkpoint work
-  layers/<sha256>.erofs            trusted immutable artifacts
-  lowers/<sha256>/                 shared read-only EROFS mounts
+    criu.conf criu-work/          protected runtime/checkpoint work
+  layers/<sha256>.erofs            trusted immutable EROFS images: template bases and
+                                   sealed capture layers, content-addressed
+  lowers/<sha256>/                 shared read-only EROFS mounts of those layers
+  checkpoints/<manifest-sha256>/   node cache: CRIU images unpacked once per warm
+                                   template manifest, shared read-only by restores
+  checkpoints/<sha256>.unpacking/  interrupted unpack; removed at worker start
   templates/<template-id>/
     manifest.json manifest.sha256
-    upper.tar checkpoint.tar      present together only for warm templates
+    checkpoint.tar                present only for warm templates
   staging/<template-id>/          unpublished capture; exclusively created by the
                                   one in-flight capture reserving that template ID;
                                   a failed removal blocks that ID until restart
@@ -43,38 +48,55 @@ API. Do not modify published artifacts, manifests or mounted images.
 All HTTP identifiers are validated components, never host paths. Fixed filenames
 and content hashes select artifacts. Ancestors are trusted, final artifact/record
 opens reject symlinks, and metadata/sizes/digests are checked before runtime use.
-User symlinks *inside* an archived upper are legitimate workload state and are
-preserved by GNU tar, not followed as administrator paths. GNU tar's default
-traversal/symlink extraction protections remain enabled. There is no user-supplied
-archive or executable host path.
+User symlinks *inside* a sealed upper layer are legitimate workload state: they are
+stored as symlinks in the EROFS image and resolved only inside the sandbox's mount
+namespace, never followed as administrator paths. The checkpoint archive is
+worker-produced and extracted by GNU tar with its default traversal/symlink
+protections. There is no user-supplied archive or executable host path.
 
 Lower mounts are shared by digest and are read-only, nodev/nosuid. Only these shared
 EROFS images use the standard mount/loop facility. Each sandbox gets sibling
 upper/work directories on the same supported local filesystem; OverlayFS uses
+`lowerdir=<sealed layers, newest first>:<base>` and
 `index=off,metacopy=off,redirect_dir=off,xino=off,nodev,nosuid`. No lower layer is
-writable, no upper is promoted to a new lower, and no private block device is added.
+writable and no private block device is added. A capture seals the source's upper
+directory into a new immutable EROFS layer (see below); a child mounts it as a lower
+with its own fresh empty upper, so nothing is copied per create.
+
+**Verified once per node.** A create checks only the manifest digest sidecar and
+fields. Each layer image is fully hashed the first time this worker mounts its
+digest (or when this worker publishes it at capture); the worker remembers the
+digest and size in memory and checks mount flags and backing image on every use.
+A warm template's `checkpoint.tar` is fully hashed and unpacked once into
+`checkpoints/<manifest-sha256>/` under a per-key turn: concurrent restores of the
+same manifest wait for that unpack, later ones reuse the directory, and the
+staging-then-rename makes the directory itself the "verified" record, which
+survives worker restarts. CRIU only reads the images; the gate checks the cache is
+unchanged by restores. Published artifacts must therefore never be modified in
+place: a change after first use on a node is not re-detected there.
 
 Deletion checks mountinfo before recursive private removal, never uses lazy unmount
 or broad recursive mount deletion, and never deletes shared templates/images.
 Shared lowers are unmounted only after all owned workloads have been cleaned during
-shutdown/reconciliation; images/templates are retained indefinitely. Cache eviction,
+shutdown/reconciliation; images/templates/checkpoint caches are retained indefinitely. Cache eviction,
 artifact deletion API, S3 transfer and disk quotas are not implemented. Operators
 must provision an appropriately bounded dedicated filesystem/quota and monitor free
 space. A filesystem failure stops admission; old durable ownership still permits
 termination/cleanup.
 
-## Manifest v2
+## Manifest v3
 
 Strict JSON fields (unknown fields are rejected):
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Exactly `2`; v1 is rejected, not silently migrated |
+| `schema_version` | Exactly `3`; v1/v2 (per-create `upper.tar`) templates are rejected, not silently migrated |
 | `template_id`, `generation` | Validated immutable publication ID and worker-generated capture-generation ID |
 | `runtime` | Exactly `runc_criu` |
 | `compatibility` | Architecture, exact kernel release, SHA-256 of CPU feature string, exact runc and CRIU version output, fixed mount/network/seccomp layout version |
 | `base` | `{ "sha256": "...", "bytes": ... }` for `layers/<digest>.erofs` |
-| `upper`, `checkpoint` | Both null for cold, or descriptors for `upper.tar` and `checkpoint.tar` from one stopped generation |
+| `layers` | Sealed capture layers above the base, newest first, each a descriptor for `layers/<digest>.erofs`; empty for cold, 1–16 for warm (a capture of a warm child adds one) |
+| `checkpoint` | Null for cold, or the descriptor of `checkpoint.tar` (CRIU images) from the same frozen instant as `layers[0]` |
 | `init_argv` | Trusted absolute in-container executable + argv; not an OCI config/host executable |
 | `memory_mib`, `vcpus` | Cold: optional create defaults (1–1,048,576 MiB, 1–4,096); warm: required, exact captured resources |
 | `pids_max` | Exact configured pids limit |
@@ -84,9 +106,13 @@ Strict JSON fields (unknown fields are rejected):
 
 `compatibility` is emitted by read-only `preflight` and has exactly:
 `architecture`, `kernel`, `cpu_features_sha256`, `runc_version`, `criu_version`,
-`layout`. The OCI network-policy digest annotation is preserved during normalization. `layout` is `erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v4-agentenv`. The seccomp profile is the
-default-allow AgentENV pattern described below; templates captured under the earlier
-deny-by-default profiles carry older layouts and are rejected. Older layout
+`init_sha256` (SHA-256 of the trusted static `tini` the worker bind-mounts as PID 1;
+restored processes map it), `layout`. The OCI network-policy digest annotation is
+preserved during normalization; the init's host path is normalized like the other
+worker-local paths. `layout` is
+`erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1`. The seccomp profile is the
+default-allow AgentENV pattern described below; templates captured under earlier
+layouts (deny-by-default seccomp, per-create upper archives, no reaping init) are rejected. Older layout
 fingerprints are incompatible rather than silently reinterpreted. The local fixture
 script demonstrates complete cold publication; do not guess compatibility strings.
 Exact matching deliberately rejects more hosts than might technically work. Version
@@ -95,43 +121,66 @@ matching is necessary, **not sufficient proof of CRIU portability**.
 ## Capture, file identity and recovery
 
 The worker excludes overlapping mutations of the same sandbox; different sandboxes
-run on a bounded operation pool. It uses a normal
-stopping runc checkpoint (not `--leave-running`), then GNU tar with numeric ownership,
-permissions, xattrs including OverlayFS metadata, ACLs, hardlinks, sparse files and
-whiteouts. The process is no longer writing during the filesystem snapshot. The
-same unchanged EROFS lower is referenced. Upper and checkpoint archives get their
-own digests/sizes and a single generation/manifest. The source is restored from its
-own original upper and images before publication. A failed dump can leave a live
-PID with uncertain state, so checkpoint failure conservatively terminates/cleans
-that source; it is not called recovered merely because runc reports a PID. Failure
-after a completed dump attempts source recovery; recovery failure is terminal. Files/manifest are synced before atomic directory rename.
-Failed/stale staging is removed without touching live mounts or published templates.
+run on a bounded operation pool. Capture follows the AgentENV container backend and
+**never stops the source**:
 
-Children extract the upper into a **new upper**, create a fresh work directory and
-mount the same lower layout. The worker writes a new OCI bundle/private cgroup and
-asks runc to restore into the new container ID. CRIU runs from host authority, with
-`mntns-compat-mode` and file-lock handling. Cgroup restoration uses runc's target
-cgroup setup with CRIU manage mode `ignore`, not source-cgroup adoption. It does not
-use TCP-established/external-Unix-socket/link-remap options to waive unsupported
-application state. Unlinked open files and broader runtime state may be rejected. Networked guests
-join a separately reconstructed, worker-pinned external netns with the same guest
-IPv4 address. Listening TCP sockets may restore; active TCP connections must be
-quiesced and are rejected by a precheck/CRIU. Peer and router conntrack state are
-not checkpoint artifacts. Fresh post-restore connections get the child slot's
-independent SNAT identity.
+1. `runc pause` freezes the source's cgroup.
+2. While frozen: read each task's `/proc/<pid>/maps` for a `[uprobes]` mapping (left
+   by a host tracing/security agent), `syncfs` the overlay and build an EROFS image
+   of the upper directory with `mkfs.erofs` (uncompressed; overlay whiteouts,
+   opaque-directory xattrs, ownership, modes and other xattrs kept).
+3. `runc checkpoint --leave-running --tcp-established --ext-unix-sk --file-locks`,
+   with `network-lock nftables` and `skip-in-flight` (plus `allow-uprobes` when step
+   2 found uprobes) in the per-container CRIU config.
+4. `runc resume` thaws the source. The frozen window is steps 1–4.
+5. Outside the window: hash the sealed layer, archive the images into
+   `checkpoint.tar` (GNU tar, numeric ownership/xattrs), write the manifest, publish
+   the layer as `layers/<sha256>.erofs` without replacing an existing file (same
+   digest = same content), then sync and atomically rename the staged template.
 
-**Directory archives do not preserve host inode numbers.** The implementation keeps
+On any failure the worker thaws the source and keeps it if runc reports it running;
+CRIU leaves dumped tasks alive, so a failed dump is not treated as terminating the
+source (the gate forces a dump failure with an undumpable file and checks the source
+keeps running). Only a source that stays frozen, or was cancelled/expired, is
+deleted. A layer published before a later step failed stays in `layers/`
+(content-addressed, retained like every layer). Failed/stale staging is removed
+without touching live mounts or published templates.
+
+`skip-in-flight`: clients that connect while the source is frozen wait unaccepted in
+a listen backlog, which CRIU otherwise refuses to dump (observed in the image gate).
+The running source still serves them after the thaw; children never had them.
+
+Children mount the sealed layer(s) above the same base with a **new empty upper**
+and a fresh work directory. The worker writes a new OCI bundle/private cgroup and
+asks runc to restore into the new container ID from the node's shared checkpoint
+cache, with `--tcp-established --ext-unix-sk --file-locks --manage-cgroups-mode
+ignore` and restore-only `allow-uprobes`, `mntns-compat-mode` and `network-lock
+nftables` (the AgentENV restore options plus the lock method). Cgroup restoration
+uses runc's target cgroup setup, not source-cgroup adoption. Unlinked open files and
+broader runtime state may be rejected.
+
+**Established TCP.** Connections are dumped and restored in TCP repair mode. Every
+sandbox, isolated or not, runs in a worker-created guest network namespace (runc
+always checkpoints the network namespace as empty, so CRIU restores no links or
+addresses itself), and every guest has the same fixed IPv4 address, so a captured
+socket's local address exists in any child. Loopback connections inside the sandbox
+continue in the child (both ends are restored). A connection to an external peer
+is restored only on the child's side: its peer, the source slot's conntrack/NAT
+state and its SNAT address are not cloned, so that connection fails in the child on
+first use, while the source keeps it.
+
+**Sealed layers do not preserve host inode numbers.** The implementation keeps
 upper/lower roles stable and relies on the supported runc/CRIU mount/file reopening
-path, not on an assertion that inode changes are harmless. The real fixture holds
-both lower and upper descriptors/mappings open and checks an in-memory random nonce
-and counter across source recovery and independent restore. It also exercises
-copy-up and whiteout isolation. That targeted gate **passed with the local static
-fixture, runc 1.3.6 and CRIU 4.3**. It does not establish compatibility for arbitrary
-open/unlinked files, other workloads or hosts. A failed gate must be investigated
-as a real compatibility blocker; do not disable CRIU identity
-checks, convert uppers into lower images, add a per-container block device or report
-a passing restore without an approved architecture decision and actual evidence.
-Cross-node reconstruction and different CPU/kernel combinations are unqualified.
+path (files open in the source reopen from the sealed lower and copy up on write),
+not on an assertion that inode changes are harmless. The real fixture holds lower
+and upper descriptors/mappings open, an ESTABLISHED loopback connection, and checks
+an in-memory random nonce and counter across capture and independent restore. It
+also checks the sealed layer itself: a whiteout for a deleted base file, and the
+modified base file with its owner, mode and a `user.` xattr. That targeted gate
+**passed with the local static fixture, runc 1.3.6 and CRIU 4.3**. It does not
+establish compatibility for arbitrary open/unlinked files, other workloads or
+hosts. Cross-node reconstruction and different CPU/kernel combinations are
+unqualified.
 
 ## Admission, operations and cleanup
 
@@ -160,7 +209,14 @@ reserved in the durable record before network side effects. Unique root/sandbox
 namespace names, an exclusive private ownership marker and bounded helper cgroups
 cover creation, cancellation and restart; unexplained namespace state fails closed.
 Cleanup retains the reservation/marker on failures, including delayed kernel link
-destruction, and retries without global flushes. See [network details](network.md). The workload has UID/GID
+destruction, and retries without global flushes. See [network details](network.md).
+PID 1 of every sandbox is the operator-staged static `tini` (a required trusted tool,
+checked static by preflight), bind-mounted read-only at `/.sandbox-init`. It runs the
+template's `init_argv` as its child, forwards signals and reaps orphaned processes
+(for example killed exec descendants), and is checkpointed with the workload. Its
+stdio, like the workload's, is `/dev/null`: detached runc runs/restores inherit
+`/dev/null`, which CRIU can restore (a pipe hangs a detached run; a file is not
+restorable), and runc's own log goes to `/dev/null`. The workload has UID/GID
 65534, empty capabilities, no_new_privs, minimal /dev, its own proc/PID/mount/net/IPC/
 UTS/cgroup namespaces and a seccomp profile matching the AgentENV container backend:
 `SCMP_ACT_ALLOW` by default, with only two checkpointability guards that CRIU needs:
@@ -168,8 +224,8 @@ UTS/cgroup namespaces and a seccomp profile matching the AgentENV container back
 EPROTONOSUPPORT, so libraries fall back. Seccomp is not an isolation layer here:
 isolation relies on the namespaces, empty capabilities (so mount, namespace creation,
 ptrace, raw/packet sockets and similar privileged operations fail), no_new_privs,
-cgroups and network policy (no external links when isolated; router-namespace nftables
-for `tcp_allowlist`). Workloads may create any unprivileged socket family; network
+cgroups and network policy (a worker-created guest namespace with only loopback when
+isolated; router-namespace nftables for `tcp_allowlist`). Workloads may create any unprivileged socket family; network
 reachability is decided by the namespace and its rules, not by socket filtering.
 Host authority, not workload privilege, performs checkpoints. This profile is
 unqualified for general applications.
@@ -177,7 +233,8 @@ unqualified for general applications.
 TTL has a separate cgroup-kill watchdog so a long archive cannot keep an expired
 workload running until a job completes. Deletion durably records cancellation and
 signals active jobs; cleanup waits for the sandbox's in-flight job rather than
-racing it. Exec uses a dedicated child cgroup and kills/removes descendants on
+racing it. Concurrent DELETE requests of one sandbox all wait for that one cleanup
+and receive its result (AgentENV's wait-for-transition; at most 64 waiters). Exec uses a dedicated child cgroup and kills/removes descendants on
 successful completion too, including children that close stdout/stderr. Exec clamps
 its deadline to remaining TTL; output/deadline/persistent-pipe failure kills the
 entire sandbox. Delete first

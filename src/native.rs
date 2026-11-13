@@ -1,8 +1,8 @@
 //! Linux runc/CRIU backend. There is no runtime adapter or simulated success path.
-use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::Read, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, sync::{Condvar, Mutex, PoisonError}, time::Duration};
 use serde::Serialize;
 use serde_json::{Value, json};
-use crate::{config::NativeConfig, model::SandboxSpec, process::{self, Result}, storage::{self, Compatibility, Manifest}};
+use crate::{config::NativeConfig, model::SandboxSpec, process::{self, Result}, storage::{self, Artifact, Compatibility, Manifest}};
 
 #[derive(Clone, Serialize)]
 pub struct Check { pub name: String, pub ok: bool }
@@ -20,13 +20,33 @@ pub struct Native {
     tools: BTreeMap<String, String>,
     pub search_path: String,
     pub helpers: process::Helpers,
+    // Layer digests (with sizes) whose image this worker has fully hashed; checked once per node.
+    verified: Mutex<BTreeMap<String, u64>>,
+    // Checkpoint cache keys being unpacked; other restores of the same key wait on `unpacked`.
+    unpacking: Mutex<BTreeSet<String>>,
+    unpacked: Condvar,
     _lock: File,
 }
+
+// Where the reaping init (the trusted static tini) is bind-mounted read-only in every sandbox.
+const INIT_PATH: &str = "/.sandbox-init";
 
 // Each sandbox runs at most one exec at a time, in this fixed child cgroup.
 pub const EXEC_CGROUP: &str = "exec";
 
-const TOOL_NAMES: &[&str] = &["runc", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip"];
+const TOOL_NAMES: &[&str] = &["runc", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini"];
+
+// Decide whether a trusted tool is a statically linked ELF executable (no program interpreter), so
+// it runs inside any image's root filesystem. Unreadable or malformed files count as not static.
+fn static_executable(path: &str) -> bool {
+    let mut header = Vec::new();
+    if File::open(path).and_then(|f| f.take(65536).read_to_end(&mut header)).is_err() || header.len() < 64 { return false; }
+    let word = |at: usize, len: usize| header.get(at..at.saturating_add(len)).map(|b| b.iter().rev().fold(0usize, |v, x| v << 8 | *x as usize));
+    // 64-bit little-endian ELF (x86-64 and aarch64): program headers are at e_phoff.
+    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 { return false; }
+    let (Some(offset), Some(size), Some(count)) = (word(0x20, 8), word(0x36, 2), word(0x38, 2)) else { return false; };
+    (0..count).all(|i| word(offset.saturating_add(i.saturating_mul(size)), 4).is_some_and(|kind| kind != 3))
+}
 
 // Find executable tools in trusted administrator-owned directories. Reject writable or untrusted
 // binaries and disallow symlinks in an explicitly configured tools directory.
@@ -90,6 +110,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let required = [0, 1, 3, 4, 5, 6, 7, 8, 12, 18, 19, 21, 24, 27].into_iter().fold(0u64, |m, b| m | 1 << b);
     add("host_capabilities", caps & required == required);
     for &name in TOOL_NAMES { add(&format!("tool_{name}"), tools.contains_key(name)); }
+    add("tool_tini_static", tools.get("tini").is_some_and(|p| static_executable(p)));
     add("helper_path_matches_verified_tools", search_path.is_ok());
     if let Some(network) = config.and_then(|c| c.network.as_ref()) {
         let bridge = tools.get("ip").zip(search_path.as_ref().ok()).and_then(|(ip, path)| process::inspect(ip, &["-j".into(), "-d".into(), "link".into(), "show".into(), "dev".into(), network.bridge.clone()], path).ok())
@@ -131,9 +152,11 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let compatibility = (|| {
         let cpu = fs::read_to_string("/proc/cpuinfo").ok()?;
         let features = cpu.lines().find(|l| l.starts_with("flags") || l.starts_with("Features"))?.split_once(':')?.1.trim();
+        // Restored processes map the init executable, so its exact bytes are part of compatibility.
+        let init = storage::artifact(Path::new(tools.get("tini")?), 1 << 26).ok()?;
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             cpu_features_sha256: storage::digest(features.as_bytes()), runc_version: version("runc")?, criu_version: version("criu")?,
-            layout: "erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v4-agentenv".to_owned() })
+            init_sha256: init.sha256, layout: "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1".to_owned() })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
     Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility }
@@ -141,7 +164,8 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
 
 impl Native {
     // Require successful preflight and exclusive ownership of the runtime root. Verify tools, drain old
-    // helper processes before touching runtime state and create private storage directories.
+    // helper processes before touching runtime state, create private storage directories and drop
+    // half-unpacked checkpoint cache entries. Unknown cache entries fail closed.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -154,8 +178,18 @@ impl Native {
         // Drain old host-side commands before inspecting/removing ANY runtime or
         // staging state. The reserved name cannot be a valid sandbox ID.
         let helpers = process::Helpers::open(Path::new(&config.cgroup_parent).join(format!(".helpers-{}", storage::digest(config.root.as_bytes()))))?;
-        for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc"] { storage::private_dir(&root.join(dir))?; }
-        Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, _lock: lock })
+        for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc", "checkpoints"] { storage::private_dir(&root.join(dir))?; }
+        for entry in fs::read_dir(root.join("checkpoints")).map_err(|_| "checkpoint_cache_scan_failed")? {
+            let entry = entry.map_err(|_| "checkpoint_cache_scan_failed")?;
+            let name = entry.file_name().into_string().map_err(|_| "unknown_checkpoint_cache_state")?;
+            match name.strip_suffix(".unpacking") {
+                Some(key) if storage::hex_digest(key) => storage::remove_private(&entry.path())?,
+                None if storage::hex_digest(&name) => {}
+                _ => return Err("unknown_checkpoint_cache_state"),
+            }
+        }
+        Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers,
+            verified: Mutex::new(BTreeMap::new()), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), _lock: lock })
     }
     // Return the configured root of this worker's runtime storage.
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
@@ -167,8 +201,9 @@ impl Native {
     pub(crate) fn command(&self, tool: &str, args: Vec<String>) -> Result<()> {
         process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers)
     }
-    // Run runc against this worker's private state with the supplied deadline and output limit. Discard
-    // output for detached cold runs and restores so workload streams are not retained as helper output.
+    // Run runc against this worker's private state with the supplied deadline and output limit. Detached
+    // cold runs and restores get /dev/null stdio, which the workload inherits and CRIU can restore (a
+    // pipe would hang a detached run and a file is not restorable), so no workload output is retained.
     pub fn runc(&self, args: Vec<String>, timeout: Duration, limit: usize) -> Result<process::Output> {
         let mut all = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), "/dev/null".into()];
         let detached = args.first().is_some_and(|a| a == "run" || a == "restore");
@@ -181,18 +216,14 @@ impl Native {
         if out.interrupted { Err("runc_deadline_or_output_limit") }
         else if out.exit_code != Some(0) { Err("runc_failed") } else { Ok(()) }
     }
-    // Load and fully verify a template, then require operator-approved networking and the configured
-    // process limit.
-    pub fn template(&self, id: &str) -> Result<Manifest> {
-        let m = storage::load(self.root(), id, &self.compatibility, self.config.max_artifact_bytes)?;
+    // Cheap check before each create or capture: load the manifest (digest sidecar, strict fields, host
+    // compatibility) and require operator-approved networking and the configured process limit. Return
+    // the manifest and its digest. Artifact contents are not hashed here; see mount_lower and
+    // checkpoint_images for the once-per-node checks.
+    pub fn template_manifest(&self, id: &str) -> Result<(Manifest, String)> {
+        let (m, digest) = storage::load_manifest(self.root(), id, &self.compatibility)?;
         self.template_usable(&m)?;
-        Ok(m)
-    }
-    // Admission-time check: this worker could launch the template, without hashing artifacts.
-    pub fn template_manifest(&self, id: &str) -> Result<Manifest> {
-        let m = storage::load_manifest(self.root(), id, &self.compatibility)?;
-        self.template_usable(&m)?;
-        Ok(m)
+        Ok((m, digest))
     }
     // Require the template's network policy to be operator-approved and its process limit to match this
     // worker's configuration.
@@ -207,49 +238,89 @@ impl Native {
         self.network_absent(id) && !self.private(id).exists() && !self.root().join("runc").join(id).exists()
             && !Path::new(&self.config.cgroup_parent).join(id).exists()
     }
-    // Mount an immutable EROFS base if needed, then verify its flags and backing image even when reusing
-    // the mount.
-    pub fn mount_lower(&self, manifest: &Manifest) -> Result<()> {
-        let lower = self.root().join("lowers").join(&manifest.base.sha256);
+    // Return the shared read-only mount point of one EROFS layer.
+    fn lower(&self, digest: &str) -> PathBuf { self.root().join("lowers").join(digest) }
+    // Return the content-addressed image file of one EROFS layer.
+    pub fn layer_image(&self, digest: &str) -> PathBuf { self.root().join("layers").join(format!("{digest}.erofs")) }
+    // Remember that a layer image was fully hashed (at first use or when this worker published it), so
+    // later creates skip rehashing it. A known digest with a different size is rejected.
+    pub fn mark_verified(&self, layer: &Artifact) -> Result<()> {
+        let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
+        if verified.get(&layer.sha256).is_some_and(|bytes| *bytes != layer.bytes) { return Err("artifact_digest_mismatch"); }
+        verified.insert(layer.sha256.clone(), layer.bytes);
+        Ok(())
+    }
+    // Mount one immutable EROFS layer (a template base or a sealed capture layer) if needed. Fully hash
+    // its image the first time this worker uses that digest, then check the mount flags and backing
+    // image on every use, including reuse of an existing mount.
+    pub fn mount_lower(&self, layer: &Artifact) -> Result<()> {
+        let known = self.verified.lock().unwrap_or_else(PoisonError::into_inner).get(&layer.sha256).copied();
+        let image = self.layer_image(&layer.sha256);
+        match known {
+            Some(bytes) if bytes != layer.bytes => return Err("artifact_digest_mismatch"),
+            Some(_) => {}
+            None => { storage::verify(&image, layer, self.config.max_artifact_bytes)?; self.mark_verified(layer)?; }
+        }
+        let lower = self.lower(&layer.sha256);
         if !lower.exists() { storage::private_dir(&lower)?; }
         storage::trusted_directory(&lower)?;
-        let image = self.root().join("layers").join(format!("{}.erofs", manifest.base.sha256));
         if !storage::mounted(&lower)? {
             self.command("mount", vec!["--internal-only".into(), "-t".into(), "erofs".into(), "-o".into(), "loop,ro,nodev,nosuid".into(), image.display().to_string(), lower.display().to_string()])?;
         }
         storage::verify_lower(&lower, &image)
     }
-    // Build a sandbox: private directories, extracted warm upper and images, an overlay root on the
-    // verified shared lower, its resource group, network and execution specification. Then start it
-    // cold or restore it from the checkpoint and confirm it runs. Partial state is left for the
-    // caller's cleanup.
-    pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+    // Return the node's shared CRIU image directory for a warm template, keyed by its manifest digest.
+    // The first restore of a key hashes checkpoint.tar fully and unpacks it once (staged, then renamed);
+    // concurrent restores of that key wait for it, and later ones reuse the directory without reading
+    // the archive. CRIU only reads these images, so restores share them.
+    pub fn checkpoint_images(&self, manifest: &Manifest, key: &str) -> Result<PathBuf> {
+        let archive = manifest.checkpoint.as_ref().ok_or("checkpoint_missing")?;
+        if !storage::hex_digest(key) { return Err("invalid_checkpoint_cache_key"); }
+        let cache = self.root().join("checkpoints");
+        let ready = cache.join(key);
+        let _turn = KeyTurn::take(&self.unpacking, &self.unpacked, key);
+        if ready.exists() { storage::trusted_directory(&ready)?; return Ok(ready); }
+        let staging = cache.join(format!("{key}.unpacking"));
+        storage::remove_private(&staging)?;
+        storage::exclusive_private_dir(&staging)?;
+        let template = self.root().join("templates").join(&manifest.template_id);
+        storage::verify(&template.join("checkpoint.tar"), archive, self.config.max_artifact_bytes)?;
+        storage::extract(self.tool("tar")?, &template.join("checkpoint.tar"), &staging, self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
+        File::open(&staging).and_then(|f| f.sync_all()).map_err(|_| "checkpoint_cache_sync_failed")?;
+        fs::rename(&staging, &ready).map_err(|_| "checkpoint_cache_publish_failed")?;
+        File::open(&cache).and_then(|f| f.sync_all()).map_err(|_| "checkpoint_cache_sync_failed")?;
+        Ok(ready)
+    }
+    // Build a sandbox: private directories, an overlay root whose lowers are the template's verified
+    // sealed layers above its base, with a fresh empty upper, plus its resource group, network and
+    // execution specification. Then start it cold or restore it from the shared checkpoint images and
+    // confirm it runs. Partial state is left for the caller's cleanup.
+    pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, images: Option<&Path>, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         let id = &request.sandbox_id;
         let private = self.private(id);
         storage::private_dir(&private)?;
-        for name in ["upper", "work", "rootfs", "images", "criu-work"] { storage::private_dir(&private.join(name))?; }
-        if manifest.checkpoint.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(private.join("upper"), fs::Permissions::from_mode(0o755)).map_err(|_| "upper_permissions_failed")?;
+        for name in ["upper", "work", "rootfs", "criu-work"] { storage::private_dir(&private.join(name))?; }
+        // The upper root is the merged root directory, for cold and warm sandboxes alike.
+        fs::set_permissions(private.join("upper"), fs::Permissions::from_mode(0o755)).map_err(|_| "upper_permissions_failed")?;
+        if images.is_some() != manifest.checkpoint.is_some() { return Err("checkpoint_images_missing"); }
+        if manifest.checkpoint.is_some() && (manifest.memory_mib != Some(request.memory_mib) || manifest.vcpus != Some(request.vcpus)) { return Err("incompatible_checkpoint_resources"); }
+        let mut lowers = Vec::new();
+        for layer in manifest.layers.iter().chain(std::iter::once(&manifest.base)) {
+            let lower = self.lower(&layer.sha256);
+            storage::verify_lower(&lower, &self.layer_image(&layer.sha256))?;
+            lowers.push(lower.display().to_string());
         }
-        if manifest.checkpoint.is_some() {
-            if manifest.memory_mib != Some(request.memory_mib) || manifest.vcpus != Some(request.vcpus) { return Err("incompatible_checkpoint_resources"); }
-            let template = self.root().join("templates").join(&manifest.template_id);
-            storage::extract(self.tool("tar")?, &template.join("upper.tar"), &private.join("upper"), self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
-            storage::extract(self.tool("tar")?, &template.join("checkpoint.tar"), &private.join("images"), self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
-        }
-        let lower = self.root().join("lowers").join(&manifest.base.sha256);
-        storage::verify_lower(&lower, &self.root().join("layers").join(format!("{}.erofs", manifest.base.sha256)))?;
-        // Work/upper are ordinary sibling directories, never a new lower layer.
+        // Topmost sealed layer first. Work/upper are ordinary private sibling directories.
         self.command("mount", vec!["--internal-only".into(), "-t".into(), "overlay".into(), "overlay".into(), "-o".into(),
-            format!("nodev,nosuid,lowerdir={},upperdir={},workdir={},index=off,metacopy=off,redirect_dir=off,xino=off", lower.display(), private.join("upper").display(), private.join("work").display()),
+            format!("nodev,nosuid,lowerdir={},upperdir={},workdir={},index=off,metacopy=off,redirect_dir=off,xino=off", lowers.join(":"), private.join("upper").display(), private.join("work").display()),
             private.join("rootfs").display().to_string()])?;
         self.cgroup(request)?;
         self.prepare_network(id, &manifest.network, network_slot)?;
         self.write_spec(request, manifest)?;
         if manifest.oci_config_sha256.as_ref().is_some_and(|d| self.spec_digest(id).as_ref() != Ok(d)) { return Err("oci_config_mismatch"); }
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
-        if manifest.checkpoint.is_some() { self.restore(id, &private.join("images"))?; }
+        if let Some(images) = images { self.restore(id, images)?; }
         else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; }
         self.ensure_running(id)
     }
@@ -264,21 +335,23 @@ impl Native {
         }
         Ok(())
     }
-    // Write the CRIU settings and the runc execution specification: unprivileged init, private
-    // namespaces (joining the prepared guest network when networked), minimal devices, resource limits,
-    // masked kernel paths and the syscall policy.
+    // Write the CRIU settings and the runc execution specification: the read-only reaping init running
+    // the template's argv unprivileged, private namespaces (joining the prepared guest network
+    // namespace), minimal devices, resource limits, masked kernel paths and the syscall policy.
     fn write_spec(&self, request: &SandboxSpec, manifest: &Manifest) -> Result<()> {
         let private = self.private(&request.sandbox_id);
         // Request-specific CRIU options are worker-authored. Administrator-owned
         // system CRIU configuration is part of the trusted host prerequisites.
         fs::write(private.join("criu.conf"), "network-lock nftables\n").map_err(|_| "criu_config_failed")?;
-        let process = self.process_spec(manifest.init_argv.clone());
+        // PID 1 is tini: it runs init_argv as its child, forwards signals and reaps orphans.
+        let process = self.process_spec([INIT_PATH.to_owned(), "--".to_owned()].into_iter().chain(manifest.init_argv.iter().cloned()).collect());
         let mut spec = json!({
             "ociVersion": "1.2.0", "process": process, "root": {"path": "rootfs", "readonly": false}, "hostname": "sandbox",
             "annotations": {"org.criu.config": private.join("criu.conf").display().to_string(), "org.sandbox.network-policy": crate::engine::fingerprint(&manifest.network)},
             "mounts": [
                 {"destination":"/proc", "type":"proc", "source":"proc", "options":["nosuid","noexec","nodev"]},
-                {"destination":"/dev", "type":"tmpfs", "source":"tmpfs", "options":["nosuid","strictatime","mode=755","size=1m"]}
+                {"destination":"/dev", "type":"tmpfs", "source":"tmpfs", "options":["nosuid","strictatime","mode=755","size=1m"]},
+                {"destination":INIT_PATH, "type":"bind", "source":self.tool("tini")?, "options":["bind","ro","nosuid","nodev"]}
             ],
             "linux": {
                 "cgroupsPath": format!("{}/{}", self.config.cgroup_parent.trim_start_matches("/sys/fs/cgroup"), request.sandbox_id),
@@ -302,19 +375,22 @@ impl Native {
                 "seccomp": seccomp()
             }
         });
-        if !matches!(manifest.network, crate::model::NetworkPolicy::Isolated) {
-            spec["linux"]["namespaces"][2]["path"] = json!(format!("/run/netns/{}", self.network_names(&request.sandbox_id).0));
-        }
+        // Every sandbox joins its worker-created guest namespace, isolated ones too.
+        spec["linux"]["namespaces"][2]["path"] = json!(format!("/run/netns/{}", self.network_names(&request.sandbox_id).0));
         process::atomic_json(&private.join("config.json"), &spec)
     }
-    // Hash the saved execution specification after replacing worker-local reconstruction paths with stable
-    // markers.
+    // Hash the saved execution specification after replacing worker-local reconstruction paths (cgroup,
+    // guest netns, CRIU config, init binary) with stable markers.
     pub fn spec_digest(&self, id: &str) -> Result<String> {
         let mut spec: Value = storage::read_json(&self.private(id).join("config.json"), 65536)?;
         // Only worker-local reconstruction paths vary between independent containers.
         spec["linux"]["cgroupsPath"] = Value::String("<private-cgroup>".into());
         if spec["linux"]["namespaces"][2].get("path").is_some() { spec["linux"]["namespaces"][2]["path"] = json!("<private-guest-netns>"); }
         spec["annotations"]["org.criu.config"] = json!("<worker-criu-config>");
+        // The init's bytes are pinned by the compatibility fingerprint, not by its host path.
+        if let Some(mounts) = spec["mounts"].as_array_mut() {
+            for mount in mounts.iter_mut().filter(|m| m["destination"] == INIT_PATH) { mount["source"] = json!("<worker-init>"); }
+        }
         Ok(storage::digest(&serde_json::to_vec(&spec).map_err(|_| "spec_encode_failed")?))
     }
     // Describe an unprivileged sandbox process with fixed environment, workspace, empty capabilities and
@@ -332,37 +408,56 @@ impl Native {
         if out.exit_code != Some(0) || state["status"] != "running" { return Err("container_not_running"); }
         Ok(())
     }
-    // Checkpoint and stop the source through runc, saving process images and file locks with network
-    // locking enabled.
-    pub fn checkpoint(&self, id: &str, images: &Path) -> Result<()> {
-        // Mount compatibility mode is a restore-only CRIU option.
-        fs::write(self.private(id).join("criu.conf"), "network-lock nftables\n").map_err(|_| "criu_config_failed")?;
-        self.runc_checked(vec!["checkpoint".into(), "--image-path".into(), images.display().to_string(),
-            "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
-            "--file-locks".into(), id.into()]).map_err(|_| "checkpoint_failed")
+    // Freeze every process of the sandbox (cgroup freezer) through runc.
+    pub fn pause(&self, id: &str) -> Result<()> { self.runc_checked(vec!["pause".into(), id.into()]).map_err(|_| "pause_failed") }
+    // Thaw a paused sandbox through runc.
+    pub fn resume(&self, id: &str) -> Result<()> { self.runc_checked(vec!["resume".into(), id.into()]).map_err(|_| "resume_failed") }
+    // While the sandbox is frozen, report whether any of its processes has a uprobes mapping (left by a
+    // host tracing or security agent). CRIU dumps such processes only with allow-uprobes.
+    pub fn uprobes_present(&self, id: &str) -> Result<bool> {
+        let procs = fs::read_to_string(Path::new(&self.config.cgroup_parent).join(id).join("cgroup.procs")).map_err(|_| "cgroup_unavailable")?;
+        for pid in procs.split_whitespace() {
+            let mut maps = String::new();
+            File::open(format!("/proc/{pid}/maps")).and_then(|f| f.take(16 << 20).read_to_string(&mut maps)).map_err(|_| "process_maps_unavailable")?;
+            if maps.lines().any(|l| l.ends_with("[uprobes]")) { return Ok(true); }
+        }
+        Ok(false)
     }
-    // Restore captured processes into the prepared sandbox without replacing its resource groups, then
-    // confirm it is running.
+    // While the sandbox is frozen, flush its overlay and build a read-only EROFS image of its upper
+    // directory. Whiteouts, opaque-directory markers, ownership, modes and extended attributes are
+    // kept, so the image works as a lower layer for restored children.
+    pub fn seal_upper(&self, id: &str, image: &Path) -> Result<()> {
+        let rootfs = File::open(self.private(id).join("rootfs")).map_err(|_| "rootfs_unavailable")?;
+        if unsafe { libc::syncfs(rootfs.as_raw_fd()) } != 0 { return Err("upper_sync_failed"); }
+        self.command("mkfs.erofs", vec!["--quiet".into(), image.display().to_string(), self.private(id).join("upper").display().to_string()])
+            .map_err(|_| "upper_seal_failed")
+    }
+    // Checkpoint the paused source through runc and leave it running afterwards. Save process images,
+    // established TCP connections, external Unix sockets and file locks, with the network locked during
+    // the dump; skip connections not yet accepted, and allow uprobes mappings only when the caller found
+    // some.
+    pub fn checkpoint(&self, id: &str, images: &Path, allow_uprobes: bool) -> Result<()> {
+        // Clients that connect while the source is frozen sit unaccepted in a listen
+        // backlog, which CRIU otherwise refuses to dump. The running source still
+        // serves them after the thaw; children never had them. runc has no flag for
+        // this, so it goes in the per-container CRIU config. Mount compatibility
+        // mode is a restore-only option.
+        let config = format!("network-lock nftables\nskip-in-flight\n{}", if allow_uprobes { "allow-uprobes\n" } else { "" });
+        fs::write(self.private(id).join("criu.conf"), config).map_err(|_| "criu_config_failed")?;
+        self.runc_checked(vec!["checkpoint".into(), "--leave-running".into(), "--image-path".into(), images.display().to_string(),
+            "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
+            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), id.into()]).map_err(|_| "checkpoint_failed")
+    }
+    // Restore captured processes, including established TCP connections, external Unix sockets and
+    // file locks, into the prepared sandbox without replacing its resource groups, then confirm it is
+    // running. The image directory is only read.
     pub fn restore(&self, id: &str, images: &Path) -> Result<()> {
-        fs::write(self.private(id).join("criu.conf"), "mntns-compat-mode\nnetwork-lock nftables\n").map_err(|_| "criu_config_failed")?;
+        // Same restore-only options as the AgentENV container backend, plus the network lock method.
+        fs::write(self.private(id).join("criu.conf"), "allow-uprobes\nmntns-compat-mode\nnetwork-lock nftables\n").map_err(|_| "criu_config_failed")?;
         self.runc_checked(vec!["restore".into(), "--detach".into(), "--bundle".into(), self.private(id).display().to_string(),
             "--image-path".into(), images.display().to_string(), "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
-            "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
+            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
         self.ensure_running(id)
-    }
-    // Restore a capture source from its fresh images, recreating its resource group if needed, unless the
-    // sandbox was cancelled or expired.
-    pub fn restore_source(&self, request: &SandboxSpec, images: &Path, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
-        if !Path::new(&self.config.cgroup_parent).join(&request.sandbox_id).exists() { self.cgroup(request)?; }
-        if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
-        self.restore(&request.sandbox_id, images)
-    }
-    // Remove stopped source state if it remains, never forcing deletion of a potentially running source.
-    pub fn forget_stopped(&self, id: &str) -> Result<()> {
-        // runc versions may remove stopped state as part of checkpoint itself.
-        // Absence is expected; never force-delete a potentially running source.
-        if !self.root().join("runc").join(id).exists() { return Ok(()); }
-        self.runc_checked(vec!["delete".into(), id.into()]).map_err(|_| "checkpoint_source_delete_failed")
     }
     // Create the fixed child resource group for the sandbox's one running exec.
     pub fn create_exec_cgroup(&self, id: &str) -> Result<()> {
@@ -411,20 +506,39 @@ impl Native {
     }
     // Drain and remove the worker-owned host-command resource groups.
     pub fn remove_helpers(&self) -> Result<()> { self.helpers.remove() }
-    // Unmount known shared lower images after helper cleanup is healthy, verifying each mount before
-    // removal.
+    // Unmount known shared layer mounts (bases and sealed capture layers) after helper cleanup is
+    // healthy, verifying each mount before removal.
     pub fn unmount_lowers(&self) -> Result<()> {
         self.helpers.ensure_healthy()?;
         for entry in fs::read_dir(self.root().join("lowers")).map_err(|_| "lower_scan_failed")? {
             let entry = entry.map_err(|_| "lower_scan_failed")?;
             if !entry.file_name().to_str().is_some_and(storage::hex_digest) { return Err("unknown_lower_state"); }
             if storage::mounted(&entry.path())? {
-                let image = self.root().join("layers").join(format!("{}.erofs", entry.file_name().to_string_lossy()));
-                storage::verify_lower(&entry.path(), &image)?;
+                storage::verify_lower(&entry.path(), &self.layer_image(&entry.file_name().to_string_lossy()))?;
                 self.command("umount", vec!["--internal-only".into(), entry.path().display().to_string()])?;
             }
         }
         Ok(())
+    }
+}
+
+// One restore's exclusive turn on a checkpoint cache key. Waiting releases the set's lock, so no lock
+// is held while another restore unpacks; dropping the turn wakes the waiters.
+struct KeyTurn<'a> { keys: &'a Mutex<BTreeSet<String>>, changed: &'a Condvar, key: String }
+impl<'a> KeyTurn<'a> {
+    // Wait until no other restore holds this key, then claim it.
+    fn take(keys: &'a Mutex<BTreeSet<String>>, changed: &'a Condvar, key: &str) -> Self {
+        let mut busy = keys.lock().unwrap_or_else(PoisonError::into_inner);
+        while busy.contains(key) { busy = changed.wait(busy).unwrap_or_else(PoisonError::into_inner); }
+        busy.insert(key.to_owned());
+        Self { keys, changed, key: key.to_owned() }
+    }
+}
+impl Drop for KeyTurn<'_> {
+    // Release the key, even after a failure or panic, and wake restores waiting for it.
+    fn drop(&mut self) {
+        self.keys.lock().unwrap_or_else(PoisonError::into_inner).remove(&self.key);
+        self.changed.notify_all();
     }
 }
 

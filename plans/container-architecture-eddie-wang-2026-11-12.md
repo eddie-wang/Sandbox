@@ -88,9 +88,9 @@ Suppose a client wants a sandbox from template `example-template`. It sends only
 4. **The controller forwards the request to that worker.** Worker addresses come from administrator configuration, not the caller. The controller uses its separate worker credential.
 5. **The worker makes the final decision.** The controller's information may already be out of date. The worker checks that it has a valid, compatible copy of the template, then its own reservations, container count and background-work slots. It saves a record before creating anything outside that record. If capacity has run out, it says so without saving anything.
 6. **If the worker said no before starting anything, the controller tries another node.** Examples are "no capacity", "busy" and "I don't have a usable copy of this template". It makes at most three attempts, each with a new ID. If the outcome is uncertain — the connection broke, the wait ran out, or the worker failed after it started — the controller does **not** try elsewhere. It reports the error together with the ID, so the client can look at or delete that sandbox.
-7. **Background work checks the template files.** It verifies their checksums and acquires the shared read-only base mount.
+7. **Background work checks the template files.** It mounts the template's shared read-only layers (its base and, for a warm template, the layers sealed by captures). Each layer's checksum is verified the first time the node uses it; later creates reuse the verified mount. For a warm template it also takes the node's copy of the saved processes, unpacked and verified once per template and shared by every later restore.
 8. **The worker prepares this sandbox's private environment.** It creates the writable directories, mounts OverlayFS, installs resource limits and any permitted networking, and writes the container's configuration file.
-9. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions.
+9. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions. The first process in every container is a tiny standard init program, `tini`, which starts the template's application, passes signals on to it and cleans up finished child processes ("zombies"), much like Docker's `--init`.
 10. **The worker verifies the container is running, and only then does the client get its answer.** The response (`201 Created`) contains the new ID and `running`. If creation failed, the worker first cleans up and the client receives the reason.
 
 The status budget counts **resources already promised to sandboxes**, not a live measurement of free host RAM. The controller's check is an early filter; it cannot reserve resources on a worker. For example, two requests can pass the same cached check, but the worker must still prevent them from reserving the same remaining capacity.
@@ -112,7 +112,7 @@ Each sandbox reads unchanged files from the shared base. Its own new files and c
 
 The private directory that stores changes is called `upper`. OverlayFS also needs a private working directory, called `work`. These are ordinary directories, not a disk image per sandbox. The shared EROFS image is mounted through Linux's standard loop-device mechanism.
 
-The current template format references **one base image**. Separate, independently selectable application/data/toolkit layers are not implemented.
+A template references **one base image** plus, for a warm template, the layers its captures sealed (newest first). Each layer is stored once per node under its checksum and shared by every template and sandbox that uses it. Separate, independently selectable application/data/toolkit layers are not implemented.
 
 **What EROFS adds:** a read-only image format, optional on-disk compression and convenient image-based staging. The main sharing benefit is not unique to EROFS: OverlayFS over a shared ext4/XFS directory could also share base files and cached file pages. That alternative is not implemented here. Compression does not mean an application's working data stays compressed in RAM.
 
@@ -133,20 +133,20 @@ Command timeouts or excessive output cause the **whole sandbox** to be terminate
 
 ### 4. Saving an initialized application and starting a copy
 
-A **cold template** contains the base files and startup instructions. A **warm template** also contains saved process state and the original sandbox's file changes.
+A **cold template** contains the base files and startup instructions. A **warm template** also contains saved process state and the original sandbox's file changes, sealed into a read-only layer.
 
-Capture works as follows:
+Capture follows the AgentENV container design and **does not stop the source**:
 
 1. Check that the requested template name is unused and that the sandbox can be captured.
-2. Reject active or closing TCP connections. Listening sockets are supported, but connections to external services cannot simply be copied.
-3. Ask runc/CRIU to checkpoint the application. **This stops the source application.**
-4. Archive the source's private file changes, including file permissions and records of deleted base files.
-5. Restore the source application from the checkpoint. Do not call it running until recovery succeeds.
-6. Publish the complete template only after source recovery succeeds. It contains the matching process checkpoint, private-file archive, base reference, required configuration and checksums.
+2. Briefly freeze the source's processes (`runc pause`).
+3. While it is frozen, flush its private file changes to disk and seal them into a new read-only EROFS layer. The layer keeps file permissions, owners, extended attributes and records of deleted base files.
+4. Still frozen, ask runc/CRIU to save the processes and let them keep running afterwards. Open network connections are saved too, including connections inside the sandbox.
+5. Unfreeze the source. It was unavailable only between steps 2 and 5; requests that arrive meanwhile wait and are answered afterwards.
+6. Archive the saved processes, then publish the layer and the complete template: the matching process checkpoint, the sealed layer, the base reference, the required configuration and checksums.
 
-Capture therefore interrupts the source briefly; it is not a zero-downtime fork. The saved private changes remain private changes: they are not turned into a replacement base layer.
+If any step fails, the worker unfreezes the source and keeps it if it is still running; it never kills a healthy source.
 
-To create a child, the client makes another create request naming the warm template; it gets a new sandbox ID, and the controller places it on a node holding a compatible copy of that template. The worker creates new private directories, reconstructs the filesystem and limits, and invokes `runc restore`. Source and child then continue independently.
+To create a child, the client makes another create request naming the warm template; it gets a new sandbox ID, and the controller places it on a node holding a compatible copy of that template. The worker mounts the sealed layer on top of the base with a new, empty private directory for the child's changes, reconstructs the limits and network, and invokes `runc restore`. Nothing is copied per child. Source and child then continue independently. Connections inside the sandbox keep working in the child; a connection to an outside service keeps working only in the source, because the outside service and the source's network state are not copied.
 
 The worker checks the architecture, kernel, CPU features, runtime versions and required configuration. Successful tests on one machine do not prove a template can be restored on every other machine. A target node must already have the required artifacts; the service does not fetch them from S3.
 
@@ -164,7 +164,7 @@ Cleanup happens when the client deletes a sandbox, its lifetime expires, or the 
 - Remove its runtime state, private mounts, network connections and private files.
 - Release its reserved capacity only after cleanup succeeds.
 
-A delete request waits for cleanup to finish; if a command is running in that sandbox, delete stops it first. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
+A delete request waits for cleanup to finish; if a command is running in that sandbox, delete stops it first. If a second delete request for the same sandbox arrives meanwhile, it waits for the same cleanup and gets the same answer. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
 
 A separate lifetime monitor can stop an expired sandbox even while a long background operation is running. The requested lifetime starts when the worker accepts the create, not when application startup finishes.
 
@@ -172,11 +172,11 @@ A separate lifetime monitor can stop an expired sandbox even while a long backgr
 
 ### 6. Network access is off unless explicitly allowed
 
-By default, a sandbox has no external network access. An approved template can allow specific **IPv4 addresses and TCP ports**, plus ports on which its own application may receive tool requests.
+By default, a sandbox has no external network access: it still gets its own private network environment, created by the worker, but with only the internal loopback connection. An approved template can allow specific **IPv4 addresses and TCP ports**, plus ports on which its own application may receive tool requests.
 
 An operator supplies a bridge, gateway and an address pool reserved for this worker. Each networked sandbox has its own isolated network and a private routing environment that checks traffic before forwarding it. The worker installs the rules before starting the application. It does not repair the host's existing firewall, routes or forwarding settings.
 
-All guests see the same private address inside their separate environments. The address used outside each sandbox is different. Keeping the guest-side address stable helps restore saved applications; it does not copy external connections or the router's connection state.
+All guests see the same private address inside their separate environments. The address used outside each sandbox is different. Keeping the guest-side address stable lets saved connections restore in any child; it does not copy the outside end of external connections or the router's connection state.
 
 There is no implicit DNS, UDP, IPv6 or access to the host or sibling sandboxes. The allowed endpoints are fixed in the template and checked against the operator's limits. A create request cannot override them.
 
@@ -223,7 +223,7 @@ The main API operations are:
 | `GET /v1/sandboxes/{id}` | Read its state and expiry time. |
 | `POST /v1/sandboxes/{id}/exec` | Run a command inside it; returns exit code and output. |
 | `POST /v1/sandboxes/{id}/http` | Call its application over HTTP; returns status and body. |
-| `POST /v1/sandboxes/{id}/capture` | Save its initialized state as a new template; returns after the source is running again. |
+| `POST /v1/sandboxes/{id}/capture` | Save its initialized state as a new template without stopping it; returns once the template is published and the source is running. |
 | `DELETE /v1/sandboxes/{id}` | Clean it up; returns when cleanup is complete. |
 
 Only `/healthz` is public, and it reports that the service is alive—not that it can run workloads. See the [API reference](../docs/api.md) for exact fields, limits, response states and retry rules.
@@ -236,8 +236,10 @@ There is no full E2B-compatible API, public fork/pause/resume API, automatic tem
 
 Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linux host, with at most three containers, each limited to 64 MiB, one vCPU and 64 processes. They checked:
 
-- Cold startup, private file changes, capture, source recovery and independent restore.
-- Saved open files and memory mappings in that fixture.
+- Cold startup, private file changes, capture without stopping the source (and a failed capture that leaves it running), independent restore, and reuse of the node's saved-process copy.
+- Saved open files, memory mappings and an open connection inside the sandbox in that fixture; deleted and modified base files in the sealed layer.
+- A first process that cleans up finished child processes, and a second delete that waits for the first.
+- The same workflow with a real public Python image, including a measurement of how long the source is frozen during capture.
 - Waiting requests that return real results, concurrent operations in different sandboxes, immediate refusal of a conflicting request, cleanup after a client disconnects mid-command or mid-create, lifetime expiry, deletion and worker-restart cleanup.
 - Allowed and denied TCP connections, application HTTP limits, restored listeners and new connections after restore.
 - Cleanup of test-owned processes, mounts, namespaces, loop devices and resource groups.
@@ -248,7 +250,7 @@ These results do not prove arbitrary application compatibility, all possible cra
 
 ### What the next qualification must establish
 
-First, run a representative real application through startup, tool calls, capture, source recovery and independent restore on both nodes. Only then measure pressure:
+First, run a representative real application through startup, tool calls, capture (source keeps running) and independent restore on both nodes. Only then measure pressure:
 
 - **Two nodes; below 512 GB per node**, not 512 GB combined. Use a 500,000,000,000-byte hard limit per node for headroom, covering the whole experiment and its charged file cache. Report any memory outside that accounting boundary.
 - **16, 32 and 64 live sandboxes across the job**, with the per-node split reported. Keep about 10% actually executing and 90% resident but idle; queued requests do not count as active execution.

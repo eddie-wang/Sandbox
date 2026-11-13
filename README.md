@@ -8,10 +8,12 @@ A small Rust controller/scheduler and Linux node worker for stateful tool execut
 smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This includes
 IPv4 TCP allowlists and text application HTTP inside a disposable outer test netns,
 restored listening sockets/fresh connections, and the existing lifecycle cases:
-cold create, capture/source recovery, independent warm restore, overlapping commands,
-private writes/whiteouts, blocking inline results, cleanup after client disconnect
-mid-exec and mid-create, TTL/delete
-and crash/restart cleanup.
+cold create, capture without stopping the source, independent warm restore
+(including an established loopback TCP connection) from a sealed EROFS layer and a
+once-per-node checkpoint cache, a reaping PID 1, overlapping commands, private
+writes/whiteouts, blocking inline results, cleanup after client disconnect
+mid-exec and mid-create, waiting concurrent DELETEs, TTL/delete
+and crash/restart cleanup. A real-image check (`python:3.12-slim`) passed too.
 This is a targeted functional result, **not production isolation, general workload
 readiness, cross-node portability or capacity qualification**. The validation host's
 indirect system-library/shell trust was not established; see the operator recipe.
@@ -47,27 +49,34 @@ RBAC, built-in TLS or Internet-facing connection defense.
 
 ## Real-runtime design
 
-- Administrator-provisioned immutable EROFS images; shared read-only lower mounts,
-  **ordinary private OverlayFS upper/work directories**, no per-container block
-  devices or storage daemon. Only the shared EROFS mount uses a loop device.
+- Administrator-provisioned immutable EROFS base images plus EROFS layers sealed by
+  captures, all content-addressed and mounted once per node as shared read-only
+  lowers (hashed once per node, at first use or publication); **ordinary private
+  OverlayFS upper/work directories**, a fresh empty upper per sandbox, no
+  per-container block devices or storage daemon. Only the shared EROFS mounts use
+  loop devices.
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
   65534, empty capabilities, `no_new_privs` and cgroup-v2 memory/swap/CPU/pids
   limits installed before launch. Seccomp follows the AgentENV container pattern:
   default-allow, blocking only io_uring (`ENOSYS`) and MPTCP sockets
   (`EPROTONOSUPPORT`), which CRIU cannot checkpoint. Isolation relies on the
   namespaces, absent capabilities, `no_new_privs`, cgroups and network policy.
+  PID 1 is an operator-staged static `tini`, bind-mounted read-only, which runs the
+  template's init as its child, forwards signals and reaps orphans; stdio is
+  `/dev/null`.
 - Fully isolated networking remains the default. Opt-in immutable templates can
   use **IPv4 TCP literal destination/port allowlists**, bounded by operator policy.
   A worker-owned routing namespace per sandbox enforces default-drop nftables
   rules and SNAT before launch/restore; every guest has the same private address.
+  Isolated sandboxes also get a worker-owned guest namespace, with only loopback.
   The operator provisions a stable-MAC bridge, gateway and exclusive address pool.
   No global firewall, routing or sysctl repair; no DNS, UDP, IPv6 or host-network mode.
 - One durable admission/state coordinator per worker, a fixed bounded pool for
   parallel runtime I/O across sandboxes, per-sandbox exclusion, separate restore
   slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic
   lifecycle records. **Blocking API:** each request returns its real outcome
-  (create when running, exec/HTTP results, capture after publication and source
-  recovery, delete after cleanup) within a route-specific bounded deadline. A client
+  (create when running, exec/HTTP results, capture after publication, delete after
+  cleanup; concurrent DELETEs of one sandbox share that result) within a route-specific bounded deadline. A client
   disconnect or timeout does not orphan a sandbox (exec/HTTP/capture/delete finish
   with normal cleanup; a create whose reply the worker could not deliver is deleted
   as `create_response_lost`), except when a later hop loses a reply the worker
@@ -77,13 +86,17 @@ RBAC, built-in TLS or Internet-facing connection defense.
   reserve memory or start a workload. CPU quota admission has an explicit bounded
   operator overcommit factor, rather than assuming each idle quota consumes a
   physical CPU.
-- Capture stops the source, archives the unchanged upper layout with ownership,
-  xattrs and whiteouts, pairs it with CRIU images, recovers the source, then
-  atomically publishes a manifest and digests. It never promotes upper files into
-  a new lower. Directory-copy file identity and independent restore are explicit
-  qualification gates, exercised by open upper/lower descriptors and mappings in
-  the real fixture. That fixture passed; arbitrary open-file/application states
-  and other host configurations are **not assumed compatible**.
+- Capture follows the AgentENV container backend and does not stop the source:
+  `runc pause`, `syncfs` and seal the upper into an EROFS layer (ownership, xattrs,
+  whiteouts kept), `runc checkpoint --leave-running` with `--tcp-established
+  --ext-unix-sk --file-locks`, `runc resume`; then archive the images and atomically
+  publish the layer, manifest and digests. On failure the source is thawed and kept
+  if it runs. Children mount the sealed layer above the base and restore from CRIU
+  images unpacked once per node per manifest digest and shared read-only. File
+  identity and independent restore are explicit qualification gates, exercised by
+  open upper/lower descriptors, mappings and a loopback TCP connection in the real
+  fixture. That fixture passed; arbitrary open-file/application states and other
+  host configurations are **not assumed compatible**.
 - Local immutable template repository with bounded artifact verification and
   exact kernel/CPU/architecture/runc/CRIU/config compatibility. All published
   templates/layers are retained; automatic cache eviction/GC and S3 transfer are

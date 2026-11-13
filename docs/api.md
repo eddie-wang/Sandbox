@@ -42,7 +42,7 @@ remains behind the worker credential only (controller and operator use).
 ordinary RPC: create returns `201` after the container is running or restored (or
 an error after failure cleanup); exec returns exit code and bounded output; HTTP
 returns the application's status/content-type/body; capture returns after template
-publication **and** source recovery; delete returns after cleanup. There is no
+publication with the source running; delete returns after cleanup. There is no
 operation ID, operation endpoint or stored result. Different sandboxes run
 concurrently on the worker's fixed operation pool (`max_concurrent_operations`,
 default 16, range 1–64); `max_concurrent_restores` bounds create/restore/capture.
@@ -53,7 +53,8 @@ Concurrent exec/HTTP in one sandbox is deliberately not supported: a bound-viola
 exec terminates the whole sandbox, which would race a parallel command's cleanup.
 `DELETE` is the exception: it cancels in-flight work of that sandbox (whose request
 then returns its failed or interrupted outcome) and returns after cleanup. A second
-concurrent DELETE of the same sandbox gets `409 sandbox_busy`. A full operation pool
+concurrent DELETE of the same sandbox waits for the same cleanup and returns its
+result (up to 64 waiting DELETEs per sandbox; more get `503 busy`). A full operation pool
 or restore budget returns `503 busy` before anything starts.
 
 **Deadlines cover the operation.** Each route's worker waits for at most:
@@ -94,8 +95,8 @@ names its generated `sandbox_id` so the caller can GET or DELETE it. A direct wo
 `409 idempotency_conflict` for different input). An exec or HTTP request runs at most
 once, but a client retry runs it again: a lost response may hide a command or
 application side effect that already happened. A capture retry for a published
-template ID returns `409 template_already_exists`. Delete is safe to repeat after it
-completes (a concurrent second DELETE gets `409 sandbox_busy`).
+template ID returns `409 template_already_exists`. Delete is safe to repeat, also
+concurrently (a second DELETE waits for the first and gets its result).
 
 Create failover is limited to **definitive pre-launch rejections**, where the worker
 answered before creating any resource: `busy`, `admission_exhausted`,
@@ -122,13 +123,13 @@ Records are retained as tombstones; IDs are never reused.
 | `DELETE /v1/sandboxes/{id}` | Blocking; `200` view after cleanup (`deleted`, or `failed` for a never-launched ID); `500 cleanup_failed` otherwise |
 | `POST /v1/sandboxes/{id}/exec` | Blocking bounded command; `200` result |
 | `POST /v1/sandboxes/{id}/http` | Blocking bounded application HTTP (not a management proxy); `200` result |
-| `POST /v1/sandboxes/{id}/capture` | Blocking warmed-template capture; `200` after publication and source recovery |
+| `POST /v1/sandboxes/{id}/capture` | Blocking warmed-template capture; `200` after publication, with the source running (it is only briefly frozen) |
 
 Create example: `201 {"sandbox_id":"node-a.3f0c…","template_id":"example-template",
 "state":"running","error":null,"expires_at":1700000000}`. States are `creating`,
 `running`, `capturing`, `deleting`, `deleted`, `failed` and `cleanup_failed`. Capture
-returns the source to `running` only after actual recovery, or makes it terminal
-through deletion. Delete/TTL/restart uses `deleting -> deleted` or `cleanup_failed`.
+returns the source to `running` once runc reports it running after the thaw, or makes
+it terminal through deletion. Delete/TTL/restart uses `deleting -> deleted` or `cleanup_failed`.
 Cleanup failures keep memory/live admission reserved and retry in the background.
 GET of an unknown sandbox is 404.
 
@@ -154,9 +155,11 @@ requires the captured memory/vCPU/pids/config and host compatibility.
 
 During admission the worker checks the template manifest (digest sidecar, strict
 fields, exact host compatibility including architecture, network policy and pids);
-failure is a pre-launch `422 template_unavailable`. The create job verifies artifact
-digests, so a damaged artifact is a failed create with a tombstone and static error,
-never a running ID. TTL starts at admission. A dedicated expiry watchdog kills the
+failure is a pre-launch `422 template_unavailable`. The create job hashes each layer
+image the first time this worker mounts it and a warm template's checkpoint archive
+the first time it is unpacked into the node cache, so a damaged artifact is a failed
+create with a tombstone and static error, never a running ID; later creates reuse
+the verified mounts and cache. TTL starts at admission. A dedicated expiry watchdog kills the
 cgroup at expiration independently of long artifact work; private cleanup follows.
 Timer/scheduling granularity is not a hard real-time guarantee.
 
@@ -200,25 +203,28 @@ immutable; existing publication names are rejected (`409 template_already_exists
 and a concurrent capture to the same name gets `409 template_busy`. Unpublished work
 is staged in `staging/<template-id>`; if removing a failed stage itself fails, the
 capture reports that error and the template ID stays unusable (capture returns
-`directory_create_failed`) until the worker restarts and reconciles staging. Capture stops
-and checkpoints the source, archives its upper (not a merged rootfs or promoted
-lower), recovers the source from its own images, then publishes matching digests.
-Failure publishes no incomplete pair. A failed checkpoint with uncertain process
-state, or failed source recovery, terminates/cleans the source rather than treating
-PID liveness as recovery. Failure before checkpoint leaves the source running;
-after a complete checkpoint the worker attempts source recovery. Capture is
- disruptive, not zero-downtime. The fixture's independent child restore and open-file/
-mapping consistency gate passed; other applications/hosts remain unqualified. There is no per-step pause, fork or S3 operation. Networked capture requires
-quiescent TCP: listening sockets are supported, established/closing connections are
-not a cloning contract. Close application/egress connections before capture. A
-namespace TCP-state precheck rejects active connections before stopping the source;
-CRIU remains authoritative for races and unsupported socket state. External peer
-and slot conntrack/NAT state are never captured.
+`directory_create_failed`) until the worker restarts and reconciles staging.
+
+Capture **does not stop the source** (AgentENV pattern): the worker freezes it with
+`runc pause`, seals its upper directory into a content-addressed EROFS layer, takes a
+CRIU checkpoint with `--leave-running` (established TCP, external Unix sockets and
+file locks included) and thaws it, then archives the images and publishes the
+manifest. The source is unavailable only during that frozen window (the real-image
+gate measures it; it grows with the upper's size and the process memory); clients
+connecting meanwhile wait and are served after the thaw. On any failure the source
+is thawed and stays running if runc reports it running; only a source that stays
+frozen or was cancelled/expired is deleted. Failure publishes no template.
+Established connections, including outbound ones, do not block capture. Loopback
+connections continue in children; a child's copy of a connection to an external
+peer fails on first use because the peer and the source slot's conntrack/NAT state
+are never cloned. The fixture's independent child restore, open-file/mapping and
+loopback-TCP gate passed; other applications/hosts remain unqualified. There is no
+user-facing pause, fork or S3 operation.
 
 ### Networking
 
 Create has no caller-authored network field: callers select an immutable template.
-Manifest v2 specifies either `{"mode":"isolated"}` (loopback only, no external links) or:
+Manifest v3 specifies either `{"mode":"isolated"}` (loopback only, no external links) or:
 
 ```json
 {"mode":"tcp_allowlist","egress":[{"ip":"198.51.100.20","port":8443}],"service_ports":[8080]}
@@ -325,7 +331,8 @@ Common statuses: 200 result, 201 created, 400 invalid fields/IDs, 401 unauthoriz
 template unavailable or resource rules, 500 failed operation or `cleanup_failed`,
 502 application HTTP failure, 503 disabled/preflight, owner unavailability, busy or
 capacity, 504 outcome wait expired. Failed operations name a static code; read the
-sandbox state afterward, because failed exec/capture can terminate the sandbox.
+sandbox state afterward, because a failed exec, or a capture that leaves the source
+frozen, can terminate the sandbox.
 
 Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–131,072 bytes.
 Durable records hold lifecycle metadata only (bounded at 64 KiB each, `max_records`

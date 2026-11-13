@@ -53,15 +53,12 @@ impl Native {
         }
         Ok(())
     }
-    // For an approved TCP policy, claim the network slot and create private guest and routing namespaces.
-    // Install deny-by-default filters and address translation before enabling links to the operator
-    // bridge. An isolated policy needs no external links; caller-owned cleanup handles partial setup
-    // failures.
+    // Create the sandbox's private guest network namespace with loopback up and IPv6 off. An isolated
+    // policy stops there (loopback only, no links). For an approved TCP policy, also claim the network
+    // slot and a routing namespace, and install deny-by-default filters and address translation before
+    // enabling links to the operator bridge. Caller-owned cleanup handles partial setup failures.
     pub fn prepare_network(&self, id: &str, policy: &NetworkPolicy, index: Option<usize>) -> Result<()> {
         self.network_policy(policy)?;
-        let NetworkPolicy::TcpAllowlist { egress, service_ports } = policy else { return Ok(()); };
-        let config = self.config.network.as_ref().ok_or("network_disabled")?;
-        let address = config.addresses.get(index.ok_or("network_slot_missing")?).ok_or("network_slot_missing")?;
         if !self.network_absent(id) { return Err("network_name_conflict"); }
         let (guest, slot, link) = self.network_names(id);
         // Durable record/slot exists before this exclusive ownership marker or any
@@ -75,11 +72,17 @@ impl Native {
         let ns = |name: &str, args: &[&str]| {
             let mut v = vec!["-n".into(), name.into()]; v.extend(args.iter().map(|s| s.to_string())); ip(v)
         };
-        ip(vec!["netns".into(), "add".into(), slot.clone()]).map_err(|_| "slot_namespace_create_failed")?;
+        // runc checkpoints always treat the network namespace as empty, so CRIU
+        // restores no links or addresses. A worker-created namespace (passed by
+        // path) keeps loopback up for restored loopback connections.
         ip(vec!["netns".into(), "add".into(), guest.clone()]).map_err(|_| "guest_namespace_create_failed")?;
-        for (name, mode) in [(&slot, "internal-forward"), (&guest, "internal-guest-network")] {
-            ip(vec!["netns".into(), "exec".into(), name.clone(), format!("/proc/{}/exe", std::process::id()), mode.into()])?;
-        }
+        ip(vec!["netns".into(), "exec".into(), guest.clone(), format!("/proc/{}/exe", std::process::id()), "internal-guest-network".into()])?;
+        ns(&guest, &["link", "set", "lo", "up"])?;
+        let NetworkPolicy::TcpAllowlist { egress, service_ports } = policy else { return Ok(()); };
+        let config = self.config.network.as_ref().ok_or("network_disabled")?;
+        let address = config.addresses.get(index.ok_or("network_slot_missing")?).ok_or("network_slot_missing")?;
+        ip(vec!["netns".into(), "add".into(), slot.clone()]).map_err(|_| "slot_namespace_create_failed")?;
+        ip(vec!["netns".into(), "exec".into(), slot.clone(), format!("/proc/{}/exe", std::process::id()), "internal-forward".into()])?;
         ns(&slot, &["link", "add", "inside", "type", "veth", "peer", "name", "eth0", "netns", &guest])?;
         ns(&slot, &["addr", "add", &format!("{GATEWAY}/30"), "dev", "inside"])?;
         ns(&guest, &["addr", "add", &format!("{GUEST}/30"), "dev", "eth0"])?;
@@ -106,7 +109,7 @@ impl Native {
         // No links are up and no untrusted process exists until filters succeed.
         ns(&slot, &["link", "set", &link, "netns", &std::process::id().to_string()])?;
         ip(vec!["link".into(), "set".into(), link.clone(), "master".into(), config.bridge.clone()])?;
-        for (name, device) in [(&slot, "inside"), (&slot, "uplink"), (&guest, "eth0"), (&guest, "lo")] { ns(name, &["link", "set", device, "up"])?; }
+        for (name, device) in [(&slot, "inside"), (&slot, "uplink"), (&guest, "eth0")] { ns(name, &["link", "set", device, "up"])?; }
         ns(&guest, &["route", "add", "default", "via", GATEWAY])?;
         ns(&slot, &["route", "add", "default", "via", &config.gateway.to_string()])?;
         ip(vec!["link".into(), "set".into(), link, "up".into()])
@@ -127,16 +130,6 @@ impl Native {
         while !link_absent(&link) || !self.network_absent(id) {
             if start.elapsed() >= Duration::from_secs(5) { return Err("network_cleanup_incomplete"); }
             std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(())
-    }
-    // Before capturing a TCP-enabled sandbox, require its guest namespace to have no active TCP
-    // connections.
-    pub fn capture_network_ready(&self, id: &str, policy: Option<&NetworkPolicy>) -> Result<()> {
-        if matches!(policy, Some(NetworkPolicy::TcpAllowlist { .. })) {
-            let (guest, _, _) = self.network_names(id);
-            self.command("ip", vec!["netns".into(), "exec".into(), guest, format!("/proc/{}/exe", std::process::id()), "internal-tcp-check".into()])
-                .map_err(|_| "capture_requires_quiescent_tcp")?;
         }
         Ok(())
     }
@@ -168,15 +161,6 @@ pub fn forward_helper(forward: bool) -> Result<()> {
         fs::write(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"), "1").map_err(|_| "namespace_ipv6_disable_failed")?;
     }
     if forward { fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|_| "slot_forwarding_failed")?; }
-    Ok(())
-}
-// Read a bounded TCP socket inventory in the current namespace and allow only listening, time-wait or
-// closed sockets.
-pub fn tcp_check_helper() -> Result<()> {
-    use std::io::Read;
-    let mut text = String::new();
-    fs::File::open("/proc/net/tcp").map_err(|_| "tcp_state_unavailable")?.take(4194305).read_to_string(&mut text).map_err(|_| "tcp_state_unavailable")?;
-    if text.len() > 4194304 || text.lines().skip(1).any(|l| !matches!(l.split_whitespace().nth(3), Some("0A" | "06" | "07"))) { return Err("capture_requires_quiescent_tcp"); }
     Ok(())
 }
 // Read and validate the request already approved by the caller, then contact the fixed guest address.
