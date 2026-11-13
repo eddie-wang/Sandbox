@@ -68,6 +68,11 @@ RBAC, built-in TLS or Internet-facing connection defense.
   use **IPv4 TCP literal destination/port allowlists**, bounded by operator policy.
   A worker-owned routing namespace per sandbox enforces default-drop nftables
   rules and SNAT before launch/restore; every guest has the same private address.
+  Routing namespaces are pre-created and pooled (AgentENV pattern): worker start
+  builds one per admissible sandbox with its uplink and default-deny base table, a
+  create only attaches the sandbox's guest namespace and installs the template's
+  rules, and delete resets the slot (rules and connection tracking flushed) rather
+  than deleting it. Restart rebuilds the pool; shutdown removes it.
   Isolated sandboxes also get a worker-owned guest namespace, with only loopback.
   The operator provisions a stable-MAC bridge, gateway and exclusive address pool.
   No global firewall, routing or sysctl repair; no DNS, UDP, IPv6 or host-network mode.

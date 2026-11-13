@@ -11,10 +11,10 @@ controller: authenticated blocking requests, routed by sandbox ID
     |
 worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |
-    +-- guest netns                         private router-slot netns
-    |   192.0.2.2/30 eth0 -- veth inside -- 192.0.2.1/30
-    |   runc workload                       nft default drop; exact TCP permits
-    |   UID/GID 65534, no capabilities       private SNAT to unique pool address
+    +-- guest netns (per sandbox)           pooled router-slot netns (pre-created)
+    |   192.0.2.2/30 eth0 -- veth inside -- 192.0.2.1/30      (attached at create)
+    |   runc workload                       nft default drop; template's TCP permits
+    |   UID/GID 65534, no capabilities       private SNAT to the slot's pool address
     |   seccomp: io_uring/MPTCP guards only     |
     |                                         uplink -- veth -- operator bridge
     |                                                          stable MAC/gateway
@@ -23,6 +23,11 @@ worker admission: durable record + exclusive pool slot + per-sandbox exclusion
 ```
 
 Every guest has the same address, isolated by its own guest **and router** netns.
+Router slots are pooled, following the AgentENV network manager (`allocate_slot`,
+`release`): each slot index owns one pool address and, once built, keeps its
+namespace, uplink veth on the bridge, address, routes and default-deny nftables
+base (filter chains with drop policy and no rules, plus the SNAT rule) between
+sandboxes. A slot holds at most one sandbox at a time.
 The unique pool address is outside the guest: independent restores do not need to
 rewrite an address embedded in a listening socket. The operator configures a
 bridge/gateway/prefix, an exclusive pool, exact IPv4 destination/port ceiling and
@@ -35,8 +40,9 @@ operator responsibilities. The worker never repairs global routing/firewall/sysc
 Manifest v3 contains the policy. `isolated` creates no external links: the worker
 still creates and owns the sandbox's guest netns (same ownership marker, names,
 cleanup and restart reconciliation as networked sandboxes), but brings up only
-loopback in it, adds no veth, address, route or router namespace, and disables IPv6.
-This remains the default configuration. The worker creates the namespace itself
+loopback in it, adds no veth, address or route, attaches it to no router slot, and
+disables IPv6. (On a network-enabled worker its reserved pool slot stays unused and
+clean.) This remains the default configuration. The worker creates the namespace itself
 because runc checkpoints always treat the network namespace as empty: a namespace
 runc created would restore with loopback down, breaking restored loopback
 connections, while a worker-created one passed by path keeps it. `tcp_allowlist`
@@ -64,25 +70,46 @@ and mounts; no_new_privs and cgroups remain in force.
 
 ## Ownership and ordering
 
-1. Admission atomically reserves capacity, operation slot and network-pool index in
-   the durable sandbox record. Names incorporate root and sandbox digests.
-2. Before resource creation, verify names are absent and durably create an exclusive
-   private ownership marker. Do not adopt unexplained existing namespaces/links.
-3. Create the guest namespace pin (loopback up, IPv6 disabled); isolated sandboxes
-   stop here. Otherwise create the router namespace pin and down veths through
-   trusted bounded helpers, disable IPv6 there too, install router nftables
-   atomically, configure addresses/routes and attach the unique uplink to the
-   existing bridge.
-4. Bring links up only after the filter succeeds, then run/restore runc. The guest
-   OCI network namespace points to its worker-owned pin. Warm OCI normalization
-   replaces only reconstruction paths; the network-policy digest stays bound.
-5. Delete/cancel waits for its in-flight job, drains tracked helper descendants,
-   kills workload cgroups, removes runc state, then drops namespace pins. Kernel
-   link destruction is awaited. Failures retain the marker, files and reservation
-   for retry; no broad flush or unrelated interface cleanup occurs.
-6. Restart drains root-specific helper cgroups before any namespace/private/staging
-   cleanup. Records and root-specific namespace names are checked for unexplained
-   ownership; old live workloads are terminated, never silently adopted.
+1. Worker start (after restart reconciliation) builds the pool: one slot for each
+   sandbox the worker can admit (`max_sandboxes`, bounded by the address pool).
+   Each slot first durably creates its ownership directory `slots/<index>` under
+   the worker root, then, through trusted bounded helpers, its namespace pin
+   (IPv6 disabled, IPv4 forwarding on), the uplink veth with its pool address, the
+   default-deny nftables base loaded atomically, and only then attaches the host
+   end to the existing bridge, brings the links up and adds the default route. A
+   slot that fails to build is removed and built lazily by the next create that
+   is assigned its index.
+2. Admission atomically reserves capacity, operation slot and the lowest free
+   network-pool index in the durable sandbox record. Guest names incorporate root
+   and sandbox digests; slot names incorporate the root digest and the index.
+3. Before resource creation, verify the guest name is absent and durably create an
+   exclusive private ownership marker. Do not adopt unexplained existing namespaces.
+4. Create the guest namespace pin (loopback up, IPv6 disabled); isolated sandboxes
+   stop here. Otherwise claim the slot (a missing or unknown one is rebuilt now),
+   atomically replace its rules with the template's (`flush table` plus the exact
+   permits in one nftables transaction), then create the `inside`/`eth0` veth pair
+   into the guest, its addresses and the guest default route.
+5. Bring the guest links up only after the rules succeed, then run/restore runc. The
+   guest OCI network namespace points to its worker-owned pin. Warm OCI
+   normalization replaces only reconstruction paths; the network-policy digest
+   stays bound.
+6. Delete/cancel waits for its in-flight job, drains tracked helper descendants,
+   kills workload cgroups and removes runc state. It then returns the slot to the
+   pool: delete the slot's `inside` end (which removes the guest's `eth0` at once,
+   even if something still holds the guest namespace), flush the template rules
+   back to the default-deny base and flush the slot's connection tracking (a
+   netlink request from a same-binary helper inside the slot, after it checks that
+   no guest link remains), so the next sandbox inherits no rules, flows or NAT
+   mappings. A slot that cannot be reset is deleted instead (its host link removal
+   is awaited) and rebuilt later. Finally the guest pin is dropped. Failures retain
+   the marker, files and reservation for retry; no broad flush or unrelated
+   interface cleanup occurs.
+7. Restart drains root-specific helper cgroups before any namespace/private/staging
+   cleanup. Records, slot ownership directories and root-specific namespace names
+   are checked for unexplained ownership; old live workloads are terminated, never
+   silently adopted. Pooled slots are not adopted either: after the sandboxes are
+   cleaned up every owned slot is deleted and the pool is built fresh (step 1).
+   Shutdown, once every sandbox is gone, deletes the whole pool.
 
 The worker's short coordinator and bounded I/O pool are unchanged. Different
 sandboxes overlap; one sandbox's exec/capture/HTTP/delete do not race. HTTP caller
@@ -100,9 +127,9 @@ guest has the same address in its own worker-created namespace, a captured socke
 local address exists in every child, so listening sockets and loopback connections
 inside the sandbox restore and keep working (gate-tested). A connection to an external
 peer is restored only on the child's side: no external peer, router conntrack/NAT
-state or SNAT address is checkpointed, and the child gets a newly constructed router
-and its own pool address, so the child's copy fails on first use while the source
-keeps the original. Fresh post-restore outbound connections work normally. A
+state or SNAT address is checkpointed, and the child gets a different router slot
+(reset, with empty connection tracking) and its own pool address, so the child's
+copy fails on first use while the source keeps the original. Fresh post-restore outbound connections work normally. A
 successful fixture is not broad application or cross-host checkpoint qualification.
 
 Manifest v1/v2 and older layout fingerprints are deliberately incompatible.

@@ -205,11 +205,14 @@ so records hold only lifecycle metadata. Tombstones are bounded by `max_records`
 retained; no automatic pruning can silently reopen an ID.
 
 Network policy and cgroup limits precede runc launch and restore. A slot index is
-reserved in the durable record before network side effects. Unique root/sandbox
-namespace names, an exclusive private ownership marker and bounded helper cgroups
-cover creation, cancellation and restart; unexplained namespace state fails closed.
-Cleanup retains the reservation/marker on failures, including delayed kernel link
-destruction, and retries without global flushes. See [network details](network.md).
+reserved in the durable record before network side effects. Router slots are
+pre-created per worker root (`slots/<index>` ownership directories, default-deny
+base rules) and reset, not deleted, when a sandbox is released; restart and shutdown
+delete them, and restart builds a fresh pool. Unique root/sandbox guest namespace
+names, root/index slot names, exclusive ownership markers and bounded helper cgroups
+cover creation, cancellation and restart; unexplained namespace or slot state fails
+closed. Cleanup retains the reservation/marker on failures and retries without
+global flushes. See [network details](network.md).
 PID 1 of every sandbox is the operator-staged static `tini` (a required trusted tool,
 checked static by preflight), bind-mounted read-only at `/.sandbox-init`. It runs the
 template's `init_argv` as its child, forwards signals and reaps orphaned processes

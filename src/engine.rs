@@ -75,9 +75,9 @@ fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = 
 
 impl Handle {
     // Return an unavailable handle if the runtime is disabled or preflight fails. Otherwise reconcile
-    // durable state, then start the lower-mount thread, bounded operation workers, serialized admission
-    // and expiry/exit monitoring; accepted jobs continue independently of HTTP connections.
-    // Shutdown waits for in-flight jobs and one cleanup attempt per remaining sandbox.
+    // durable state (rebuilding the network slot pool), then start the lower-mount thread, operation
+    // workers, admission and expiry/exit monitoring; jobs continue independently of HTTP connections.
+    // Shutdown waits for jobs and one cleanup per sandbox, then removes shared mounts and the slot pool.
     pub fn start(config: &WorkerConfig, report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
@@ -162,7 +162,9 @@ impl Handle {
                 engine.maintenance();
                 if engine.stopping.is_some() && engine.flights.is_empty()
                     && engine.records.iter().all(|(id, r)| !r.reserved() || engine.stop_attempted.contains(id)) {
-                    let cleanup = if !engine.records.values().any(Record::reserved) { engine.native.unmount_lowers().and_then(|_| engine.native.remove_helpers()) } else { Err("private_cleanup_failed") };
+                    let cleanup = if !engine.records.values().any(Record::reserved) {
+                        engine.native.unmount_lowers().and_then(|_| engine.native.remove_slot_pool()).and_then(|_| engine.native.remove_helpers())
+                    } else { Err("private_cleanup_failed") };
                     let durable = process::atomic_json(&engine.native.root().join("worker-status.json"), &serde_json::json!({"cleanup_error":cleanup.err()}));
                     let _ = engine.stopping.take().unwrap().send(cleanup.and(durable));
                     break;
@@ -388,8 +390,9 @@ impl Engine {
         }
     }
     // Load saved sandbox records and reject invalid or untracked resources. Kill and clean up every
-    // sandbox left from before the restart and remove abandoned staging. Release unused lower mounts and
-    // save cleanup status; durability failures prevent startup.
+    // sandbox left from before the restart and remove abandoned staging. Release unused lower mounts,
+    // replace the network slot pool with freshly built slots and save cleanup status; durability or
+    // slot-removal failures prevent startup.
     fn reconcile(&mut self) -> Result<()> {
         for entry in fs::read_dir(self.native.root().join("records")).map_err(|_| "record_scan_failed")? {
             let path = entry.map_err(|_| "record_scan_failed")?.path();
@@ -419,7 +422,7 @@ impl Engine {
                 let r = self.records.get_mut(&id).unwrap();
                 r.delete_requested = true; r.state = "deleting".into();
                 let _ = self.save(&id);
-                let cleanup = self.native.cleanup(&id);
+                let cleanup = self.native.cleanup(&id, self.records[&id].network_slot);
                 let r = self.records.get_mut(&id).unwrap();
                 r.state = if cleanup.is_ok() { "deleted" } else { "cleanup_failed" }.into(); r.error = cleanup.err().map(str::to_owned);
                 let _ = self.save(&id);
@@ -427,6 +430,10 @@ impl Engine {
         }
         if !self.records.values().any(Record::reserved) { self.native.unmount_lowers()?; }
         for entry in fs::read_dir(self.native.root().join("staging")).map_err(|_| "staging_scan_failed")? { storage::remove_private(&entry.map_err(|_| "staging_scan_failed")?.path())?; }
+        // Pre-create the slots admission can hand out (it picks the lowest free index).
+        let held = self.records.values().filter(|r| r.reserved()).filter_map(|r| r.network_slot).collect();
+        let count = self.snapshot.read().expect("snapshot poisoned").status.capacity.max_sandboxes as usize;
+        self.native.start_slot_pool(count, &held)?;
         if !self.healthy { return Err("reconciliation_durability_failed"); }
         process::atomic_json(&self.native.root().join("worker-status.json"), &serde_json::json!({"cleanup_error": if self.records.values().any(Record::reserved) { Some("private_cleanup_failed") } else { None }}))
     }
@@ -447,9 +454,10 @@ impl Runner<'_> {
             Action::Delete => { self.delete(); if self.record.state == "deleted" { Ok(Outcome::Sandbox(self.record.view())) } else { Err("cleanup_failed") } }
         }
     }
-    // Remove the sandbox's owned resources and mark it deleted, or retain a cleanup failure.
+    // Remove the sandbox's owned resources (returning its network slot to the pool) and mark it
+    // deleted, or retain a cleanup failure.
     fn delete(&mut self) {
-        let result = self.native.cleanup(&self.record.request.sandbox_id);
+        let result = self.native.cleanup(&self.record.request.sandbox_id, self.record.network_slot);
         self.record.state = if result.is_ok() { "deleted" } else { "cleanup_failed" }.into();
         if let Err(e) = result { self.record.error = Some(e.into()); }
     }
@@ -507,7 +515,7 @@ impl Runner<'_> {
     // remaining TTL. A failure fails only this call, not the sandbox.
     fn http(&mut self, request: HttpRequest) -> Result<Outcome> {
         let policy = self.active().and_then(|_| self.record.network_policy.as_ref().ok_or("network_policy_unavailable"))?;
-        self.native.application_http(&self.record.request.sandbox_id, &request, policy, self.record.expires_at.saturating_sub(now()).saturating_mul(1000)).map(Outcome::Http)
+        self.native.application_http(&self.record.request.sandbox_id, self.record.network_slot, &request, policy, self.record.expires_at.saturating_sub(now()).saturating_mul(1000)).map(Outcome::Http)
     }
     // Capture a running sandbox as a new warm template without stopping it (AgentENV order): freeze it,
     // flush and seal its upper directory into an EROFS layer, checkpoint it with CRIU leaving it running,

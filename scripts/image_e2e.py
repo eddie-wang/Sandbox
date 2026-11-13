@@ -579,6 +579,8 @@ url = "http://127.0.0.1:{worker_port}"
     write_template(session, cold_manifest("image-cold", compatibility, prepared["base"], prepared["init_argv"], network,
                                           memory_mib=args.memory_mib, vcpus=args.vcpus, pids_max=args.pids_max))
     processes, ids, timings, observations = [], [], {}, {"prepared": prepared}
+    # Worker-owned namespace names start with this root-derived prefix; routing slots add "s-<index>".
+    owned_prefix = "sb-" + hashlib.sha256(str(session).encode()).hexdigest()[:16] + "-"
     worker = None
 
     # Blocking calls wait for real outcomes; the client deadline exceeds the
@@ -657,11 +659,26 @@ url = "http://127.0.0.1:{worker_port}"
             with log.open("rb") as source:
                 (target / f"{label}-{log.name}").write_bytes(source.read(262144))
 
+    # Returns the name of the pooled routing slot namespace recorded for a sandbox.
+    def slot_of(sandbox):
+        index = json.loads((session / "records" / f"{sandbox}.json").read_text())["network_slot"]
+        return f"{owned_prefix}s-{index}"
+
+    # Requires every pooled routing slot to exist in its clean pool state: only loopback and the
+    # uplink, no rule in its filter chains and no tracked connection (both flushed on release).
+    def slots_reset():
+        for pin in sorted(Path("/run/netns").iterdir()):
+            assert pin.name.startswith(owned_prefix + "s-"), f"unexpected namespace pin {pin.name}"
+            links = sorted(link["ifname"] for link in json.loads(run("ip", "-n", pin.name, "-j", "link")))
+            assert links == ["lo", "uplink"], (pin.name, links)
+            table = json.loads(run("ip", "netns", "exec", pin.name, "nft", "-j", "list", "table", "inet", "sandbox"))
+            assert not any("rule" in entry for entry in table["nftables"]), (pin.name, table)
+            assert run("ip", "netns", "exec", pin.name, "cat", "/proc/sys/net/netfilter/nf_conntrack_count").strip() == "0", pin.name
+
     # Starts a client in the sandbox's routing namespace that requests the service
     # port every 20 ms (2 s timeout) and prints "start end ok" monotonic times,
     # until the stop file exists. Returns the process and its output file.
     def availability_probe(sandbox, label):
-        guest = Path(json.loads((session / "private" / sandbox / "config.json").read_text())["linux"]["namespaces"][2]["path"]).name
         script = ("import socket, sys, time, os\n"
                   "while not os.path.exists(sys.argv[3]):\n"
                   "    t = time.monotonic(); ok = 0\n"
@@ -673,7 +690,7 @@ url = "http://127.0.0.1:{worker_port}"
                   "    print(t, time.monotonic(), int(ok), flush=True); time.sleep(0.02)\n")
         output = (session / f"probe-{label}.txt").open("w")
         stop = session / f"probe-{label}.stop"
-        process = subprocess.Popen(["ip", "netns", "exec", guest.replace("-g-", "-s-"), sys.executable, "-c", script, "192.0.2.2", str(args.port), str(stop)],
+        process = subprocess.Popen(["ip", "netns", "exec", slot_of(sandbox), sys.executable, "-c", script, "192.0.2.2", str(args.port), str(stop)],
                                    stdout=output, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
         return process, output, stop
 
@@ -702,6 +719,9 @@ url = "http://127.0.0.1:{worker_port}"
         worker = start("worker", worker_config)
         start("controller", controller_config)
         eventually(lambda: expect(request(controller_port, "/v1/status", token, timeout=4), 200)["nodes"][0]["fresh"], timeout=15)
+        # The worker pre-creates one routing slot per sandbox it can admit, before any create.
+        assert sorted(p.name for p in Path("/run/netns").iterdir()) == [f"{owned_prefix}s-{i}" for i in range(3)]
+        slots_reset()
 
         source, timings["cold_create_s"] = create("image-cold")
         first, ready_after_create, attempts = wait_http(source, args.ready_timeout)
@@ -797,15 +817,18 @@ url = "http://127.0.0.1:{worker_port}"
             assert len(identities) == 3, namespace
         print("PASS source still answers; child writes are not visible in the source; distinct pid/mnt/net namespaces")
 
+        # The probe and HTTP calls left tracked connections in the source's slot.
+        assert int(run("ip", "netns", "exec", slot_of(source), "cat", "/proc/sys/net/netfilter/nf_conntrack_count")) > 0
         for sandbox in (child, source):
             started = time.monotonic()
             result = expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, method="DELETE"), 200)
             assert result["state"] == "deleted"
             timings.setdefault("delete_s", []).append(round(time.monotonic() - started, 3))
             gone(sandbox)
-        assert not list(Path("/run/netns").iterdir()), "owned netns remain after delete"
-        assert not any(link["ifname"].startswith("sb") and link["ifname"] != BRIDGE for link in json.loads(run("ip", "-j", "link"))), "owned veth remain"
-        print("PASS delete of source and child: no runc state, private state, cgroups or network namespaces remain")
+        # Guest namespaces are gone; the pooled slots stay, reset rather than deleted.
+        assert sorted(p.name for p in Path("/run/netns").iterdir()) == [f"{owned_prefix}s-{i}" for i in range(3)], "guest netns remain after delete"
+        slots_reset()
+        print("PASS delete of source and child: no runc state, private state, cgroups or guest namespaces remain; pooled slots reset")
     finally:
         # All cleanup goes through the owner; never recurse through live mounts.
         if worker is not None and worker.poll() is None:

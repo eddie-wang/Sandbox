@@ -153,6 +153,10 @@ max_timeout_ms = 600000''' if args.http_limits else 'request_timeout_ms = 5000')
         parser.error("cgroup parent must be below /sys/fs/cgroup")
     root = Path(tempfile.mkdtemp(prefix="lifecycle-", dir=parent))
     root.chmod(0o700)
+    # Worker-owned namespace names start with this root-derived prefix; routing slots add "s-<index>"
+    # and their host links are "sb" + 10 root-digest hex digits + the index in 3 hex digits.
+    owned_prefix = "sb-" + hashlib.sha256(str(root).encode()).hexdigest()[:16] + "-"
+    slot_link_prefix = "sb" + hashlib.sha256(str(root).encode()).hexdigest()[:10]
     helpers = cgroup / (".helpers-" + hashlib.sha256(str(root).encode()).hexdigest())
     worker_port, controller_port = port(), port()
     assert worker_port != controller_port
@@ -385,6 +389,29 @@ url = "http://127.0.0.1:{worker_port}"
                          f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode() + data)
             eventually(lambda: exec_cgroup_populated(sandbox), timeout=10)
 
+    # Returns the name of the pooled routing slot namespace recorded for a sandbox.
+    def slot_of(sandbox):
+        return f"{owned_prefix}s-{json.loads((root / 'records' / f'{sandbox}.json').read_text())['network_slot']}"
+
+    # Returns each pooled slot's identity: its ownership directory's change time and its host link's
+    # interface index. A slot that was rebuilt gets new values; a slot that was reset keeps them.
+    def slot_identities():
+        links = {link["ifname"]: link["ifindex"] for link in json.loads(subprocess.check_output(["ip", "-j", "link"], timeout=5))}
+        return {i: ((root / "slots" / str(i)).stat().st_ctime_ns, links[f"{slot_link_prefix}{i:03x}"]) for i in range(3)}
+
+    # Returns the number of connection-tracking entries in a routing slot.
+    def tracked_connections(name):
+        return int(subprocess.check_output(["ip", "netns", "exec", name, "cat", "/proc/sys/net/netfilter/nf_conntrack_count"], text=True, timeout=5))
+
+    # Requires a pooled slot to be in its clean pool state: only loopback and the uplink, no rule in
+    # its filter chains and no tracked connection.
+    def slot_reset(name):
+        links = sorted(link["ifname"] for link in json.loads(subprocess.check_output(["ip", "-n", name, "-j", "link"], timeout=5)))
+        assert links == ["lo", "uplink"], (name, links)
+        table = json.loads(subprocess.check_output(["ip", "netns", "exec", name, "nft", "-j", "list", "table", "inet", "sandbox"], timeout=5))
+        assert not any("rule" in entry for entry in table["nftables"]), (name, table)
+        assert tracked_connections(name) == 0, name
+
     # Kill the worker abruptly, start a new one on the same root and wait for a fresh observation.
     def kill_and_restart_worker():
         nonlocal worker
@@ -397,6 +424,12 @@ url = "http://127.0.0.1:{worker_port}"
         worker = start("worker", worker_config)
         controller = start("controller", controller_config)
         fresh()
+        if args.network:
+            # The worker pre-creates one clean routing slot per sandbox it can admit, before any create.
+            assert sorted(p.name for p in Path("/run/netns").iterdir() if p.name.startswith(owned_prefix)) == [f"{owned_prefix}s-{i}" for i in range(3)]
+            for i in range(3):
+                slot_reset(f"{owned_prefix}s-{i}")
+            pool_identities = slot_identities()
         # Omitted resources come from the cold template defaults (64 MiB, 1 vCPU).
         source = create()
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
@@ -451,18 +484,28 @@ url = "http://127.0.0.1:{worker_port}"
         eventually(lambda: expect(request(controller_port, "/v1/status", token, timeout=4), 200)["nodes"][0]["status"]["usage"]["sandboxes"] == 3)
         expect(request(controller_port, "/v1/sandboxes", token, dict(template_id="fixture", ttl_seconds=60), "POST"), 503, "no_capacity")
         observations["final_worker_admission_without_record_and_controller_no_capacity"] = True
+        guest = Path(json.loads((root / "private" / third / "config.json").read_text())["linux"]["namespaces"][2]["path"])
+        # A test-owned open file in the sandbox root keeps its mount busy, so the blocking DELETE reports
+        # cleanup_failed; the reservation and ownership marker survive and cleanup is retried once the
+        # file is closed. A test-owned guest namespace FD does not delay the network release: deleting
+        # the slot's end of the veth pair removes the guest's end at once.
+        with open(guest, "rb") as held_guest, open(root / "private" / third / "rootfs" / "fixture", "rb"):
+            expect(request(controller_port, f"/v1/sandboxes/{third}", token, method="DELETE"), 500, "cleanup_failed")
+            assert get(third)["state"] == "cleanup_failed" and (root / "private" / third / "network-owned").exists()
+            assert not guest.exists()
+            held_links = json.loads(subprocess.check_output(["nsenter", f"--net=/proc/{os.getpid()}/fd/{held_guest.fileno()}", "ip", "-j", "link"], timeout=5))
+            assert [link["ifname"] for link in held_links] == ["lo"], held_links
+            if args.network:
+                third_slot = slot_of(third)
+                slot_reset(third_slot)
+        eventually(lambda: get(third)["state"] == "deleted", timeout=15)
+        remove(third)
+        observations["cleanup_retry_after_root_holder_release"] = True
         if args.network:
-            guest = Path(json.loads((root / "private" / third / "config.json").read_text())["linux"]["namespaces"][2]["path"])
-            # A test-owned namespace FD deliberately delays kernel link destruction.
-            # The blocking DELETE reports cleanup_failed; reservations survive and retry.
-            with open(guest.with_name(guest.name.replace("-g-", "-s-")), "rb"):
-                expect(request(controller_port, f"/v1/sandboxes/{third}", token, method="DELETE"), 500, "cleanup_failed")
-                assert get(third)["state"] == "cleanup_failed" and (root / "private" / third / "network-owned").exists()
-            eventually(lambda: get(third)["state"] == "deleted", timeout=15)
-            remove(third)
-            observations["network_cleanup_retry_after_namespace_fd_release"] = True
-        else:
-            remove(third)
+            # Released slots are reset, not deleted: the same slot namespace and host link remain.
+            assert slot_identities() == pool_identities
+            slot_reset(third_slot)
+            observations["network_slot_reset_not_deleted_with_guest_namespace_held"] = third_slot
         print("PASS template rejection without IDs, failed-launch tombstone, final worker admission without a record and inline delete")
 
         # A client that disconnects mid-exec leaves no orphan: the command still runs
@@ -578,7 +621,7 @@ url = "http://127.0.0.1:{worker_port}"
         def network_gate(sandbox, full=False):
             config_json = json.loads((root / "private" / sandbox / "config.json").read_text())
             guest = Path(config_json["linux"]["namespaces"][2]["path"]).name
-            slot = guest.replace("-g-", "-s-")
+            slot = slot_of(sandbox)
             observations.setdefault("network_rules", {})[sandbox] = {name: subprocess.check_output(["ip", "netns", "exec", name, "nft", "list", "ruleset"], text=True, timeout=5) for name in [guest, slot]}
             observations.setdefault("network_links", {})[sandbox] = {name: {what: subprocess.check_output(["ip", "-n", name, "-j", what], text=True, timeout=5) for what in ["address", "route", "neigh"]} for name in [guest, slot]}
             observations.setdefault("guest_netns_match", {})[sandbox] = [os.readlink(f"/proc/{host_pid(sandbox)}/ns/net"), os.stat("/run/netns/" + guest).st_ino]
@@ -754,7 +797,14 @@ url = "http://127.0.0.1:{worker_port}"
         assert checkpoint_cache(root, "warm")[1] == warm_cache_state
         print("PASS capture without stopping the source (frozen window only), sealed EROFS layer with whiteout/xattr, "
               "warm restore with established loopback TCP, independent child")
+        if args.network:
+            child_slot = slot_of(child)
+            assert tracked_connections(child_slot) > 0
         remove(child)
+        if args.network:
+            # The release flushed the child's rules and connection tracking from its slot.
+            slot_reset(child_slot)
+            observations["released_slot_connection_tracking_flushed"] = child_slot
         other_child = create("isolated-warm", memory_mib=64, vcpus=1)
         assert int(execute(other_child, "counter").split()[1]) == isolated_nonce
         assert execute(other_child, "read", "copied") == "immutable-base"
@@ -786,6 +836,13 @@ url = "http://127.0.0.1:{worker_port}"
         assert get(source)["state"] == "deleted"
         gone(source)
         observations["restart_inflight_exec_reconciled"] = True
+        if args.network:
+            # Restart never adopts old slots: every pooled slot was removed and built fresh.
+            rebuilt = slot_identities()
+            assert all(rebuilt[i][0] != pool_identities[i][0] and rebuilt[i][1] != pool_identities[i][1] for i in range(3)), (pool_identities, rebuilt)
+            for i in range(3):
+                slot_reset(f"{owned_prefix}s-{i}")
+            observations["restart_rebuilt_slot_pool"] = True
         # Publication survives source/restart cleanup and is still independently restorable.
         retained = create("warm")
         time.sleep(0.3)
@@ -887,8 +944,8 @@ url = "http://127.0.0.1:{worker_port}"
     assert not any(str(root) in line.split()[4] for line in mountinfo.splitlines()), "owned mounts remain"
     assert not any(path.is_dir() for path in cgroup.iterdir()), "owned workload/helper cgroups remain"
     assert all(not (root / "private" / sandbox).exists() for sandbox in ids), "private state remains"
-    # Isolated and networked sandboxes alike leave no worker-owned namespace pin.
-    owned_prefix = "sb-" + hashlib.sha256(str(root).encode()).hexdigest()[:16] + "-"
+    # Isolated and networked sandboxes alike leave no worker-owned namespace pin; shutdown removes the
+    # slot pool.
     assert not any(p.name.startswith(owned_prefix) for p in Path("/run/netns").iterdir()), "owned netns remain"
     if args.network:
         assert not any(p.name.startswith("sb-") and p.name != "sb-test-peer" for p in Path("/run/netns").iterdir()), "owned netns remain"

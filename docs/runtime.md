@@ -133,8 +133,11 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    leaves no zombie. A client that disconnects mid-exec leaves the command to finish
    (or, on a bound violation, the sandbox to be terminated) with full cleanup; a
    client that disconnects mid-create (host helpers frozen) gets its unlearnable
-   sandbox deleted with `create_response_lost`; DELETE cancels an in-flight exec; and
-   with cleanup frozen, a second DELETE waits and both return `deleted`.
+   sandbox deleted with `create_response_lost`; DELETE cancels an in-flight exec;
+   with cleanup frozen, a second DELETE waits and both return `deleted`; and a DELETE
+   whose root unmount is blocked by a test-owned open file reports `cleanup_failed`,
+   keeps the reservation and ownership marker, and is retried to `deleted` once the
+   file is closed (a test-owned FD on the guest namespace does not block it).
 2. Private write/copy-up and lower whiteout isolation between two cold sandboxes.
 3. Distinct PID/mount/network namespaces from each other and the host, only loopback
    in the sandbox, UID/GID 65534, empty effective caps, no_new_privs and an active
@@ -277,8 +280,10 @@ exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
 socket creation, HTTP authentication/header stripping/path validation, text body,
 redirect refusal, timeout/output bounds, capture of a sandbox holding an established
 external TCP connection and restore of a child from it, source and child restored
-listening sockets/fresh egress, delayed namespace
-FD cleanup retry and HTTP-helper crash/restart cleanup. Adding `--http-limits`
+listening sockets/fresh egress, the pre-created slot pool (built at start,
+reset rather than deleted on release even while a test-owned FD holds the guest
+namespace, rebuilt on restart, removed at shutdown), cleanup retry after a held root
+mount is released and HTTP-helper crash/restart cleanup. Adding `--http-limits`
 also exercises the opt-in large ceilings: an 8 MiB inline response, two concurrent
 worst-case JSON-escaped 8 MiB results, a 16 KiB escaped body, a 31-second application
 deadline beyond `request_timeout_ms`, and TTL clamping. Namespace rules, addresses,
@@ -351,6 +356,8 @@ What the script does:
   `--init-argv` (a JSON list), `--port`, `--http-path` and `--expect-body`. The
   template network is `tcp_allowlist` with only that service port and no egress.
 - **Lifecycle.** The script runs these steps in order:
+  0. Before any create, the worker has pre-created three clean routing slots
+     (loopback and uplink only, no rules in the filter chains).
   1. Cold create, then retry the application HTTP operation until the server
      answers 200 with the expected body. Check the init process's UID,
      capabilities and no_new_privs.
@@ -369,10 +376,10 @@ What the script does:
      answers and is deleted.
   5. Write a file in the child that must not appear in the source, and check
      that the pid/mnt/net namespaces are distinct.
-  6. Delete both. No runc state, private state, cgroups, network namespaces or
-     veths may remain.
-  7. After shutdown, no owned mounts or cgroups may remain and service logs must
-     not contain the tokens.
+  6. Delete both. No runc state, private state, cgroups or guest namespaces may
+     remain; the three pooled slots remain and are clean again (reset, not deleted).
+  7. After shutdown, no owned mounts, cgroups, namespace pins or veths may remain
+     and service logs must not contain the tokens.
 - **Defaults.** 256 MiB, one vCPU and 128 pids per container, at most three
   containers. PASS lines print informational timings (cold create, first HTTP
   ready, capture and its frozen window, first and cached warm restore, first call

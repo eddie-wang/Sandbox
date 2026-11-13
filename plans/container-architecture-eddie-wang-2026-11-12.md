@@ -176,6 +176,8 @@ By default, a sandbox has no external network access: it still gets its own priv
 
 An operator supplies a bridge, gateway and an address pool reserved for this worker. Each networked sandbox has its own isolated network and a private routing environment that checks traffic before forwarding it. The worker installs the rules before starting the application. It does not repair the host's existing firewall, routes or forwarding settings.
 
+The routing environments are **built ahead of time and reused**, as AgentENV does. When the worker starts, it builds one per sandbox it can hold, each connected to the bridge with its own outside address and a "block everything" rule set. Creating a sandbox then only connects the sandbox's own network to a free routing environment and adds that template's allowed endpoints. Deleting a sandbox disconnects it, removes those rules and forgets all remembered connections, and returns the routing environment for the next sandbox instead of tearing it down. If one cannot be reset, it is removed and rebuilt later. A restarted worker never reuses old ones: it removes them all and builds fresh ones. A worker that shuts down removes them.
+
 All guests see the same private address inside their separate environments. The address used outside each sandbox is different. Keeping the guest-side address stable lets saved connections restore in any child; it does not copy the outside end of external connections or the router's connection state.
 
 There is no implicit DNS, UDP, IPv6 or access to the host or sibling sandboxes. The allowed endpoints are fixed in the template and checked against the operator's limits. A create request cannot override them.
@@ -199,7 +201,7 @@ Low-level packet rules and the tested fix for paths with smaller packet-size lim
 | [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU. |
 | [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time, and safely writes saved JSON records. |
 | [`storage.rs`](../src/storage.rs) | Checks template files, handles file archives and publishes complete templates. |
-| [`network.rs`](../src/network.rs) | Creates private sandbox networking, applies traffic rules and runs the application HTTP helper. |
+| [`network.rs`](../src/network.rs) | Keeps the pool of pre-built routing environments, connects each sandbox's private network to one, applies and resets its traffic rules and runs the application HTTP helper. |
 | [`lifecycle.rs`](../src/lifecycle.rs) | Defines the small liveness response. Despite its name, the lifecycle logic is in `engine.rs`. |
 
 ## Interfaces/signatures/headers

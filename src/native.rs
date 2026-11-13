@@ -25,6 +25,8 @@ pub struct Native {
     // Checkpoint cache keys being unpacked; other restores of the same key wait on `unpacked`.
     unpacking: Mutex<BTreeSet<String>>,
     unpacked: Condvar,
+    // State of each pooled routing slot this worker built (see network.rs); never held across I/O.
+    pub(crate) slots: Mutex<BTreeMap<usize, crate::network::SlotState>>,
     _lock: File,
 }
 
@@ -164,8 +166,9 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
 
 impl Native {
     // Require successful preflight and exclusive ownership of the runtime root. Verify tools, drain old
-    // helper processes before touching runtime state, create private storage directories and drop
-    // half-unpacked checkpoint cache entries. Unknown cache entries fail closed.
+    // helper processes before touching runtime state, create private storage directories (including
+    // the slot-pool ownership directory) and drop half-unpacked checkpoint cache entries. Unknown cache
+    // entries fail closed.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -178,7 +181,7 @@ impl Native {
         // Drain old host-side commands before inspecting/removing ANY runtime or
         // staging state. The reserved name cannot be a valid sandbox ID.
         let helpers = process::Helpers::open(Path::new(&config.cgroup_parent).join(format!(".helpers-{}", storage::digest(config.root.as_bytes()))))?;
-        for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc", "checkpoints"] { storage::private_dir(&root.join(dir))?; }
+        for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc", "checkpoints", "slots"] { storage::private_dir(&root.join(dir))?; }
         for entry in fs::read_dir(root.join("checkpoints")).map_err(|_| "checkpoint_cache_scan_failed")? {
             let entry = entry.map_err(|_| "checkpoint_cache_scan_failed")?;
             let name = entry.file_name().into_string().map_err(|_| "unknown_checkpoint_cache_state")?;
@@ -189,7 +192,7 @@ impl Native {
             }
         }
         Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers,
-            verified: Mutex::new(BTreeMap::new()), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), _lock: lock })
+            verified: Mutex::new(BTreeMap::new()), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), _lock: lock })
     }
     // Return the configured root of this worker's runtime storage.
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
@@ -376,7 +379,7 @@ impl Native {
             }
         });
         // Every sandbox joins its worker-created guest namespace, isolated ones too.
-        spec["linux"]["namespaces"][2]["path"] = json!(format!("/run/netns/{}", self.network_names(&request.sandbox_id).0));
+        spec["linux"]["namespaces"][2]["path"] = json!(format!("/run/netns/{}", self.guest_name(&request.sandbox_id)));
         process::atomic_json(&private.join("config.json"), &spec)
     }
     // Hash the saved execution specification after replacing worker-local reconstruction paths (cgroup,
@@ -477,9 +480,10 @@ impl Native {
         fs::remove_dir(path).map_err(|_| "exec_cgroup_remove_failed")
     }
     // Tear down everything a sandbox owns: kill its processes and exec group, delete runc state, wait
-    // for and remove its resource group, remove its network, unmount its root and delete private files.
-    // Stop at the first failure so the caller can retry.
-    pub fn cleanup(&self, id: &str) -> Result<()> {
+    // for and remove its resource group, return its network slot to the pool and remove its guest
+    // network, unmount its root and delete private files. Stop at the first failure so the caller can
+    // retry.
+    pub fn cleanup(&self, id: &str, network_slot: Option<usize>) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
         let cgroup = Path::new(&self.config.cgroup_parent).join(id);
@@ -498,7 +502,7 @@ impl Native {
             // runc may have removed its cgroup during delete.
             if cgroup.exists() { fs::remove_dir(&cgroup).map_err(|_| "cgroup_remove_failed")?; }
         }
-        self.cleanup_network(id)?;
+        self.cleanup_network(id, network_slot)?;
         let private = self.private(id);
         let rootfs = private.join("rootfs");
         if storage::mounted(&rootfs)? { self.command("umount", vec!["--internal-only".into(), rootfs.display().to_string()])?; }
