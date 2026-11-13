@@ -75,7 +75,7 @@ Run the nonprivileged checks first:
 ```sh
 cargo build --locked
 python3 scripts/smoke.py --binary target/debug/sandboxd
-python3 -m py_compile scripts/runtime_smoke.py
+python3 -m py_compile scripts/runtime_smoke.py scripts/image_e2e.py
 cc -static -O2 -Wall -Wextra -Werror scripts/fixture.c -o target/smoke-fixture
 ```
 
@@ -275,3 +275,78 @@ source recovery and independent child restore and retains denied destinations an
 ports. No MTU, route or forwarding sysctl on the actual host/default namespace is
 changed. This is targeted PMTU transport qualification, not a general routed-network
 or performance result.
+
+## Real-image end-to-end check
+
+`scripts/image_e2e.py` runs the owner workflow with a real OCI image instead of
+the static fixture: build a cold template from the image, create a container,
+call the HTTP server inside it, capture a warm CRIU template, restore an
+independent child from it and call the child. Everything goes through the
+controller's blocking API. It needs the same explicit approval, root, trusted
+root directory, delegated cgroup parent and tools as the network gate, and it
+runs in its own disposable outer network/mount namespace in the same way.
+
+The image comes from an OCI image layout directory (`--oci-layout`) or a tar of
+one (`--oci-tar`). `--image REF --oci-layout DIR --fetch-only` fetches one platform
+into a new layout with an already installed `regctl`, `skopeo` or `crane`
+(`--fetch-tool`). It runs without privilege and in the host network namespace, and
+your proxy environment applies. If you have no registry access, use an existing
+local layout instead. Example with a generic public image:
+
+```sh
+python3 scripts/image_e2e.py --fetch-only --image python:3.12-slim --oci-layout /tmp/python-oci
+python3 scripts/image_e2e.py --allow-privileged-runtime \
+  --oci-layout /tmp/python-oci \
+  --binary target/debug/sandboxd \
+  --root /var/lib/sandbox-validation \
+  --cgroup-parent /sys/fs/cgroup/sandbox-validation \
+  --tools-dir /var/lib/sandbox-tools
+```
+
+What the script does:
+
+- **Image to template.**
+  - It verifies the manifest, config and layer digests and the uncompressed
+    `diff_ids`.
+  - It applies the layers in order: `.wh.` whiteouts and `.wh..wh..opq` opaque
+    directories, modes including setuid, numeric ownership, symlinks, hardlinks,
+    devices and FIFOs. Paths are resolved as if chrooted, and `..` member names
+    are rejected. xattrs are not copied. zstd layers need the installed `zstd` tool.
+  - It makes `/workspace` owned by 65534. It replaces the image's
+    `/etc/resolv.conf` with a loopback-only one and adds a localhost `/etc/hosts`
+    if the image has none. This follows the AgentENV fresh-rootfs pattern; turn it
+    off with `--keep-image-resolver`. Sandboxes have no DNS, so a build-time
+    resolver would make lookups wait on blocked egress. For example, Python's
+    `http.server` took about 20 s to start listening.
+  - It builds an uncompressed EROFS base with `mkfs.erofs` and writes a cold
+    manifest with `runtime_smoke.py`'s helpers.
+  - The image `Env` is passed to the workload through the image's `env(1)`
+    (`--no-image-env` turns this off). The image `User` and `WorkingDir` are not
+    applied: the worker always uses UID/GID 65534 and `/workspace`.
+- **Default workload.** `python3 -m http.server 8000 --bind 0.0.0.0`. Change it with
+  `--init-argv` (a JSON list), `--port`, `--http-path` and `--expect-body`. The
+  template network is `tcp_allowlist` with only that service port and no egress.
+- **Lifecycle.** The script runs these steps in order:
+  1. Cold create, then retry the application HTTP operation until the server
+     answers 200 with the expected body. Check the init process's UID,
+     capabilities and no_new_privs.
+  2. Run an exec (`--exec-argv`/`--exec-expect`) and write a random marker file
+     with the image's shell (`--shell`).
+  3. Capture a warm template. The source must still be running and answering
+     afterward.
+  4. Create a child from the warm template and call its HTTP server on a fresh
+     connection. The marker must be present in the child.
+  5. Write a file in the child that must not appear in the source, and check
+     that the pid/mnt/net namespaces are distinct.
+  6. Delete both. No runc state, private state, cgroups, network namespaces or
+     veths may remain.
+  7. After shutdown, no owned mounts or cgroups may remain and service logs must
+     not contain the tokens.
+- **Defaults.** 256 MiB, one vCPU and 128 pids per container, at most three
+  containers. PASS lines print informational timings (cold create, first HTTP
+  ready, capture, warm restore, first call after restore). These are not
+  benchmarks. The session root keeps `prepared.json`, `image-e2e.json` and the
+  service logs for inspection.
+
+This is a targeted compatibility check for one image and workload on one host. It
+is not general application compatibility, isolation or performance qualification.

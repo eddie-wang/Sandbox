@@ -22,10 +22,48 @@ import threading
 from smoke import eventually, expect, port, request as smoke_request
 
 
-# Require explicit privileged opt-in, prepare a tiny local template and launch worker/controller
-# services. Exercise cold runs, captures, restores, limits, restart cleanup and optional networking,
-# retaining observations. Route cleanup through owners and verify no owned runtime resources or leaked
-# tokens remain.
+# Runs the worker's read-only preflight for this config and returns the host
+# compatibility fingerprint a manifest must carry. Fails if any check fails.
+def preflight_compatibility(binary, worker_config):
+    # Version checks and preflight do not install/load/configure anything.
+    report = subprocess.run([binary, "preflight", "--config", str(worker_config)], capture_output=True, timeout=15)
+    if report.returncode:
+        print(report.stdout.decode(errors="replace"))
+        raise RuntimeError("preflight failed; no runtime mutation attempted")
+    return json.loads(report.stdout)["compatibility"]
+
+
+# Moves a built EROFS image into the worker's digest-named layer store and
+# returns its manifest descriptor (sha256 and size).
+def publish_layer(root, image):
+    digest = hashlib.sha256()
+    with image.open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    (root / "layers").mkdir(mode=0o700, exist_ok=True)
+    target = root / "layers" / (digest.hexdigest() + ".erofs")
+    image.rename(target)
+    return dict(sha256=digest.hexdigest(), bytes=target.stat().st_size)
+
+
+# Returns a cold (no checkpoint) template manifest the worker accepts: fixed
+# UID/GID 65534, the given base layer, init argv, network policy and defaults.
+def cold_manifest(template_id, compatibility, base, init_argv, network, memory_mib, vcpus, pids_max):
+    return dict(schema_version=2, template_id=template_id, generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
+                base=base, upper=None, checkpoint=None, init_argv=init_argv, memory_mib=memory_mib, vcpus=vcpus, pids_max=pids_max,
+                oci_config_sha256=None, network=network, uid=65534, gid=65534)
+
+
+# Writes manifest.json and its digest sidecar into a new template directory.
+def write_template(root, manifest):
+    (root / "templates").mkdir(mode=0o700, exist_ok=True)
+    template = root / "templates" / manifest["template_id"]
+    template.mkdir(mode=0o700)
+    (template / "manifest.json").write_text(json.dumps(manifest))
+    (template / "manifest.sha256").write_text(hashlib.sha256((template / "manifest.json").read_bytes()).hexdigest() + "\n")
+    return template
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -118,12 +156,7 @@ fanout = 1
 node_id = "node-smoke"
 url = "http://127.0.0.1:{worker_port}"
 ''')
-    # Version checks and preflight do not install/load/configure anything.
-    report = subprocess.run([binary, "preflight", "--config", str(worker_config)], capture_output=True, timeout=15)
-    if report.returncode:
-        print(report.stdout.decode(errors="replace"))
-        raise RuntimeError("preflight failed; no runtime mutation attempted")
-    compatibility = json.loads(report.stdout)["compatibility"]
+    compatibility = preflight_compatibility(binary, worker_config)
     rootfs = root / "fixture-rootfs"
     rootfs.mkdir(mode=0o755)
     for name in ("dev", "proc", "workspace"):
@@ -136,18 +169,10 @@ url = "http://127.0.0.1:{worker_port}"
     subprocess.run(["cc", "-static", "-O2", "-Wall", "-Wextra", "-Werror", str(Path(__file__).with_name("fixture.c")), "-o", str(rootfs / "fixture")], check=True, timeout=60)
     layer = root / "fixture.erofs"
     subprocess.run(["mkfs.erofs", str(layer), str(rootfs)], check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    digest = hashlib.sha256(layer.read_bytes()).hexdigest()
-    (root / "layers").mkdir(mode=0o700)
-    layer.rename(root / "layers" / (digest + ".erofs"))
-    (root / "templates").mkdir(mode=0o700)
-    template = root / "templates" / "fixture"
-    template.mkdir(mode=0o700)
-    manifest = dict(schema_version=2, template_id="fixture", generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
-                    base=dict(sha256=digest, bytes=(root / "layers" / (digest + ".erofs")).stat().st_size), upper=None, checkpoint=None,
-                    init_argv=["/fixture", "init-network" if args.network else "init"], memory_mib=64, vcpus=1, pids_max=64, oci_config_sha256=None,
-                    network=({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}), uid=65534, gid=65534)
-    (template / "manifest.json").write_text(json.dumps(manifest))
-    (template / "manifest.sha256").write_text(hashlib.sha256((template / "manifest.json").read_bytes()).hexdigest() + "\n")
+    manifest = cold_manifest("fixture", compatibility, publish_layer(root, layer), ["/fixture", "init-network" if args.network else "init"],
+                             ({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}),
+                             memory_mib=64, vcpus=1, pids_max=64)
+    write_template(root, manifest)
     for name in ("incompatible", "tampered", "symlinked", "unknown-metadata", "no-defaults") + (("policy-not-authorized", "unsupported-policy", "old-schema") if args.network else ()):
         directory = root / "templates" / name
         directory.mkdir(mode=0o700)
