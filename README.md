@@ -69,10 +69,14 @@ RBAC, built-in TLS or Internet-facing connection defense.
   [runtime selection and its forced-loop validation switch](docs/runtime.md#erofs-mount-selection).
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
   65534, empty capabilities, `no_new_privs` and cgroup-v2 memory/swap/CPU/pids
-  limits installed before launch. Seccomp follows the AgentENV container pattern:
-  default-allow, blocking only io_uring (`ENOSYS`) and MPTCP sockets
-  (`EPROTONOSUPPORT`), which CRIU cannot checkpoint. Isolation relies on the
-  namespaces, absent capabilities, `no_new_privs`, cgroups and network policy.
+  limits installed before launch. Seccomp uses the generated Docker default
+  allowlist (Moby v28.3.3), resolved for x86-64 with no capabilities: default EPERM,
+  upstream architecture/argument restrictions, plus io_uring (`ENOSYS`) and MPTCP
+  (`EPROTONOSUPPORT`) checkpoint guards. Other native architectures fail preflight;
+  old seccomp-layout templates must be republished/recaptured. See
+  [policy provenance and regeneration](docs/runtime.md#syscall-policy). This is
+  defense in depth alongside namespaces, absent capabilities, `no_new_privs`,
+  cgroups and network policy, not a general shared-kernel security qualification.
   PID 1 is an operator-staged static `tini`, bind-mounted read-only, which runs the
   template's init as its child, forwards signals and reaps orphans; stdio is
   `/dev/null`.

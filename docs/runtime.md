@@ -240,10 +240,14 @@ The script fails rather than substituting a fake runtime/result. It exercises:
 2. Private write/copy-up and lower whiteout isolation between two cold sandboxes.
 3. Distinct PID/mount/network namespaces from each other and the host, only loopback
    in the sandbox, UID/GID 65534, empty effective caps, no_new_privs and an active
-   seccomp filter. Inside the sandbox `io_uring_setup` returns ENOSYS, an MPTCP
-   socket returns EPROTONOSUPPORT, a packet socket returns EPERM (no capability)
-   and IPv6 (and, when isolated, external IPv4) connects are unreachable. Host
-   cgroup memory/swap/CPU/pids settings are inspected.
+   deny-by-default seccomp filter. Cold, restored and chained copies reject
+   `unshare(0)`, invalid keyctl and userfaultfd with EPERM; all three io_uring calls,
+   clone3 and an unknown high syscall number return ENOSYS; an MPTCP socket returns
+   EPROTONOSUPPORT and AF_VSOCK returns EPERM. The init rechecks these on every tick,
+   including after CRIU restore, and exec checks them independently. The emitted OCI
+   profile must match the generated data file, and old seccomp-layout templates are
+   rejected. A packet socket returns EPERM (no capability); IPv6 (and, when isolated,
+   external IPv4) connects are unreachable. Host cgroup settings are inspected.
 4. A CRIU checkpoint with **open upper and lower descriptors/mappings**, an in-memory
    counter and random nonce, and an **ESTABLISHED loopback TCP connection** that the
    init uses every 100 ms. The source must keep running: its counter advances during
@@ -259,8 +263,9 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    xattr, and the child's upper starts empty. The child's restore unpacks the node
    checkpoint cache once; it is unchanged by that restore and reused unchanged by a
    later restore after a worker restart. A checkpoint that fails after the freeze
-   (the fixture holds an undumpable userfaultfd) leaves the source running and
-   publishes nothing; a `runc checkpoint` stopped by the test (SIGSTOP) until the
+   (the test kills only its owned checkpoint helper) leaves the source running and
+   publishes nothing. The former userfaultfd failure fixture is no longer possible:
+   that call is denied by the profile. A `runc checkpoint` stopped by the test (SIGSTOP) until the
    worker kills it at the 30 s command deadline is `500 checkpoint_interrupted`, and
    that source is thawed and keeps running (its counter advances). A source whose
    processes the test kills while its `runc checkpoint` is stopped fails with `500
@@ -512,19 +517,60 @@ remove another worker's cgroups, loop devices, mounts or shared images. Publishe
 layers/templates are never automatically evicted while referenced (there is currently
 no automatic eviction at all).
 
+## Syscall policy
+
+`data/seccomp-x86_64.json` is generated, not hand-maintained, from
+[Moby v28.3.3 profiles/seccomp/default.json](https://github.com/moby/moby/blob/v28.3.3/profiles/seccomp/default.json)
+under Apache-2.0 ([license](../data/LICENSE.seccomp)). Its pinned SHA-256 is
+`01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b01b8301e28`.
+The generator follows upstream `setupSeccomp`: native `amd64`, empty bounding
+capabilities, x86-64/x86/x32 architecture map, and Linux >= 4.8. The worker's required
+`cgroup.kill` already requires Linux 5.14 or newer. All selected argument rules are
+preserved, including clone's namespace mask and personality's allowed values.
+Only the io_uring ENOSYS and MPTCP EPROTONOSUPPORT guards are added; no broader socket
+allow rule replaces upstream's AF_VSOCK restriction. See [the execution contract](contracts.md#admission-operations-and-cleanup)
+for the security boundary.
+
+Docker and containers-common are related but **not identical** profiles.
+[containers-common v0.64.2](https://github.com/containers/common/blob/v0.64.2/pkg/seccomp/seccomp.json)
+uses `defaultErrnoRet: 38` (ENOSYS), explicit EPERM rules for known denials, and allows
+several namespace/mount calls without capability conditions. This implementation
+uses Docker's capability/argument rules and its exact `defaultErrnoRet: 1` (EPERM),
+not a union of their allowlists. As with Docker, runc supplies the
+[ENOSYS stub](https://github.com/opencontainers/runc/blob/v1.3.6/libcontainer/seccomp/patchbpf/enosys_linux.go)
+for syscall numbers above the highest known rule on each architecture; holes below
+that maximum still get the profile's default EPERM. Clone3 has upstream's explicit
+ENOSYS rule so libraries can fall back to clone. No fallback allows new syscalls.
+
+Regenerate and verify (network access is only for this explicit maintenance command,
+never worker startup or a build):
+
+```sh
+python3 scripts/generate_seccomp.py
+python3 scripts/generate_seccomp.py --source /path/to/pinned-default.json --check
+```
+
+The script verifies the source hash before writing. Offline `--source` must contain
+those same bytes. Updating the pin requires reviewing upstream conditions, generating
+again, bumping the layout version, and rerunning the foundation, runtime, network,
+image and bounded stress gates. The current `seccomp-v5-moby-28.3.3-nocaps` layout
+rejects old cold and warm templates; republish and recapture rather than migrating
+saved filters. Non-x86-64 preflight fails closed until a separately resolved policy
+and runtime validation exist. The smoke gate checks actual denials and fallback
+errors in cold/restored processes; it is not a general security qualification.
+
 ## Explicit remaining boundaries
 
 - Literal IPv4 TCP allowlists and the app proxy to approved service ports are implemented;
   DNS, UDP, IPv6, domain/CIDR policy, per-create endpoint overrides and arbitrary
   established external TCP connection cloning remain unsupported.
-- Seccomp follows the AgentENV container pattern: default-allow, with only io_uring
-  (ENOSYS) and MPTCP sockets (EPROTONOSUPPORT) blocked because CRIU cannot dump them.
-  Isolation relies on namespaces, empty capabilities, no_new_privs, cgroups and
-  network policy. CRIU runs with `--tcp-established --ext-unix-sk --file-locks`
-  (AgentENV's options): established and loopback TCP are captured and restored; a
-  child's copy of a connection to an external peer fails on first use. Other
-  unsupported state (for example a userfaultfd) fails the capture while the source
-  keeps running.
+- The generated Docker seccomp allowlist adds defense in depth; it is not a
+  complete shared-kernel security qualification. Only native x86-64 is enabled.
+  Empty capabilities, no_new_privs, namespaces, cgroups and network policy remain.
+  CRIU runs with `--tcp-established --ext-unix-sk --file-locks` (AgentENV's options):
+  established and loopback TCP are captured and restored; a child's copy of a
+  connection to an external peer fails on first use. Unsupported state still fails
+  capture while a surviving source is thawed; userfaultfd is now denied outright.
 - No S3 client, remote template transport, signed publisher provenance or two-node
   qualification. The local digest-bound layout is the serialized transfer boundary.
 - No per-sandbox writable-disk quota, automatic artifact GC or tombstone pruning.

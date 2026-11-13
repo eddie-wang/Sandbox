@@ -144,12 +144,12 @@ Strict JSON fields (unknown fields are rejected):
 restored processes map it), `layout`. The OCI network-policy digest annotation is
 preserved during normalization; the init's host path is normalized like the other
 worker-local paths. `layout` is
-`erofs-sealed-layers-v3-cni-ptp-static-v1-mtu<value>-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1`
+`erofs-sealed-layers-v3-cni-ptp-static-v1-mtu<value>-tcp-established-pmtu-v1-seccomp-v5-moby-28.3.3-nocaps-tini-v1-conmon-null-v1`
 where `<value>` is the configured MTU (1500 without network configuration).
-Pre-CNI templates and templates with another MTU are rejected. The seccomp profile is the
-default-allow AgentENV pattern described below; templates captured under earlier
-layouts (deny-by-default seccomp, per-create upper archives, no reaping init) are rejected. Older layout
-fingerprints are incompatible rather than silently reinterpreted. The local fixture
+Pre-CNI templates, templates with another MTU, and the former default-allow seccomp
+layout are rejected. The current profile is the generated Docker deny-by-default
+allowlist described below. Older layout fingerprints are incompatible rather than
+silently reinterpreted; republish cold templates and recapture warm templates. The local fixture
 script demonstrates complete cold publication; do not guess compatibility strings.
 Exact matching deliberately rejects more hosts than might technically work. Version
 matching is necessary, **not sufficient proof of CRIU portability**.
@@ -314,17 +314,31 @@ runtime's inherited null descriptors (no logging pipes or attach API). Conmon is
 outside the guest, subreaps init and persists exit/OOM files. Runc startup diagnostics
 use the private `runc.log`, not workload stdio. The workload has UID/GID
 65534, empty capabilities, no_new_privs, minimal /dev, its own proc/PID/mount/net/IPC/
-UTS/cgroup namespaces and a seccomp profile matching the AgentENV container backend:
-`SCMP_ACT_ALLOW` by default, with only two checkpointability guards that CRIU needs:
-`io_uring_setup/enter/register` return ENOSYS and `socket(..., IPPROTO_MPTCP)` returns
-EPROTONOSUPPORT, so libraries fall back. Seccomp is not an isolation layer here:
-isolation relies on the namespaces, empty capabilities (so mount, namespace creation,
-ptrace, raw/packet sockets and similar privileged operations fail), no_new_privs,
-cgroups and network policy (a worker-created guest namespace with only loopback when
-isolated; router-namespace nftables for `tcp_allowlist`). Workloads may create any unprivileged socket family; network
-reachability is decided by the namespace and its rules, not by socket filtering.
-Host authority, not workload privilege, performs checkpoints. This profile is
-unqualified for general applications.
+UTS/cgroup namespaces and Docker's default seccomp allowlist (Moby v28.3.3), resolved
+for native x86-64 with **no capabilities**, embedded as plain OCI `linux.seccomp`.
+Other native architectures fail preflight. `defaultAction` is `SCMP_ACT_ERRNO` and
+`defaultErrnoRet` is 1 (EPERM), exactly as in that upstream profile. Capability-only
+allow rules are omitted; native-architecture, kernel and argument rules are preserved:
+namespace-changing clone flags are denied, clone3 returns ENOSYS, personality is
+argument-limited and AF_VSOCK sockets are denied. Mount, unshare, keyctl, bpf and
+userfaultfd are denied. Upstream permits ptrace/process_vm_readv/process_vm_writev
+on Linux >= 4.8 even without CAP_SYS_PTRACE; the normal kernel access checks still
+apply. Do not describe ptrace as categorically blocked.
+
+The two CRIU guards remain: `io_uring_setup/enter/register` return ENOSYS and
+`socket(..., IPPROTO_MPTCP=262)` returns EPROTONOSUPPORT. The socket allow rule retains
+upstream's family restriction as well as excluding MPTCP. Runc's upstream ENOSYS
+fallback for syscall numbers beyond the profile's known maximum is retained, not
+replaced with an allow rule or a hand-written syscall-number list. See
+[syscall policy](runtime.md#syscall-policy) for generation, licensing and the distinction
+from containers-common's ENOSYS-default variant.
+
+This filter is defense in depth alongside namespaces, empty capabilities,
+no_new_privs, cgroups and network policy (loopback only when isolated;
+router-namespace nftables for `tcp_allowlist`). Ordinary UDP, IPv6 and Unix socket
+creation is allowed; external reachability is decided by the namespace and its rules.
+Host authority, not workload privilege, performs checkpoints. Local gates do not
+qualify the shared-kernel boundary against hostile workloads or general applications.
 
 TTL has a separate cgroup-kill watchdog so a long archive cannot keep an expired
 workload running until a job completes. Deletion durably records cancellation and

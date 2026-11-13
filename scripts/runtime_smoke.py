@@ -237,7 +237,7 @@ def mount_inventory_gate(binary, root, worker_config):
 
 
 # Run real lifecycle, rejection, bounds and restart gates with at most three live containers.
-# Check mounts/storage, OCI limits, conmon and CNI ownership, including startup DEL and sync faults.
+# Check mounts/storage, OCI limits, syscall policy on cold/restored copies, conmon and CNI ownership.
 # --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
 def main():
@@ -386,7 +386,7 @@ url = "http://127.0.0.1:{worker_port}"
         subprocess.run(["mkfs.erofs", str(probe_image), str(probe_rootfs)], check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         probe_bases[name] = publish_layer(root, probe_image)
         write_template(root, dict(manifest, template_id=name, base=probe_bases[name]))
-    for name in ("incompatible", "pre-cni-layout", "other-mtu", "tampered", "symlinked", "unknown-metadata", "no-defaults", "old-schema") + (("policy-not-authorized", "unsupported-policy") if args.network else ()):
+    for name in ("incompatible", "pre-cni-layout", "old-seccomp", "other-mtu", "tampered", "symlinked", "unknown-metadata", "no-defaults", "old-schema") + (("policy-not-authorized", "unsupported-policy") if args.network else ()):
         directory = root / "templates" / name
         directory.mkdir(mode=0o700)
         invalid = json.loads(json.dumps(manifest))
@@ -395,6 +395,8 @@ url = "http://127.0.0.1:{worker_port}"
             invalid["compatibility"]["kernel"] = "incompatible-kernel"
         if name == "pre-cni-layout":
             invalid["compatibility"]["layout"] = "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1"
+        if name == "old-seccomp":
+            invalid["compatibility"]["layout"] = compatibility["layout"].replace("seccomp-v5-moby-28.3.3-nocaps", "seccomp-v4-agentenv")
         if name == "other-mtu":
             invalid["compatibility"]["layout"] = compatibility["layout"].replace("mtu1500", "mtu1400")
         if name == "tampered":
@@ -732,7 +734,7 @@ url = "http://127.0.0.1:{worker_port}"
         print("PASS blocking cold create, concurrent commands in one sandbox (own groups), command limit, kill, streamed output and immediate capture 409")
 
         before_dirs = {name: sorted(p.name for p in (root / name).iterdir()) for name in ("private", "runc")}
-        rejected_templates = ["incompatible", "pre-cni-layout", "other-mtu", "symlinked", "unknown-metadata", "old-schema"] + (["policy-not-authorized", "unsupported-policy"] if args.network else [])
+        rejected_templates = ["incompatible", "pre-cni-layout", "old-seccomp", "other-mtu", "symlinked", "unknown-metadata", "old-schema"] + (["policy-not-authorized", "unsupported-policy"] if args.network else [])
         for invalid_template in rejected_templates:
             rejected = expect(create_call(dict(template_id=invalid_template, ttl_seconds=60)), 422, "template_unavailable")
             assert "sandbox_id" not in rejected, "a pre-launch template rejection must not name an ID"
@@ -1073,8 +1075,17 @@ url = "http://127.0.0.1:{worker_port}"
         execute(source, "unlink", "removed")
         assert execute(isolated, "read", "copied") == "immutable-base"
         assert execute(isolated, "read", "removed") == "immutable-base"
+        # Check the embedded OCI bytes and actual denied/fallback calls, including restored copies.
+        def syscall_policy(sandbox):
+            expected = "seccomp_policy unshare=EPERM keyctl=EPERM userfaultfd=EPERM io_uring=ENOSYS clone3=ENOSYS unknown=ENOSYS mptcp=EPROTONOSUPPORT vsock=EPERM\n"
+            assert execute(sandbox, "seccomp") == expected
+            spec = json.loads((root / "private" / sandbox / "config.json").read_text())
+            profile = json.loads((Path(__file__).resolve().parent.parent / "data/seccomp-x86_64.json").read_text())
+            assert spec["linux"]["seccomp"] == profile and profile["defaultAction"] == "SCMP_ACT_ERRNO" and profile["defaultErrnoRet"] == 1
+            observations.setdefault("seccomp_policy_checked", []).append(sandbox)
+        syscall_policy(source)
         status = execute(source, "network-isolation" if args.network else "isolation")
-        assert status.startswith("seccomp_guards io_uring=ENOSYS mptcp=EPROTONOSUPPORT\n") and "CapEff:\t0000000000000000" in status and "NoNewPrivs:\t1" in status and "Seccomp:\t2" in status
+        assert status.startswith("seccomp_policy unshare=EPERM") and "CapEff:\t0000000000000000" in status and "NoNewPrivs:\t1" in status and "Seccomp:\t2" in status
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
         assert (cgroup / source / "memory.swap.max").read_text().strip() == "0"
         assert (cgroup / source / "cpu.max").read_text().strip() == "100000 100000"
@@ -1265,25 +1276,6 @@ url = "http://127.0.0.1:{worker_port}"
         (conflict / "sentinel").unlink()
         conflict.rmdir()
         observations["unacquired_staging_preserved"] = True
-        # A checkpoint that fails after the source was frozen (CRIU cannot dump a userfaultfd) thaws
-        # the source and keeps it: it stays running, its counter and loopback connection advance, and
-        # nothing is published.
-        # Read the init's userfaultfd status; empty until the init first writes it.
-        def uffd_status():
-            result = expect(exec_call(source, ["/fixture", "read", "uffd-status"]), 200)
-            return result["stdout"] if result["exit_code"] == 0 else ""
-        execute(source, "write", "hold-uffd", "1")
-        eventually(lambda: uffd_status() == "held\n", timeout=10)
-        frozen_counter = int(execute(source, "counter").split()[0])
-        failed_trips = loopback(source)
-        code, failed = capture(source, "uffd-fails")
-        assert code == 500 and failed["error"]["code"] == "checkpoint_failed", (code, failed)
-        assert get(source)["state"] == "running" and not (root / "templates" / "uffd-fails").exists() and not (root / "staging" / "uffd-fails").exists()
-        time.sleep(0.3)
-        assert int(execute(source, "counter").split()[0]) > frozen_counter and loopback(source) > failed_trips
-        execute(source, "unlink", "hold-uffd")
-        eventually(lambda: uffd_status().startswith("released"), timeout=10)
-        observations["failed_checkpoint_keeps_source_running"] = True
         # A dump stopped at its deadline is reported as `checkpoint_interrupted`, and (as in
         # AgentENV) the source is thawed and kept because it still runs. The test stops the
         # `runc checkpoint` helper (SIGSTOP) as soon as it appears; the worker kills it at the 30 s
@@ -1291,10 +1283,10 @@ url = "http://127.0.0.1:{worker_port}"
         # stops the helper again, kills the sandbox's processes, then lets the helper continue so
         # the dump fails.
         stopped = {}
-        # Find the sandbox's runc checkpoint process among the worker's helpers and stop it. With
-        # `kill_source`, delay a second, kill every sandbox process, wait until none is left, then
-        # continue the helper. The delay must be timed as failed_step, never cleanup's kill.
-        def stop_checkpoint(sandbox, kill_source):
+        # Stop this sandbox's checkpoint helper. Kill just the helper to fail a running source's
+        # dump, kill the source to test its cleanup, or leave the helper stopped until its deadline.
+        # The source-kill delay must be timed as failed_step, never cleanup's kill.
+        def stop_checkpoint(sandbox, failure):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 for procs in helpers.glob("command-*/cgroup.procs"):
@@ -1310,7 +1302,9 @@ url = "http://127.0.0.1:{worker_port}"
                         if b"checkpoint" in argv and sandbox.encode() in argv:
                             os.kill(int(pid), signal.SIGSTOP)
                             stopped[sandbox] = int(pid)
-                            if kill_source:
+                            if failure == "helper":
+                                os.kill(int(pid), signal.SIGKILL)
+                            elif failure == "source":
                                 time.sleep(1)
                                 (cgroup / sandbox / "cgroup.kill").write_text("1")
                                 eventually(lambda: "populated 0" in (cgroup / sandbox / "cgroup.events").read_text(), timeout=10)
@@ -1319,8 +1313,8 @@ url = "http://127.0.0.1:{worker_port}"
                 time.sleep(0.001)
         # Capture the sandbox while stop_checkpoint runs on it; require that its helper was found
         # and nothing was published or left staged. Return the status, body and seconds taken.
-        def stopped_capture(sandbox, template_id, kill_source):
-            stopper = threading.Thread(target=stop_checkpoint, args=(sandbox, kill_source), daemon=True)
+        def stopped_capture(sandbox, template_id, failure):
+            stopper = threading.Thread(target=stop_checkpoint, args=(sandbox, failure), daemon=True)
             stopper.start()
             started = time.monotonic()
             code, body = capture(sandbox, template_id)
@@ -1329,9 +1323,19 @@ url = "http://127.0.0.1:{worker_port}"
             assert sandbox in stopped, "runc checkpoint helper was not found"
             assert not (root / "templates" / template_id).exists() and not (root / "staging" / template_id).exists()
             return code, body, seconds
+        # userfaultfd is now denied, so fail the owned checkpoint helper instead of opening one.
+        # The source must thaw, advance both its counter and TCP connection, and publish nothing.
+        frozen_counter = int(execute(source, "counter").split()[0])
+        failed_trips = loopback(source)
+        code, failed, _ = stopped_capture(source, "helper-fails", "helper")
+        assert code == 500 and failed["error"]["code"] == "checkpoint_failed", (code, failed)
+        assert get(source)["state"] == "running"
+        time.sleep(0.3)
+        assert int(execute(source, "counter").split()[0]) > frozen_counter and loopback(source) > failed_trips
+        observations["failed_checkpoint_keeps_source_running"] = True
         kept = create()
         kept_counter = int(execute(kept, "counter").split()[0])
-        code, interrupted, interrupted_seconds = stopped_capture(kept, "interrupted-dump", False)
+        code, interrupted, interrupted_seconds = stopped_capture(kept, "interrupted-dump", "deadline")
         assert code == 500 and interrupted["error"]["code"] == "checkpoint_interrupted", (code, interrupted)
         assert interrupted_seconds >= 29, interrupted_seconds
         assert get(kept)["state"] == "running", get(kept)
@@ -1339,7 +1343,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert int(execute(kept, "counter").split()[0]) > kept_counter
         remove(kept)
         dead = create()
-        code, failed_dead, dead_seconds = stopped_capture(dead, "dead-source", True)
+        code, failed_dead, dead_seconds = stopped_capture(dead, "dead-source", "source")
         assert code == 500 and failed_dead["error"]["code"] == "checkpoint_failed", (code, failed_dead)
         assert get(dead)["state"] == "deleted", get(dead)
         gone(dead)
@@ -1402,6 +1406,7 @@ url = "http://127.0.0.1:{worker_port}"
         remove(isolated)
         expect(create_call(dict(template_id="warm", ttl_seconds=60, memory_mib=128)), 422, "template_resource_mismatch")
         child = create("warm")
+        syscall_policy(child)
         observations["conmon_restore_pid"] = monitor_identity(child)
         time.sleep(0.3)
         restored, child_nonce = map(int, execute(child, "counter").split())
@@ -1465,6 +1470,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert chained_manifest["base"] == warm_manifest["base"]
         assert get(child)["state"] == "running" and execute(child, "read", "copied") == "child-private"
         grandchild = create("chained")
+        syscall_policy(grandchild)
         time.sleep(0.3)
         assert int(execute(grandchild, "counter").split()[1]) == nonce
         assert execute(grandchild, "read", "copied") == "child-private"
@@ -1508,7 +1514,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert get(bounded)["state"] == "running" and exec_groups(bounded) == [] and execute(bounded, "counter")
         remove(bounded)
         observations["exec_bound_violation_keeps_sandbox"] = True
-        print("PASS configured cgroup limits, namespace separation, seccomp checkpoint guards, TTL and per-command bounds that keep the sandbox")
+        print("PASS configured cgroup limits, namespace separation, cold/restored seccomp deny rules and checkpoint guards, TTL and per-command bounds that keep the sandbox")
 
         # Layer verification runs in the create job: two simultaneous first creates of a new base hash it
         # once. The result is saved with the image's identity in a root-owned 0600 state file.

@@ -51,11 +51,28 @@ static void loopback_pair(int *client, int *server) {
     if (setsockopt(*client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))
         || setsockopt(*server, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) fail("loopback timeout");
 }
-/* Dispatch persistent counter/TCP/HTTP services, file/isolation/guard checks and command bounds. */
+/* Check denied calls, argument restrictions and fallback errors without changing guest state. */
+/* unshare(0) and invalid keyctl distinguish filtering from a capability-only refusal. */
+static int syscall_policy(void) {
+    if (syscall(__NR_unshare, 0) != -1 || errno != EPERM) return 5;
+    if (syscall(__NR_keyctl, -1, 0, 0, 0, 0) != -1 || errno != EPERM) return 5;
+    if (syscall(__NR_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */) != -1 || errno != EPERM) return 5;
+    if (syscall(__NR_io_uring_setup, 1, NULL) != -1 || errno != ENOSYS) return 5;
+    if (syscall(__NR_io_uring_enter, -1, 0, 0, 0, NULL, 0) != -1 || errno != ENOSYS) return 5;
+    if (syscall(__NR_io_uring_register, -1, 0, NULL, 0) != -1 || errno != ENOSYS) return 5;
+    if (syscall(__NR_clone3, NULL, 0) != -1 || errno != ENOSYS) return 5;
+    if (syscall(0x3fffffff, 0, 0, 0, 0, 0, 0) != -1 || errno != ENOSYS) return 5;
+    if (socket(AF_INET, SOCK_STREAM, 262 /* IPPROTO_MPTCP */) >= 0 || errno != EPROTONOSUPPORT) return 5;
+    if (socket(AF_VSOCK, SOCK_STREAM, 0) >= 0 || errno != EPERM) return 5;
+    printf("seccomp_policy unshare=EPERM keyctl=EPERM userfaultfd=EPERM io_uring=ENOSYS clone3=ENOSYS unknown=ENOSYS mptcp=EPROTONOSUPPORT vsock=EPERM\n");
+    return 0;
+}
+/* Dispatch persistent counter/TCP/HTTP services, file/isolation/policy checks and command bounds. */
 /* Monitor modes exit immediately, wait for a trigger then exit, or exceed the sandbox memory cap. */
-/* Return each check's result; init and stress modes keep running until stopped. */
+/* Init rechecks syscall policy each tick, including after restore, and exits on any mismatch. */
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
+    if (!strcmp(argv[1], "seccomp")) return syscall_policy();
     if (!strcmp(argv[1], "exit-now")) return 23;
     if (!strcmp(argv[1], "monitor-exit") || !strcmp(argv[1], "monitor-oom")) {
         while (access("/workspace/go", F_OK) != 0) usleep(10000);
@@ -144,16 +161,9 @@ int main(int argc, char **argv) {
         volatile uint64_t count = 0;
         uint64_t nonce;
         if (getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce)) fail("getrandom");
-        int held = -1, uffd = -1;
+        int held = -1;
         for (;;) {
-            /* While /workspace/hold-uffd exists, hold a userfaultfd, a file CRIU cannot
-               dump, so a capture fails after the source was frozen. */
-            if (!access("/workspace/hold-uffd", F_OK) ? uffd < 0 : uffd >= 0) {
-                if (uffd < 0) uffd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | 1 /* UFFD_USER_MODE_ONLY */);
-                else { close(uffd); uffd = -1; }
-                int status = open("/workspace/uffd-status", O_CREAT | O_TRUNC | O_WRONLY, 0666);
-                if (status < 0 || dprintf(status, uffd >= 0 ? "held\n" : "released %d\n", errno) < 0 || close(status)) fail("uffd status");
-            }
+            if (syscall_policy()) return 5;
             if (listener >= 0 && held < 0 && !access("/workspace/hold-external", F_OK)) {
                 held = socket(AF_INET, SOCK_STREAM, 0);
                 struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(18080)};
@@ -363,9 +373,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "isolation") || !strcmp(argv[1], "network-isolation")) {
         if (getuid() != 65534 || getgid() != 65534 || getpid() == 1) return 4;
-        /* Seccomp only guards CRIU checkpointability (AgentENV pattern). */
-        if (syscall(__NR_io_uring_setup, 1, NULL) != -1 || errno != ENOSYS) return 5;
-        if (socket(AF_INET, SOCK_STREAM, 262 /* IPPROTO_MPTCP */) >= 0 || errno != EPROTONOSUPPORT) return 5;
+        if (syscall_policy()) return 5;
         /* Raw packet sockets need a capability the workload does not have. */
         if (socket(AF_PACKET, SOCK_RAW, 0) >= 0 || errno != EPERM) return 5;
         /* Isolated: loopback only. Both modes: IPv6 has no route. */
@@ -380,7 +388,6 @@ int main(int argc, char **argv) {
         if (fd < 0) fail("tcp6 socket");
         if (connect(fd, (struct sockaddr *)&v6, sizeof(v6)) == 0 || (errno != ENETUNREACH && errno != EADDRNOTAVAIL)) return 5;
         close(fd);
-        printf("seccomp_guards io_uring=ENOSYS mptcp=EPROTONOSUPPORT\n");
         fflush(stdout);
         if (!access("/sys", F_OK) || !access("/dev/nvidia0", F_OK)) return 6;
         return read_file("/proc/self/status");

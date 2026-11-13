@@ -230,15 +230,15 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
 }
 
 // Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
-// creating runtime state, including CNI protocol support and the configured link MTU. Report readiness only if every check
-// passes; qualification stays unvalidated. Active EROFS and overlay probes run only at startup.
+// creating runtime state, including CNI protocol support and the configured link MTU. Only x86-64 has
+// a resolved syscall policy. All checks must pass; active EROFS/overlay probes run only at startup.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
     let search_path = tool_search_path(&tools);
     let mut checks = Vec::new();
     let mut add = |name: &str, ok: bool| checks.push(Check { name: name.to_owned(), ok });
     add("linux", std::env::consts::OS == "linux");
-    add("supported_architecture", matches!(std::env::consts::ARCH, "x86_64" | "aarch64"));
+    add("supported_architecture", std::env::consts::ARCH == "x86_64");
     add("namespaces", ["pid", "mnt", "net", "ipc", "uts", "cgroup"].iter().all(|n| Path::new("/proc/self/ns").join(n).exists()));
     add("explicitly_enabled", config.is_some_and(|c| c.enabled));
     add("root", unsafe { libc::geteuid() } == 0);
@@ -292,7 +292,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let init = storage::artifact(Path::new(tools.get("tini")?), 1 << 26).ok()?;
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             runc_version: version("runc")?, criu_version: version("criu")?,
-            init_sha256: init.sha256, layout: format!("erofs-sealed-layers-v3-cni-ptp-static-v1-mtu{}-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1",
+            init_sha256: init.sha256, layout: format!("erofs-sealed-layers-v3-cni-ptp-static-v1-mtu{}-tcp-established-pmtu-v1-seccomp-v5-moby-28.3.3-nocaps-tini-v1-conmon-null-v1",
                 config.and_then(|c| c.network.as_ref()).map_or(1500, |n| n.mtu)) })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
@@ -1027,21 +1027,9 @@ impl Drop for KeyTurn<'_> {
     }
 }
 
-// Return the syscall policy: allow everything except the io_uring calls (ENOSYS) and MPTCP sockets
-// (EPROTONOSUPPORT), which CRIU cannot checkpoint.
+// Return Docker's deny-by-default profile resolved for x86-64 with no capabilities, plus the
+// io_uring/MPTCP checkpoint guards. scripts/generate_seccomp.py pins the source and generates it;
+// preflight refuses other architectures rather than applying the wrong argument/architecture rules.
 fn seccomp() -> Value {
-    // Same pattern as the AgentENV container backend: default-allow, with
-    // CRIU checkpointability guards only. CRIU cannot dump io_uring instances or
-    // MPTCP sockets, so these return ENOSYS/EPROTONOSUPPORT and callers fall back.
-    // Isolation relies on namespaces, no capabilities, no_new_privs, cgroups and
-    // network policy, not on this filter.
-    let architectures = match std::env::consts::ARCH {
-        "aarch64" => json!(["SCMP_ARCH_AARCH64", "SCMP_ARCH_ARM"]),
-        _ => json!(["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"]),
-    };
-    json!({"defaultAction":"SCMP_ACT_ALLOW","architectures":architectures,
-        "syscalls":[
-            {"names":["io_uring_setup","io_uring_enter","io_uring_register"],"action":"SCMP_ACT_ERRNO","errnoRet":38u32},
-            {"names":["socket"],"action":"SCMP_ACT_ERRNO","errnoRet":93u32,
-             "args":[{"index":2u32,"value":262u64,"op":"SCMP_CMP_EQ"}]}]})
+    serde_json::from_str(include_str!("../data/seccomp-x86_64.json")).expect("generated OCI seccomp profile")
 }

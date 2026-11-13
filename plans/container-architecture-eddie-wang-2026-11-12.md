@@ -36,7 +36,7 @@ S3 transfer is **deferred**, not a prerequisite. An administrator currently plac
 
 - Management requests require authentication. The service does not provide built-in TLS, user accounts or per-user permissions; an operator must supply the appropriate access boundary.
 - A container shares the host's Linux kernel. Its isolation is not the same as a separate virtual machine, and hostile-workload security has not been fully qualified.
-- Isolation relies on Linux namespaces, an unprivileged user with no capabilities, `no_new_privs`, resource groups and network policy. The system-call filter follows the AgentENV container pattern: everything is allowed except io_uring and MPTCP sockets, which the checkpoint tool cannot save.
+- Isolation uses Linux namespaces, an unprivileged user with no capabilities, `no_new_privs`, resource groups, network policy and a deny-by-default system-call filter. The filter is generated from Docker's maintained default profile for x86-64 with no capabilities, preserving its argument rules; the extra io_uring and MPTCP guards keep checkpointing possible. This does not make the shared-kernel boundary a qualified hostile-workload security boundary.
 - Resource limits, private files and network restrictions must be in place before application code starts.
 - A saved process and its saved file changes must come from the same capture. The worker rejects missing, damaged or incompatible template files instead of trying to guess how to use them.
 - Every created resource must belong to a saved sandbox record, so the worker can find and clean it up after a restart.
@@ -216,6 +216,10 @@ The CNI/MTU layout version rejects old templates. The guest interface stays `eth
 but MACs can change because CRIU restores sockets into a supplied external namespace,
 not saved links. The release-build local gates must qualify established internal
 TCP, listening sockets and fresh external connections with these CNI-built guests.
+
+### Built syscall policy
+
+The Docker default allowlist (Moby v28.3.3) replaces the former AgentENV default-allow filter. A small script verifies a pinned upstream hash and generates the checked-in execution policy; no worker download or hand-maintained syscall list is needed. It resolves native x86-64, no capabilities and the upstream kernel/argument conditions. Calls not permitted by the profile fail with EPERM, while runc preserves upstream's ENOSYS fallback for new syscall numbers. The io_uring and MPTCP checkpoint guards remain. Only native x86-64 can pass preflight; other architectures need their own resolved policy and validation. The new layout fingerprint rejects old templates rather than applying a new filter to saved processes silently. Runtime gates check denied calls and fallback errors both before and after checkpoint/restore. See [policy details and generation](../docs/runtime.md#syscall-policy).
 
 ### Built resource and mount ownership
 

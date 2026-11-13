@@ -16,7 +16,7 @@ worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |   192.0.2.2/30 eth0 -- CNI veth -- 192.0.2.1/32        (attached at create)
     |   runc workload                       nft default drop; template's TCP permits
     |   UID/GID 65534, no capabilities       private SNAT to the slot's pool address
-    |   seccomp: io_uring/MPTCP guards only     |
+    |   seccomp: Docker allowlist + guards     |
     |                                         uplink -- veth -- operator bridge
     |                                                          stable MAC/gateway
     +-- app proxy: a fresh TCP connection opened inside the router slot only
@@ -78,12 +78,13 @@ All other forwarding/input/output is dropped. Only its
 own approved service-port TCP requests can leave the router toward the guest;
 untrusted workload replies to those requests require established state. Unsolicited
 uplink ingress cannot reach guest services. IPv6 is disabled in both owned
-namespaces. There is no implicit DNS. Seccomp no longer filters socket families: it
-follows the AgentENV pattern (default-allow; io_uring returns ENOSYS and MPTCP sockets
-EPROTONOSUPPORT, for CRIU checkpointability only). Workloads may create UDP, IPv6
-or Unix sockets, but only the router nftables rules decide what leaves the guest.
-Empty workload capabilities still prevent raw/packet sockets, namespace changes
-and mounts; no_new_privs and cgroups remain in force.
+namespaces. There is no implicit DNS. The generated Docker seccomp allowlist rejects
+AF_VSOCK, and the additional MPTCP rule returns EPROTONOSUPPORT; io_uring returns
+ENOSYS for CRIU compatibility. Workloads may create ordinary UDP, IPv6 or Unix
+sockets, but only the router nftables rules decide what leaves the guest. Empty
+capabilities prevent raw/packet sockets; seccomp also denies mount and unshare and
+restricts clone's namespace flags. no_new_privs and cgroups remain in force. See
+[syscall policy](runtime.md#syscall-policy) for exact rules and provenance.
 
 ## Ownership and ordering
 
