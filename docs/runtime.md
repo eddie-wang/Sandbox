@@ -110,31 +110,42 @@ Workload namespaces are created by runc/CRIU; there is no host-network mode.
 
 The script fails rather than substituting a fake runtime/result. It exercises:
 
-1. Actual EROFS/shared-lower and private OverlayFS cold creates through the controller;
-   worker create replay/conflict handling and real argv exec. Independent commands
-   must have overlapping in-container monotonic execution intervals; same-sandbox
-   mutation is excluded. A fourth reservation is rejected by the worker. Incompatible,
-   digest-mismatched and symlinked template metadata fail before launch. A disconnected
-   command response can be retried without repeating its write.
+1. Actual EROFS/shared-lower and private OverlayFS blocking cold creates through the
+   controller, which assigns the returned ID (template-default and explicit resources);
+   direct worker same-ID replay/conflict handling and inline argv exec results.
+   Independent commands must have overlapping in-container monotonic execution
+   intervals; a conflicting same-sandbox exec/capture gets an immediate
+   `409 sandbox_busy`. A fourth reservation is rejected by the worker without writing
+   a record, and the controller reports `no_capacity`. Incompatible, symlinked,
+   unknown-field and (network) unauthorized/old-schema templates are rejected before
+   any record; a digest-mismatched artifact is a failed create naming its ID. A client
+   that disconnects mid-exec leaves the command to finish (or, on a bound violation,
+   the sandbox to be terminated) with full cleanup; a client that disconnects
+   mid-create (host helpers frozen) gets its unlearnable sandbox deleted with
+   `create_response_lost`; DELETE cancels an in-flight exec.
 2. Private write/copy-up and lower whiteout isolation between two cold sandboxes.
 3. Distinct PID/mount/network namespaces from each other and the host, only loopback
-   in the sandbox, UID/GID 65534, empty effective caps, no_new_privs, seccomp and
-   denied socket creation. Host cgroup memory/swap/CPU/pids settings are inspected.
+   in the sandbox, UID/GID 65534, empty effective caps, no_new_privs and an active
+   seccomp filter. Inside the sandbox `io_uring_setup` returns ENOSYS, an MPTCP
+   socket returns EPROTONOSUPPORT, a packet socket returns EPERM (no capability)
+   and IPv6 (and, when isolated, external IPv4) connects are unreachable. Host
+   cgroup memory/swap/CPU/pids settings are inspected.
 4. A CRIU checkpoint with **open upper and lower descriptors/mappings**, an in-memory
    counter and random nonce. Source recovery must preserve the nonce/state; a new
    container restores the same memory nonce, filesystem delta/whiteout and private
    network namespace, and writes independently of the source. Restored host PIDs
    must be in their own cgroups. This is a targeted file-identity check, not blanket
-   CRIU compatibility for all filesystem/syscall/application states. Two captures with
-   formerly ambiguous hyphen-paired IDs run concurrently into distinct, exclusively
-   created staging leaves and restore independently. A preexisting unacquired leaf
-   must remain untouched by a failed capture.
+   CRIU compatibility for all filesystem/syscall/application states. Capture returns
+   only after publication and source recovery. Two captures run concurrently into
+   distinct, exclusively created staging leaves and restore independently. A
+   preexisting unacquired leaf must remain untouched by a failed capture, and a warm
+   create with mismatching explicit resources is rejected.
 5. TTL cleanup, explicit deletion, successful exec descendant cleanup (including a
    child that closes its stdio), deadline-triggered whole-sandbox termination and
-   output-overflow termination with bounded output.
-6. One worker SIGKILL with a live owned source and a durably accepted, actually
-   running exec, then restart using the same root: records, pending operation,
-   exec child cgroup, processes and private mounts must reconcile. Retained warm artifacts
+   output-overflow termination with bounded output, reported inline.
+6. One worker SIGKILL with a live owned source and an actually running blocking exec,
+   then restart using the same root: records, exec child cgroup, processes and private
+   mounts must reconcile. Retained warm artifacts
    must still restore after source cleanup/restart. A second crash occurs with a
    host checkpoint helper paused in its owned cgroup before exec. A trusted sleeping fixture
    holding a staging FD is explicitly placed in that leaf to stand in for a surviving
@@ -144,7 +155,7 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    management tokens absent from service logs. Shared **artifacts**, records and
    fixture build inputs are intentionally retained for inspection, not mistaken for
    live-container leaks. `validation.json` retains actual overlap, namespace and
-   warm-state observations; records retain bounded operation results.
+   warm-state observations. Records hold lifecycle metadata only; results are inline.
 
 The script does not prove hostile-workload containment, full memory-pressure/pids
 exhaustion behavior, system-wide host cleanup under every crash point, arbitrary
@@ -192,6 +203,12 @@ no automatic eviction at all).
 - Literal IPv4 TCP allowlists and bounded text application HTTP are implemented;
   DNS, UDP, IPv6, domain/CIDR policy, per-create endpoint overrides and arbitrary
   established external TCP connection cloning remain unsupported.
+- Seccomp follows the AgentENV container pattern: default-allow, with only io_uring
+  (ENOSYS) and MPTCP sockets (EPROTONOSUPPORT) blocked because CRIU cannot dump them.
+  Isolation relies on namespaces, empty capabilities, no_new_privs, cgroups and
+  network policy. CRIU runs without `--ext-unix-sk` or `--tcp-established`: Unix
+  sockets connected outside the dumped tree and established TCP (including loopback
+  connections in isolated sandboxes, which have no TCP precheck) fail capture closed.
 - No S3 client, remote template transport, signed publisher provenance or two-node
   qualification. The local digest-bound layout is the serialized transfer boundary.
 - No per-sandbox writable-disk quota, automatic artifact GC or tombstone pruning.
@@ -237,8 +254,11 @@ exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
 socket creation, HTTP authentication/header stripping/path validation, text body,
 redirect refusal, timeout/output bounds, quiescent capture rejection of established
 TCP, source and child restored listening sockets/fresh egress, delayed namespace
-FD cleanup retry and HTTP-helper crash/restart cleanup. Namespace rules, addresses,
-identities and operation results are retained under the test-owned root. Fixtures
+FD cleanup retry and HTTP-helper crash/restart cleanup. Adding `--http-limits`
+also exercises the opt-in large ceilings: an 8 MiB inline response, two concurrent
+worst-case JSON-escaped 8 MiB results, a 16 KiB escaped body, a 31-second application
+deadline beyond `request_timeout_ms`, and TTL clamping. Namespace rules, addresses,
+identities and observations are retained under the test-owned root. Fixtures
 are original local code, not downloaded images. Test harness helpers are drained
 before pins/staging are discarded. Functional qualification on a development host
 does not establish hardened-host isolation or a production network deployment.

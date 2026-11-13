@@ -1,15 +1,15 @@
 use std::{sync::Arc, time::{Duration, Instant}};
 
-use axum::{Json, Router, extract::{Path, State, rejection::{JsonRejection, PathRejection}}, http::StatusCode, routing::{get, post}};
+use axum::{Json, Router, extract::{Path, State, rejection::{JsonRejection, PathRejection}}, http::StatusCode, response::{IntoResponse, Response}, routing::{get, post}};
 use serde_json::Value;
 use serde::Serialize;
 use tokio::{sync::RwLock, task::JoinSet};
 
 use crate::{
-    config::{ControllerConfig, WorkerEndpoint},
+    config::{ControllerConfig, ServerConfig, WorkerEndpoint},
     http::{self, ApiError},
     lifecycle,
-    model::{CaptureRequest, CreateRequest, ExecRequest, HttpRequest, WorkerStatus, sandbox_owner, valid_id},
+    model::{CaptureRequest, CreateSpec, ExecRequest, HttpRequest, WorkerStatus, sandbox_owner, valid_id},
     scheduler,
 };
 
@@ -39,11 +39,14 @@ struct Controller {
     endpoints: Arc<Vec<WorkerEndpoint>>,
     client: reqwest::Client,
     worker_token: Arc<String>,
-    application_http_limits: crate::config::ApplicationHttpLimits,
+    server: ServerConfig,
+    short_wait: Duration,
 }
 
 impl Controller {
-    // Copy cached worker observations, marking reachability and freshness from poll errors and age.
+    // The owner waits `wait` for its outcome; one request_timeout_ms of slack lets
+    // it report its own operation_timeout before this forward gives up.
+    fn operation_timeout(&self, wait: Duration) -> Duration { wait + self.server.timeout() }
     async fn snapshot(&self) -> Vec<NodeView> {
         let nodes = self.nodes.read().await;
         let now = Instant::now();
@@ -78,90 +81,143 @@ async fn status(State(controller): State<Controller>) -> Json<ControllerStatus> 
     })
 }
 
-// Validate the create request and check advisory capacity only on the owner named in its ID. Forward
-// to that owner without choosing another node; acceptance is not completion.
-async fn create(
-    State(controller): State<Controller>,
-    input: Result<Json<CreateRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let request = http::json(input)?;
-    if !request.valid() { return Err(http::invalid_input()); }
-    let owner = sandbox_owner(&request.sandbox_id).ok_or_else(http::invalid_input)?;
-    let nodes: Vec<_> = controller.snapshot().await.into_iter().filter(|n| n.node_id == owner).collect();
-    if scheduler::choose(&nodes, &request).is_none() {
-        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "no_ready_runtime", "Owner worker is not fresh, compatible and ready with advisory capacity"));
+// Definitive pre-launch rejections: the worker answered before creating any
+// resource or record. Safe to fail over with a new ID.
+const PRE_LAUNCH_REJECTIONS: &[&str] = &["busy", "admission_exhausted", "record_limit", "runtime_unavailable", "worker_unavailable", "template_unavailable"];
+const MAX_CREATE_ATTEMPTS: usize = 3;
+const MAX_SANDBOX_VIEW_BYTES: usize = 65_536;
+
+fn random_local_id() -> Result<String, ApiError> {
+    let mut bytes = [0u8; 16];
+    // Nonblocking after kernel entropy initialization; never reads a file.
+    if unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), libc::GRND_NONBLOCK) } != bytes.len() as isize {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "id_generation_failed", "Cannot generate a sandbox ID"));
     }
-    forward(&controller, owner, reqwest::Method::POST, "/v1/sandboxes", Some(serde_json::to_value(&request).map_err(|_| http::invalid_input())?)).await
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-// Extract a sandbox ID from the request path and reject IDs without a valid owner.
-fn path_id(path: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
+// An ambiguous create outcome names the generated ID so callers can GET/DELETE it.
+fn with_sandbox_id(status: StatusCode, mut body: Value, sandbox_id: &str) -> Response {
+    if let Some(object) = body.as_object_mut() { object.insert("sandbox_id".into(), Value::String(sandbox_id.into())); }
+    (status, Json(body)).into_response()
+}
+
+async fn create(State(c): State<Controller>, input: Result<Json<CreateSpec>, JsonRejection>) -> Result<Response, ApiError> {
+    let spec = http::json(input)?;
+    if !spec.valid() { return Err(http::invalid_input()); }
+    let nodes = c.snapshot().await;
+    let candidates: Vec<String> = scheduler::rank(&nodes, &spec).into_iter().take(MAX_CREATE_ATTEMPTS).map(str::to_owned).collect();
+    let wait = Duration::from_millis(c.server.operation_deadlines.create_ms);
+    // All attempts share one budget that ends a request_timeout_ms before this
+    // route's guard deadline, so a running attempt reports its ID, never a bare 408.
+    let budget_end = Instant::now() + c.operation_timeout(wait);
+    // template_unavailable is reported only if every candidate answered exactly that.
+    let mut only_template_rejections = !candidates.is_empty();
+    for owner in candidates {
+        let remaining = budget_end.saturating_duration_since(Instant::now());
+        // Too little budget left for another attempt: nothing was sent to it.
+        if remaining < c.server.timeout() { only_template_rejections = false; break; }
+        let sandbox_id = format!("{owner}.{}", random_local_id()?);
+        let body = serde_json::to_value(spec.clone().with_id(sandbox_id.clone())).map_err(|_| http::invalid_input())?;
+        match forward(&c, &owner, reqwest::Method::POST, "/v1/sandboxes", Some(body), remaining, MAX_SANDBOX_VIEW_BYTES).await {
+            Err(Forward::NotSent(_)) => { only_template_rejections = false; continue; }
+            Err(Forward::Lost(ApiError(status, code, message))) =>
+                return Ok(with_sandbox_id(status, serde_json::json!({"error":{"code":code,"message":message}}), &sandbox_id)),
+            Ok((status, body)) if status.is_success() => return Ok((status, Json(body)).into_response()),
+            Ok((_, body)) if body["error"]["code"].as_str().is_some_and(|code| PRE_LAUNCH_REJECTIONS.contains(&code)) => {
+                only_template_rejections &= body["error"]["code"] == "template_unavailable";
+                continue;
+            }
+            // Other 4xx answers created nothing: invalid input or template resource rules.
+            Ok((status, body)) if status.is_client_error() => return Ok((status, Json(body)).into_response()),
+            // Any other answer (including a failed launch) is final for this ID; never retry elsewhere.
+            Ok((status, body)) => return Ok(with_sandbox_id(status, body, &sandbox_id)),
+        }
+    }
+    if only_template_rejections {
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "template_unavailable", "No candidate worker holds a valid, compatible template with this ID"));
+    }
+    Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "no_capacity", "No fresh, ready worker admitted the sandbox"))
+}
+
+fn path_id(path: Result<Path<String>, PathRejection>) -> Result<(String, String), ApiError> {
     let Path(id) = path.map_err(|_| http::invalid_input())?;
-    if sandbox_owner(&id).is_none() { return Err(http::invalid_input()); }
-    Ok(id)
+    let owner = sandbox_owner(&id).ok_or_else(http::invalid_input)?.to_owned();
+    Ok((id, owner))
 }
-// Validate the sandbox ID and ask its owner for the current state.
-async fn get_sandbox(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let id = path_id(path)?;
-    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::GET, &format!("/v1/sandboxes/{id}"), None).await
+fn reply(result: Result<(StatusCode, Value), Forward>) -> Result<Response, ApiError> {
+    let (status, body) = result.map_err(Forward::error)?;
+    Ok((status, Json(body)).into_response())
 }
-// Validate the sandbox ID and forward deletion to its owner.
-async fn delete(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let id = path_id(path)?;
-    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"), None).await
+async fn get_sandbox(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
+    let (id, owner) = path_id(path)?;
+    reply(forward(&c, &owner, reqwest::Method::GET, &format!("/v1/sandboxes/{id}"), None, c.short_wait, MAX_SANDBOX_VIEW_BYTES).await)
 }
-// Validate command arguments and bounds, then forward exec to the sandbox owner for acceptance.
-async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let id = path_id(path)?;
+async fn delete(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
+    let (id, owner) = path_id(path)?;
+    let wait = Duration::from_millis(c.server.operation_deadlines.delete_ms);
+    reply(forward(&c, &owner, reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"), None, c.operation_timeout(wait), MAX_SANDBOX_VIEW_BYTES).await)
+}
+async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<Response, ApiError> {
+    let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
     if !request.valid() { return Err(http::invalid_input()); }
-    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
+    let wait = Duration::from_millis(request.timeout_ms + c.server.operation_deadlines.margin_ms);
+    let limit = request.max_result_bytes();
+    reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
 }
-// Validate application HTTP fields against controller limits and forward to the sandbox owner.
-async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let id = path_id(path)?;
+async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<Response, ApiError> {
+    let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
-    if !request.valid_for(&c.application_http_limits) { return Err(http::invalid_input()); }
-    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
+    if !request.valid_for(&c.server.application_http) { return Err(http::invalid_input()); }
+    let wait = Duration::from_millis(request.timeout_ms + c.server.operation_deadlines.margin_ms);
+    let limit = request.max_result_bytes();
+    reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
 }
-// Validate capture identifiers and forward the capture request to the sandbox owner.
-async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let id = path_id(path)?;
+async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<Response, ApiError> {
+    let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
-    if !valid_id(&request.template_id) || !valid_id(&request.operation_id) { return Err(http::invalid_input()); }
-    forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/capture"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
+    if !valid_id(&request.template_id) { return Err(http::invalid_input()); }
+    let wait = Duration::from_millis(c.server.operation_deadlines.capture_ms);
+    reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/capture"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), MAX_SANDBOX_VIEW_BYTES).await)
 }
-// Validate sandbox and operation IDs, then poll the owner's saved operation result.
-async fn operation(State(c): State<Controller>, path: Result<Path<(String, String)>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let Path((id, op)) = path.map_err(|_| http::invalid_input())?;
-    let owner = sandbox_owner(&id).ok_or_else(http::invalid_input)?;
-    if !valid_id(&op) { return Err(http::invalid_input()); }
-    forward(&c, owner, reqwest::Method::GET, &format!("/v1/sandboxes/{id}/operations/{op}"), None).await
+
+enum Forward {
+    // Nothing reached the owner; the caller may choose another node for a create.
+    NotSent(ApiError),
+    // The owner may have acted; exec/HTTP are not exactly-once, so read state.
+    Lost(ApiError),
 }
-// Require a configured owner with a fresh observation, then forward with worker credentials. Bound the
-// response and return its status and JSON; transport failures may hide an already accepted operation.
-async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or(http::invalid_input())?;
+impl Forward {
+    fn error(self) -> ApiError { match self { Self::NotSent(e) | Self::Lost(e) => e } }
+}
+
+// `timeout` covers the whole owner exchange; `limit` is the largest valid result body.
+async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &str, body: Option<Value>, timeout: Duration, limit: usize) -> Result<(StatusCode, Value), Forward> {
+    let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or(Forward::NotSent(http::invalid_input()))?;
     let nodes = c.snapshot().await;
     if !nodes.iter().any(|n| n.node_id == owner && n.fresh) {
-        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable", "Owner identity has no fresh validated observation"));
+        return Err(Forward::NotSent(ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable", "Owner identity has no fresh validated observation")));
     }
-    let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| http::invalid_input())?;
+    let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| Forward::NotSent(http::invalid_input()))?;
     url.set_path(path);
-    let mut request = c.client.request(method, url).bearer_auth(c.worker_token.as_str());
-    if let Some(body) = body { request = request.header("content-type", "application/json").body(serde_json::to_vec(&body).map_err(|_| http::invalid_input())?); }
-    let uncertain = || ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_response_unavailable", "Read state or retry the identical identifiers; an operation may already be accepted");
-    let mut response = request.send().await.map_err(|_| uncertain())?;
+    let mut request = c.client.request(method, url).bearer_auth(c.worker_token.as_str()).timeout(timeout);
+    if let Some(body) = body { request = request.header("content-type", "application/json").body(serde_json::to_vec(&body).map_err(|_| Forward::NotSent(http::invalid_input()))?); }
+    let lost = |timeout: bool| Forward::Lost(if timeout {
+        ApiError(StatusCode::GATEWAY_TIMEOUT, "owner_response_timeout", "Owner did not answer in time; the operation may continue there. Read sandbox state")
+    } else {
+        ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_response_unavailable", "Owner response was lost; the operation may have run. Read sandbox state")
+    });
+    let mut response = request.send().await.map_err(|e| lost(e.is_timeout()))?;
     let status = response.status();
-    let max_response = c.application_http_limits.response_reservation().max(8388608);
-    if response.content_length().is_some_and(|n| n > max_response as u64) { return Err(uncertain()); }
+    if response.content_length().is_some_and(|n| n > limit as u64) { return Err(lost(false)); }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
-        if bytes.len() + chunk.len() > max_response { return Err(uncertain()); }
+    while let Some(chunk) = response.chunk().await.map_err(|e| lost(e.is_timeout()))? {
+        if bytes.len() + chunk.len() > limit { return Err(lost(false)); }
         bytes.extend_from_slice(&chunk);
     }
-    let value = serde_json::from_slice(&bytes).map_err(|_| uncertain())?;
-    Ok((status, Json(value)))
+    let value = serde_json::from_slice(&bytes).map_err(|_| lost(false))?;
+    Ok((status, value))
 }
 
 // Start protected management routes and bounded worker polling with redirects and proxies disabled. On
@@ -181,7 +237,9 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         }).collect())),
         freshness: Duration::from_millis(config.poll.freshness_ms),
         endpoints: Arc::new(config.workers.clone()), client: client.clone(), worker_token: Arc::new(worker_token),
-        application_http_limits: config.server.application_http.clone(),
+        server: config.server.clone(),
+        // Plain reads stay within the short route deadline.
+        short_wait: Duration::from_millis(config.poll.timeout_ms.min(config.server.request_timeout_ms / 2)),
     };
     let router = Router::new()
         .route("/healthz", get(|| async { Json(lifecycle::Health { service: "controller", live: true }) }))
@@ -191,14 +249,13 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         .route("/v1/sandboxes/{id}/exec", post(exec))
         .route("/v1/sandboxes/{id}/http", post(application_http))
         .route("/v1/sandboxes/{id}/capture", post(capture))
-        .route("/v1/sandboxes/{id}/operations/{op}", get(operation))
         .with_state(controller.clone());
-    let app = http::protect(router, &config.server, token);
+    let app = http::protect(router, &config.server, token, 2);
     let listener = tokio::net::TcpListener::bind(config.server.address(8080)).await
         .map_err(|_| "cannot bind controller listener")?;
     let worker_token = controller.worker_token.clone();
     let poller = tokio::spawn(poll(controller, config, client, worker_token));
-    println!("controller listening; stable owner routing enabled");
+    println!("controller listening; controller-assigned placement and ID-prefix routing enabled");
     let result = axum::serve(listener, app).with_graceful_shutdown(http::shutdown()).await;
     poller.abort();
     let _ = poller.await;

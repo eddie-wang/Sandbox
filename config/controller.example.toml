@@ -4,6 +4,9 @@ listen = "127.0.0.1:8080"
 max_in_flight = 64
 request_timeout_ms = 5000
 max_body_bytes = 16384
+# Blocking requests hold a permit while waiting; keep max_in_flight above the
+# workers' combined operation pools. Optional [server.operation_deadlines] and
+# [server.application_http] must match the workers' values.
 
 [auth]
 env = "SANDBOX_CONTROLLER_TOKEN"

@@ -20,6 +20,8 @@ struct Limits {
     permits: Arc<Semaphore>,
     max_body_bytes: usize,
     timeout: Duration,
+    server: ServerConfig,
+    hops: u32,
 }
 
 pub struct ApiError(pub StatusCode, pub &'static str, pub &'static str);
@@ -57,8 +59,9 @@ pub fn json<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     input.map(|Json(value)| value).map_err(|_| invalid_input())
 }
 
-// Wrap management routes with authentication and request bounds, plus a safe unknown-route response.
-pub fn protect(router: Router, config: &ServerConfig, token: String) -> Router {
+// `hops` is 1 on a worker and 2 on the controller: each forwarding layer gets one
+// extra request_timeout_ms so the inner layer reports its own timeout first.
+pub fn protect(router: Router, config: &ServerConfig, token: String, hops: u32) -> Router {
     router
         .fallback(|| async {
             ApiError(StatusCode::NOT_FOUND, "not_found", "Unknown API route")
@@ -68,6 +71,8 @@ pub fn protect(router: Router, config: &ServerConfig, token: String) -> Router {
             permits: Arc::new(Semaphore::new(config.max_in_flight)),
             max_body_bytes: config.max_body_bytes,
             timeout: config.timeout(),
+            server: config.clone(),
+            hops,
         }, guard))
 }
 
@@ -89,23 +94,26 @@ async fn guard(State(limits): State<Limits>, request: Request, next: Next) -> Re
     let Ok(_permit) = limits.permits.clone().try_acquire_owned() else {
         return ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy", "Request concurrency limit reached").into_response();
     };
-    let response = tokio::time::timeout(limits.timeout, async {
-        let (parts, body) = request.into_parts();
-        if parts.headers.get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| length > limits.max_body_bytes as u64)
-        {
-            return ApiError(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", "Request body limit exceeded").into_response();
-        }
-        let bytes = match to_bytes(body, limits.max_body_bytes).await {
-            Ok(bytes) => bytes,
-            Err(_) => return ApiError(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", "Request body unavailable or exceeds limit").into_response(),
-        };
-        next.run(Request::from_parts(parts, Body::from(bytes))).await
-    }).await;
-    let mut response = response.unwrap_or_else(|_| {
-        ApiError(StatusCode::REQUEST_TIMEOUT, "request_timeout", "Request deadline exceeded").into_response()
-    });
+    let handler_deadline = limits.server.route_wait(request.method(), request.uri().path())
+        .map_or(limits.timeout, |wait| wait + limits.timeout * limits.hops);
+    let (parts, body) = request.into_parts();
+    if parts.headers.get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limits.max_body_bytes as u64)
+    {
+        return ApiError(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", "Request body limit exceeded").into_response();
+    }
+    let timed_out = || ApiError(StatusCode::REQUEST_TIMEOUT, "request_timeout", "Request deadline exceeded").into_response();
+    // The body deadline is always short; only the handler wait is route-specific.
+    let bytes = match tokio::time::timeout(limits.timeout, to_bytes(body, limits.max_body_bytes)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return ApiError(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", "Request body unavailable or exceeds limit").into_response(),
+        Err(_) => return timed_out(),
+    };
+    // Dropping a handler future never cancels worker-owned jobs (an undelivered
+    // create is deleted as create_response_lost); see engine.rs.
+    let mut response = tokio::time::timeout(handler_deadline, next.run(Request::from_parts(parts, Body::from(bytes)))).await
+        .unwrap_or_else(|_| timed_out());
     response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
 }

@@ -86,7 +86,7 @@ def main():
     if "--inside" not in args:
         before = inventory()
         env = dict(os.environ, SANDBOX_TEST_PARENT_NETNS=os.readlink("/proc/self/ns/net"))
-        result = subprocess.run(["unshare", "--mount", "--net", "--fork", sys.executable, __file__, "--inside", *args], env=env, timeout=900)
+        result = subprocess.run(["unshare", "--mount", "--net", "--fork", sys.executable, __file__, "--inside", *args], env=env, timeout=1500)
         after = inventory()
         # Link counters may change, but topology/address/rules/forwarding must not.
         if before != after:
@@ -130,7 +130,7 @@ def main():
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         assert select.select([peer.stdout], [], [], 5)[0] and peer.stdout.readline() == b"READY\n", "PMTU peer did not start"
         env = dict(os.environ, SANDBOX_TEST_OUTER_NETNS=os.readlink("/proc/self/ns/net"))
-        result = subprocess.run([sys.executable, str(Path(__file__).with_name("runtime_smoke.py")), "--network", *args], env=env, timeout=800)
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name("runtime_smoke.py")), "--network", *args], env=env, timeout=1400)
     finally:
         if peer is not None:
             peer.terminate()

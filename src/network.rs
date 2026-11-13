@@ -153,7 +153,7 @@ impl Native {
         let (_, slot, _) = self.network_names(id);
         let output = self.helpers.run(self.tool("ip")?, &[
             "netns".into(), "exec".into(), slot, format!("/proc/{}/exe", std::process::id()), "internal-http".into(), file.display().to_string()],
-            Duration::from_millis(request.timeout_ms + 1000), request.max_response_bytes as usize * 6 + 8192, false, &self.search_path);
+            Duration::from_millis(request.timeout_ms + 1000), request.max_result_bytes(), false, &self.search_path);
         let _ = fs::remove_file(file);
         let out = output?;
         if out.interrupted || out.exit_code != Some(0) { return Err("application_http_failed_or_bounded"); }
@@ -185,7 +185,7 @@ pub fn tcp_check_helper() -> Result<()> {
 // requests.
 pub fn http_helper(path: &Path) -> Result<()> {
     // Covers the opt-in 16 KiB text body after worst-case JSON escaping,
-    // plus bounded path/headers/operation metadata.
+    // plus bounded path/headers metadata.
     let request: HttpRequest = storage::read_json(path, 131072)?;
     if !request.valid() { return Err("invalid_http_request"); }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "http_runtime_failed")?;

@@ -35,6 +35,7 @@ S3 transfer is **deferred**, not a prerequisite. An administrator currently plac
 
 - Management requests require authentication. The service does not provide built-in TLS, user accounts or per-user permissions; an operator must supply the appropriate access boundary.
 - A container shares the host's Linux kernel. Its isolation is not the same as a separate virtual machine, and hostile-workload security has not been fully qualified.
+- Isolation relies on Linux namespaces, an unprivileged user with no capabilities, `no_new_privs`, resource groups and network policy. The system-call filter follows the AgentENV container pattern: everything is allowed except io_uring and MPTCP sockets, which the checkpoint tool cannot save.
 - Resource limits, private files and network restrictions must be in place before application code starts.
 - A saved process and its saved file changes must come from the same capture. The worker rejects missing, damaged or incompatible template files instead of trying to guess how to use them.
 - Every created resource must belong to a saved sandbox record, so the worker can find and clean it up after a restart.
@@ -42,7 +43,7 @@ S3 transfer is **deferred**, not a prerequisite. An administrator currently plac
 
 ## Architecture
 
-There is one executable, `sandboxd`, which can run in two roles. The **controller** receives client requests and forwards them to the right node. Each node has a **worker** that owns its containers, checks its resource budget and performs the requested work.
+There is one executable, `sandboxd`, which can run in two roles. The **controller** receives client requests, chooses a node for each new sandbox and forwards later requests to that node. Each node has a **worker** that owns its containers, checks its resource budget and performs the requested work. Clients talk only to the controller.
 
 ```text
 Application / client
@@ -52,6 +53,7 @@ Application / client
 Controller
   knows the configured workers
   checks their recent status
+  picks a node for each create
   forwards to the sandbox's owner
         |
         +-------------------------+
@@ -78,17 +80,18 @@ The controller does not launch containers itself. The worker uses existing Linux
 
 ### 1. Creating a sandbox
 
-Suppose a client wants to create `node-a.example` from template `example-template`.
+Suppose a client wants a sandbox from template `example-template`. It sends only the template name, a lifetime and, optionally, memory and CPU. Omitted values come from the template.
 
-1. **The client chooses the owner.** It reads the controller's status and chooses node A. The `node-a` part of the sandbox ID records that choice. Automatic node selection is **not** connected to the create API yet.
-2. **The controller validates the request.** It checks authentication, request fields and the owner's recent status. It checks the requested platform/runtime and whether the owner's reported budget appears to have enough room.
-3. **The controller forwards the request to worker A.** Worker addresses come from administrator configuration, not the caller. The controller uses its separate worker credential.
-4. **Worker A makes the final resource decision.** The controller's information may already be out of date. The worker checks its own reservations, container count and available background-work slots. It saves a record of the request before creating external resources. A rejected resource request can be saved as a failed create without launching anything.
-5. **The client gets an acknowledgement.** `202 Accepted` means the worker saved the request. It does **not** mean the container is running, or even that creation will succeed. The client checks the sandbox's state in subsequent requests.
-6. **Background work checks the template.** It verifies the files and their checksums, platform compatibility, requested limits and network policy. It acquires the shared read-only base mount.
-7. **The worker prepares this sandbox's private environment.** It creates the writable directories, mounts OverlayFS, installs resource limits and any permitted networking, and writes the container's configuration file.
-8. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions.
-9. **The worker verifies the container is running and saves the result.** The client can now observe `running`, or a failure that explains why it did not start.
+1. **The controller validates the request.** It checks authentication and the request fields.
+2. **The controller chooses a node.** It considers every worker with a recent, healthy status and orders them by how full their promised budgets are, least full first. The client never names a node.
+3. **The controller creates the sandbox ID.** The ID starts with the chosen node's name followed by a random part, for example `node-a.3f0c…`. Clients treat it as an opaque name. Because the owner is part of the ID, later requests reach the right worker without a lookup table, even after the controller restarts.
+4. **The controller forwards the request to that worker.** Worker addresses come from administrator configuration, not the caller. The controller uses its separate worker credential.
+5. **The worker makes the final decision.** The controller's information may already be out of date. The worker checks that it has a valid, compatible copy of the template, then its own reservations, container count and background-work slots. It saves a record before creating anything outside that record. If capacity has run out, it says so without saving anything.
+6. **If the worker said no before starting anything, the controller tries another node.** Examples are "no capacity", "busy" and "I don't have a usable copy of this template". It makes at most three attempts, each with a new ID. If the outcome is uncertain — the connection broke, the wait ran out, or the worker failed after it started — the controller does **not** try elsewhere. It reports the error together with the ID, so the client can look at or delete that sandbox.
+7. **Background work checks the template files.** It verifies their checksums and acquires the shared read-only base mount.
+8. **The worker prepares this sandbox's private environment.** It creates the writable directories, mounts OverlayFS, installs resource limits and any permitted networking, and writes the container's configuration file.
+9. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions.
+10. **The worker verifies the container is running, and only then does the client get its answer.** The response (`201 Created`) contains the new ID and `running`. If creation failed, the worker first cleans up and the client receives the reason.
 
 The status budget counts **resources already promised to sandboxes**, not a live measurement of free host RAM. The controller's check is an early filter; it cannot reserve resources on a worker. For example, two requests can pass the same cached check, but the worker must still prevent them from reserving the same remaining capacity.
 
@@ -119,10 +122,10 @@ The current template format references **one base image**. Separate, independent
 
 There are two different operations:
 
-- **Run a command:** the client submits an argument list such as `["/fixture", "counter"]`. The worker runs it inside the container with `runc exec`. It does not pass the arguments through a host shell. Each exec starts a new command process; state that must survive calls belongs in files or an application already running in the sandbox. The worker collects the exit code and bounded output, saves them, and the client retrieves the result.
-- **Make an application HTTP request:** the client submits an approved service port, a method, a relative path and an optional text body. A worker-controlled helper connects to that sandbox's application. It saves the HTTP status and text response for later retrieval. This does not run `runc exec`, and it is not an arbitrary-URL proxy.
+- **Run a command:** the client submits an argument list such as `["/fixture", "counter"]`. The worker runs it inside the container with `runc exec`. It does not pass the arguments through a host shell. Each exec starts a new command process; state that must survive calls belongs in files or an application already running in the sandbox. The response contains the exit code and bounded output.
+- **Make an application HTTP request:** the client submits an approved service port, a method, a relative path and an optional text body. A worker-controlled helper connects to that sandbox's application. The response contains the application's HTTP status and text body. This does not run `runc exec`, and it is not an arbitrary-URL proxy.
 
-Both use the same request-ID and polling pattern as other background operations. Only one such operation runs in a sandbox at a time, but operations in different sandboxes can run concurrently.
+Every request waits for its real result, like an ordinary function call; nothing is saved for later retrieval. Only one such operation runs in a sandbox at a time. A second request for a busy sandbox is refused immediately rather than queued. Operations in different sandboxes run at the same time.
 
 The worker limits how many operations can run at once. Creating/restoring containers and capturing templates have an additional concurrency limit. Slow mounts, commands and file copies run separately from the short checks that reserve resources and update records.
 
@@ -143,17 +146,17 @@ Capture works as follows:
 
 Capture therefore interrupts the source briefly; it is not a zero-downtime fork. The saved private changes remain private changes: they are not turned into a replacement base layer.
 
-To create a child, the client makes another create request with a new sandbox ID and the warm template ID. The worker creates new private directories, reconstructs the filesystem and limits, and invokes `runc restore`. Source and child then continue independently.
+To create a child, the client makes another create request naming the warm template; it gets a new sandbox ID, and the controller places it on a node holding a compatible copy of that template. The worker creates new private directories, reconstructs the filesystem and limits, and invokes `runc restore`. Source and child then continue independently.
 
 The worker checks the architecture, kernel, CPU features, runtime versions and required configuration. Successful tests on one machine do not prove a template can be restored on every other machine. A target node must already have the required artifacts; the service does not fetch them from S3.
 
-### 5. Retrying requests and cleaning up
+### 5. Waiting, lost answers and cleaning up
 
-A client supplies an operation ID for commands, application HTTP and capture. Repeating the same ID with the same request refers to the existing operation rather than starting another one; the client still polls for its result. Reusing the ID with different input is an error.
+Each kind of request has a time limit long enough for that operation: a command's own time limit plus a margin for cleanup, or configured limits for creating, capturing and deleting. If the limit passes, the client gets a timeout error.
 
-**A lost HTTP response does not cancel work already accepted by the worker.** Read the saved state or retry with the original IDs and input. Do not immediately choose a different node or ID: the original request may already be running. Once a create is confirmed failed, correct the underlying problem and use a new sandbox ID. Deleted and failed IDs are retained and cannot be reused.
+**A dropped connection or timeout does not stop or abandon work.** The worker, not the client's connection, owns the work. A command, HTTP call, capture or delete finishes or fails normally, including cleanup and lifetime limits, and its result is discarded. The client can read the sandbox's state afterward. A create is the exception: if its answer cannot be delivered, nobody knows the new ID, so the worker deletes that sandbox.
 
-This is not an exactly-once guarantee for application side effects. An application may have processed an HTTP request just before the worker crashed, even if no completed result was saved.
+Without operation IDs, retries are not deduplicated. If a create's answer is lost and the client asks again, it may get a second sandbox. The first is normally deleted as described above; in the rare case where the answer was lost after the worker handed it over, it ends when its lifetime expires, or the client can delete it using the ID in the error. A repeated command or HTTP request runs again; an application may already have acted on the first one. Delete is safe to repeat. Deleted and failed IDs are kept and never reused.
 
 Cleanup happens when the client deletes a sandbox, its lifetime expires, or the worker restarts:
 
@@ -161,11 +164,11 @@ Cleanup happens when the client deletes a sandbox, its lifetime expires, or the 
 - Remove its runtime state, private mounts, network connections and private files.
 - Release its reserved capacity only after cleanup succeeds.
 
-If cleanup fails, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
+A delete request waits for cleanup to finish; if a command is running in that sandbox, delete stops it first. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
 
-A separate lifetime monitor can stop an expired sandbox even while a long background operation is running. The requested lifetime starts when the create request is saved, not when application startup finishes.
+A separate lifetime monitor can stop an expired sandbox even while a long background operation is running. The requested lifetime starts when the worker accepts the create, not when application startup finishes.
 
-**Worker restart does not resume or adopt old containers.** It reads the saved records, stops leftover work, marks interrupted operations as failed and cleans up. Host-side helper programs are tracked separately so that a dead worker does not leave an unowned mount or runtime command behind.
+**Worker restart does not resume or adopt old containers.** It reads the saved records, stops leftover work and cleans up. Requests that were waiting lose their answers. Host-side helper programs are tracked separately so that a dead worker does not leave an unowned mount or runtime command behind.
 
 ### 6. Network access is off unless explicitly allowed
 
@@ -188,11 +191,11 @@ Low-level packet rules and the tested fix for paths with smaller packet-size lim
 | [`main.rs`](../src/main.rs) | Chooses controller, worker or read-only preflight mode. |
 | [`config.rs`](../src/config.rs) | Loads and checks administrator settings and credential sources. |
 | [`http.rs`](../src/http.rs) | Checks management authentication and request size/time limits. |
-| [`controller.rs`](../src/controller.rs) | Polls workers, handles client requests and forwards to the owner. |
-| [`scheduler.rs`](../src/scheduler.rs) | Checks candidate-node readiness and budget. Create currently supplies only the caller-selected owner. |
-| [`worker.rs`](../src/worker.rs) | Receives node-local API requests and returns saved state/results. |
+| [`controller.rs`](../src/controller.rs) | Polls workers, places new sandboxes, generates their IDs and forwards requests to the owner. |
+| [`scheduler.rs`](../src/scheduler.rs) | Orders ready nodes by how full their promised budgets are, for create placement. |
+| [`worker.rs`](../src/worker.rs) | Receives node-local API requests, waits for each result and returns it. |
 | [`model.rs`](../src/model.rs) | Defines request/status fields and checks valid values. |
-| [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work, expiry and restart cleanup. |
+| [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work and its results, expiry and restart cleanup. |
 | [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU. |
 | [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time, and safely writes saved JSON records. |
 | [`storage.rs`](../src/storage.rs) | Checks template files, handles file archives and publishes complete templates. |
@@ -216,17 +219,16 @@ The main API operations are:
 | Request | Purpose |
 | --- | --- |
 | `GET /v1/status` | Inspect worker budgets/readiness, or the controller's recent observations. |
-| `POST /v1/sandboxes` | Request a new sandbox from a cold or warm template. |
+| `POST /v1/sandboxes` | Create a sandbox from a cold or warm template; returns its ID once running. |
 | `GET /v1/sandboxes/{id}` | Read its state and expiry time. |
-| `POST /v1/sandboxes/{id}/exec` | Request a command inside it. |
-| `POST /v1/sandboxes/{id}/http` | Request an HTTP call to its application. |
-| `POST /v1/sandboxes/{id}/capture` | Save its initialized state as a new template. |
-| `GET /v1/sandboxes/{id}/operations/{operation_id}` | Read an operation's status and result. |
-| `DELETE /v1/sandboxes/{id}` | Request cleanup; poll until it is complete. |
+| `POST /v1/sandboxes/{id}/exec` | Run a command inside it; returns exit code and output. |
+| `POST /v1/sandboxes/{id}/http` | Call its application over HTTP; returns status and body. |
+| `POST /v1/sandboxes/{id}/capture` | Save its initialized state as a new template; returns after the source is running again. |
+| `DELETE /v1/sandboxes/{id}` | Clean it up; returns when cleanup is complete. |
 
 Only `/healthz` is public, and it reports that the service is alive—not that it can run workloads. See the [API reference](../docs/api.md) for exact fields, limits, response states and retry rules.
 
-There is no full E2B-compatible API, public fork/pause/resume API, automatic node assignment, automatic template cleanup, writable-disk quota or deletion of old request records. Operators must monitor disk usage and retained artifacts. The [storage reference](../docs/contracts.md) describes the exact saved-file format.
+There is no full E2B-compatible API, public fork/pause/resume API, automatic template cleanup, writable-disk quota or deletion of old request records. Operators must monitor disk usage and retained artifacts. The [storage reference](../docs/contracts.md) describes the exact saved-file format.
 
 ## Testing
 
@@ -236,7 +238,7 @@ Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linu
 
 - Cold startup, private file changes, capture, source recovery and independent restore.
 - Saved open files and memory mappings in that fixture.
-- Concurrent operations in different sandboxes, safe retries, lifetime expiry, deletion and worker-restart cleanup.
+- Waiting requests that return real results, concurrent operations in different sandboxes, immediate refusal of a conflicting request, cleanup after a client disconnects mid-command or mid-create, lifetime expiry, deletion and worker-restart cleanup.
 - Allowed and denied TCP connections, application HTTP limits, restored listeners and new connections after restore.
 - Cleanup of test-owned processes, mounts, namespaces, loop devices and resource groups.
 

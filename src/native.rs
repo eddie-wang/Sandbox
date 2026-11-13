@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, time::Duration};
 use serde::Serialize;
 use serde_json::{Value, json};
-use crate::{config::NativeConfig, model::CreateRequest, process::{self, Result}, storage::{self, Compatibility, Manifest}};
+use crate::{config::NativeConfig, model::SandboxSpec, process::{self, Result}, storage::{self, Compatibility, Manifest}};
 
 #[derive(Clone, Serialize)]
 pub struct Check { pub name: String, pub ok: bool }
@@ -22,6 +22,9 @@ pub struct Native {
     pub helpers: process::Helpers,
     _lock: File,
 }
+
+// Each sandbox runs at most one exec at a time, in this fixed child cgroup.
+pub const EXEC_CGROUP: &str = "exec";
 
 const TOOL_NAMES: &[&str] = &["runc", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip"];
 
@@ -130,7 +133,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let features = cpu.lines().find(|l| l.starts_with("flags") || l.starts_with("Features"))?.split_once(':')?.1.trim();
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             cpu_features_sha256: storage::digest(features.as_bytes()), runc_version: version("runc")?, criu_version: version("criu")?,
-            layout: "erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v3".to_owned() })
+            layout: "erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v4-agentenv".to_owned() })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
     Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility }
@@ -182,9 +185,19 @@ impl Native {
     // process limit.
     pub fn template(&self, id: &str) -> Result<Manifest> {
         let m = storage::load(self.root(), id, &self.compatibility, self.config.max_artifact_bytes)?;
+        self.template_usable(&m)?;
+        Ok(m)
+    }
+    // Admission-time check: this worker could launch the template, without hashing artifacts.
+    pub fn template_manifest(&self, id: &str) -> Result<Manifest> {
+        let m = storage::load_manifest(self.root(), id, &self.compatibility)?;
+        self.template_usable(&m)?;
+        Ok(m)
+    }
+    fn template_usable(&self, m: &Manifest) -> Result<()> {
         self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
-        Ok(m)
+        Ok(())
     }
     // Check that no network, private storage, runtime state or resource group already uses this sandbox
     // ID.
@@ -204,10 +217,7 @@ impl Native {
         }
         storage::verify_lower(&lower, &image)
     }
-    // Build a private writable overlay, extracting both archives anew for a checkpoint restore. Apply
-    // resource limits and template networking before writing and checking the execution specification.
-    // Recheck cancellation and expiry, then cold-start or restore the sandbox and confirm it is running.
-    pub fn prepare(&self, request: &CreateRequest, manifest: &Manifest, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+    pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         let id = &request.sandbox_id;
         let private = self.private(id);
         storage::private_dir(&private)?;
@@ -237,8 +247,7 @@ impl Native {
         else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; }
         self.ensure_running(id)
     }
-    // Create a sandbox resource group and set memory, swap, process-count and CPU limits.
-    fn cgroup(&self, request: &CreateRequest) -> Result<()> {
+    fn cgroup(&self, request: &SandboxSpec) -> Result<()> {
         let p = Path::new(&self.config.cgroup_parent).join(&request.sandbox_id);
         fs::create_dir(&p).map_err(|_| "cgroup_create_failed")?;
         for (name, value) in [("memory.max", (request.memory_mib * 1048576).to_string()), ("memory.swap.max", "0".into()),
@@ -247,10 +256,7 @@ impl Native {
         }
         Ok(())
     }
-    // Write the worker-owned execution and checkpoint settings, including private storage and namespaces.
-    // Apply restricted process privileges, devices and system calls, using the template's prepared network
-    // namespace when allowed.
-    fn write_spec(&self, request: &CreateRequest, manifest: &Manifest) -> Result<()> {
+    fn write_spec(&self, request: &SandboxSpec, manifest: &Manifest) -> Result<()> {
         let private = self.private(&request.sandbox_id);
         // Request-specific CRIU options are worker-authored. Administrator-owned
         // system CRIU configuration is part of the trusted host prerequisites.
@@ -282,7 +288,7 @@ impl Native {
                         {"allow":true,"type":"c","major":1,"minor":9,"access":"rw"}]},
                 "maskedPaths":["/proc/acpi","/proc/asound","/proc/kcore","/proc/keys","/proc/latency_stats","/proc/timer_list","/proc/timer_stats","/proc/sched_debug","/proc/scsi","/proc/interrupts"],
                 "readonlyPaths":["/proc/bus","/proc/fs","/proc/irq","/proc/sys","/proc/sysrq-trigger"],
-                "seccomp": seccomp(!matches!(manifest.network, crate::model::NetworkPolicy::Isolated))
+                "seccomp": seccomp()
             }
         });
         if !matches!(manifest.network, crate::model::NetworkPolicy::Isolated) {
@@ -333,9 +339,7 @@ impl Native {
             "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
         self.ensure_running(id)
     }
-    // Recreate missing source resource limits, reject expiry or cancellation, then restore the captured
-    // source.
-    pub fn restore_source(&self, request: &CreateRequest, images: &Path, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+    pub fn restore_source(&self, request: &SandboxSpec, images: &Path, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         if !Path::new(&self.config.cgroup_parent).join(&request.sandbox_id).exists() { self.cgroup(request)?; }
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
         self.restore(&request.sandbox_id, images)
@@ -347,13 +351,11 @@ impl Native {
         if !self.root().join("runc").join(id).exists() { return Ok(()); }
         self.runc_checked(vec!["delete".into(), id.into()]).map_err(|_| "checkpoint_source_delete_failed")
     }
-    // Create a child resource group to track one exec operation and its descendants.
-    pub fn create_exec_cgroup(&self, id: &str, operation: &str) -> Result<()> {
-        fs::create_dir(Path::new(&self.config.cgroup_parent).join(id).join(format!("exec-{operation}"))).map_err(|_| "exec_cgroup_create_failed")
+    pub fn create_exec_cgroup(&self, id: &str) -> Result<()> {
+        fs::create_dir(Path::new(&self.config.cgroup_parent).join(id).join(EXEC_CGROUP)).map_err(|_| "exec_cgroup_create_failed")
     }
-    // Kill an exec operation's descendants, wait briefly for the group to empty, then remove it.
-    pub fn cleanup_exec_cgroup(&self, id: &str, operation: &str) -> Result<()> {
-        let path = Path::new(&self.config.cgroup_parent).join(id).join(format!("exec-{operation}"));
+    pub fn cleanup_exec_cgroup(&self, id: &str) -> Result<()> {
+        let path = Path::new(&self.config.cgroup_parent).join(id).join(EXEC_CGROUP);
         if !path.exists() { return Ok(()); }
         fs::write(path.join("cgroup.kill"), "1").map_err(|_| "exec_cgroup_kill_failed")?;
         let start = std::time::Instant::now();
@@ -363,17 +365,14 @@ impl Native {
         }
         fs::remove_dir(path).map_err(|_| "exec_cgroup_remove_failed")
     }
-    // Require healthy helper cleanup before killing the sandbox and its exec descendants. Remove owned
-    // runtime and network state, unmount its writable root and delete private files; stop on cleanup
-    // errors.
-    pub fn cleanup(&self, id: &str, operations: &[String]) -> Result<()> {
+    pub fn cleanup(&self, id: &str) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
         let cgroup = Path::new(&self.config.cgroup_parent).join(id);
         if cgroup.exists() {
             fs::write(cgroup.join("cgroup.kill"), "1").map_err(|_| "cgroup_kill_failed")?;
         }
-        for operation in operations { self.cleanup_exec_cgroup(id, operation)?; }
+        self.cleanup_exec_cgroup(id)?;
         let state_dir = self.root().join("runc").join(id);
         if state_dir.exists() { self.runc_checked(vec!["delete".into(), "--force".into(), id.into()])?; }
         if cgroup.exists() {
@@ -410,29 +409,19 @@ impl Native {
     }
 }
 
-// Build a deny-by-default system-call policy with a restricted process-creation fallback. Only the
-// network-enabled profile permits filtered IPv4 TCP sockets and related socket operations.
-fn seccomp(network: bool) -> Value {
-    // Small native-tool profile, not a universal application compatibility claim.
-    // Namespace changes, mount, ptrace, bpf, perf and io_uring are absent.
-    // Only the explicit network profile adds filtered TCP socket creation. Unknown syscalls fail EPERM rather than default-allow.
-    let calls = "read write readv writev pread64 pwrite64 preadv pwritev close close_range lseek open openat openat2 creat fstat stat lstat newfstatat statx statfs fstatfs access faccessat faccessat2 readlink readlinkat getdents getdents64 dup dup2 dup3 fcntl ioctl flock fsync fdatasync sync_file_range truncate ftruncate fallocate rename renameat renameat2 unlink unlinkat mkdir mkdirat rmdir link linkat symlink symlinkat chmod fchmod fchmodat chown fchown lchown fchownat umask utime utimes futimesat utimensat getxattr lgetxattr fgetxattr listxattr llistxattr flistxattr setxattr lsetxattr fsetxattr removexattr lremovexattr fremovexattr mmap mprotect munmap mremap madvise mincore brk msync mlock munlock mlockall munlockall rt_sigaction rt_sigprocmask rt_sigreturn rt_sigsuspend rt_sigtimedwait rt_sigpending sigaltstack kill tkill tgkill restart_syscall nanosleep clock_nanosleep clock_gettime clock_getres gettimeofday time times getpid getppid getpgrp gettid getuid geteuid getgid getegid getgroups getresuid getresgid getcwd chdir fchdir uname sysinfo getrlimit setrlimit prlimit64 getrusage sched_yield sched_getaffinity sched_setaffinity sched_getparam sched_getscheduler sched_get_priority_max sched_get_priority_min getpriority setpriority arch_prctl prctl set_tid_address set_robust_list get_robust_list futex futex_waitv rseq membarrier fork vfork execve execveat wait4 waitid exit exit_group pipe pipe2 poll ppoll select pselect6 epoll_create epoll_create1 epoll_ctl epoll_wait epoll_pwait epoll_pwait2 eventfd eventfd2 timerfd_create timerfd_settime timerfd_gettime signalfd signalfd4 getrandom memfd_create sendfile copy_file_range splice tee vmsplice fadvise64 getcpu getitimer setitimer alarm capget";
-    let mut profile = json!({"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,
-        "syscalls":[{"names":calls.split_whitespace().collect::<Vec<_>>(),"action":"SCMP_ACT_ALLOW"},
-            {"names":["clone"],"action":"SCMP_ACT_ALLOW","args":[{"index":0,"value":2114060288u64,"valueTwo":0,"op":"SCMP_CMP_MASKED_EQ"}]},
-            // clone3 cannot filter its pointed-to flags. ENOSYS permits libc fallback.
-            {"names":["clone3"],"action":"SCMP_ACT_ERRNO","errnoRet":38}]});
-    if network {
-        let rules = profile["syscalls"].as_array_mut().unwrap();
-        rules.push(json!({"names":["connect","bind","listen","accept","accept4","getsockname","getpeername","getsockopt","setsockopt","shutdown","sendto","recvfrom","sendmsg","recvmsg","sendmmsg","recvmmsg"],"action":"SCMP_ACT_ALLOW"}));
-        // AF_INET + SOCK_STREAM only (CLOEXEC/NONBLOCK flags accepted), protocol
-        // zero or TCP. No AF_INET6/UNIX/PACKET/NETLINK, UDP or raw sockets.
-        for protocol in [0, 6] {
-            rules.push(json!({"names":["socket"],"action":"SCMP_ACT_ALLOW","args":[
-                {"index":0,"value":2,"op":"SCMP_CMP_EQ"},
-                {"index":1,"value":4294440959u64,"valueTwo":1,"op":"SCMP_CMP_MASKED_EQ"},
-                {"index":2,"value":protocol,"op":"SCMP_CMP_EQ"}]}));
-        }
-    }
-    profile
+fn seccomp() -> Value {
+    // Same pattern as the AgentENV container backend: default-allow, with
+    // CRIU checkpointability guards only. CRIU cannot dump io_uring instances or
+    // MPTCP sockets, so these return ENOSYS/EPROTONOSUPPORT and callers fall back.
+    // Isolation relies on namespaces, no capabilities, no_new_privs, cgroups and
+    // network policy, not on this filter.
+    let architectures = match std::env::consts::ARCH {
+        "aarch64" => json!(["SCMP_ARCH_AARCH64", "SCMP_ARCH_ARM"]),
+        _ => json!(["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"]),
+    };
+    json!({"defaultAction":"SCMP_ACT_ALLOW","architectures":architectures,
+        "syscalls":[
+            {"names":["io_uring_setup","io_uring_enter","io_uring_register"],"action":"SCMP_ACT_ERRNO","errnoRet":38u32},
+            {"names":["socket"],"action":"SCMP_ACT_ERRNO","errnoRet":93u32,
+             "args":[{"index":2u32,"value":262u64,"op":"SCMP_CMP_EQ"}]}]})
 }

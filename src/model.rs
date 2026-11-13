@@ -76,33 +76,78 @@ impl WorkerStatus {
     }
 }
 
+fn valid_resources(memory_mib: Option<u64>, vcpus: Option<u32>) -> bool {
+    memory_mib.is_none_or(|m| (1..=1_048_576).contains(&m)) && vcpus.is_none_or(|v| (1..=4_096).contains(&v))
+}
+
+// Client-facing create input. The controller chooses the owner and generates the
+// ID; the owner's template supplies architecture and default resources.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSpec {
+    pub template_id: String,
+    #[serde(default)]
+    pub memory_mib: Option<u64>,
+    #[serde(default)]
+    pub vcpus: Option<u32>,
+    pub ttl_seconds: u32,
+}
+
+impl CreateSpec {
+    pub fn valid(&self) -> bool {
+        valid_id(&self.template_id) && valid_resources(self.memory_mib, self.vcpus) && (1..=86_400).contains(&self.ttl_seconds)
+    }
+    pub fn with_id(self, sandbox_id: String) -> CreateRequest {
+        CreateRequest { sandbox_id, template_id: self.template_id, memory_mib: self.memory_mib, vcpus: self.vcpus, ttl_seconds: self.ttl_seconds }
+    }
+}
+
+// Controller-to-worker create, with the controller-generated owner-prefixed ID.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
     pub sandbox_id: String,
     pub template_id: String,
-    pub runtime: Runtime,
-    pub architecture: String,
+    pub memory_mib: Option<u64>,
+    pub vcpus: Option<u32>,
+    pub ttl_seconds: u32,
+}
+
+impl CreateRequest {
+    pub fn valid(&self) -> bool {
+        sandbox_owner(&self.sandbox_id).is_some() && valid_id(&self.template_id)
+            && valid_resources(self.memory_mib, self.vcpus) && (1..=86_400).contains(&self.ttl_seconds)
+    }
+    // An identical retry may omit values that were resolved from the template.
+    pub fn matches(&self, spec: &SandboxSpec) -> bool {
+        self.sandbox_id == spec.sandbox_id && self.template_id == spec.template_id && self.ttl_seconds == spec.ttl_seconds
+            && self.memory_mib.is_none_or(|m| m == spec.memory_mib) && self.vcpus.is_none_or(|v| v == spec.vcpus)
+    }
+}
+
+// A create with resources resolved by the worker at admission; durable in records.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxSpec {
+    pub sandbox_id: String,
+    pub template_id: String,
     pub memory_mib: u64,
     pub vcpus: u32,
     pub ttl_seconds: u32,
 }
 
-impl CreateRequest {
-    // Check owned sandbox and template IDs, supported architecture, resource requests and TTL bounds.
+impl SandboxSpec {
     pub fn valid(&self) -> bool {
         sandbox_owner(&self.sandbox_id).is_some() && valid_id(&self.template_id)
-            && matches!(self.architecture.as_str(), "x86_64" | "aarch64")
-            && (1..=1_048_576).contains(&self.memory_mib)
-            && (1..=4_096).contains(&self.vcpus)
-            && (1..=86_400).contains(&self.ttl_seconds)
+            && valid_resources(Some(self.memory_mib), Some(self.vcpus)) && (1..=86_400).contains(&self.ttl_seconds)
     }
 }
+
+pub const MAX_EXEC_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecRequest {
-    pub operation_id: String,
     pub argv: Vec<String>,
     pub timeout_ms: u64,
     pub max_output_bytes: u64,
@@ -111,17 +156,18 @@ pub struct ExecRequest {
 impl ExecRequest {
     // Check the operation ID, nonempty command, argument sizes and output/deadline bounds.
     pub fn valid(&self) -> bool {
-        valid_id(&self.operation_id) && !self.argv.is_empty() && self.argv.len() <= 64 && !self.argv[0].is_empty()
+        !self.argv.is_empty() && self.argv.len() <= 64 && !self.argv[0].is_empty()
             && self.argv.iter().all(|arg| arg.len() <= 4_096 && !arg.contains('\0'))
-            && (1..=60_000).contains(&self.timeout_ms)
+            && (1..=MAX_EXEC_TIMEOUT_MS).contains(&self.timeout_ms)
             && (1..=1_048_576).contains(&self.max_output_bytes)
     }
+    // Worst-case JSON result: lossy UTF-8 and escaping expand raw bytes up to 6x.
+    pub fn max_result_bytes(&self) -> usize { self.max_output_bytes as usize * 6 + 8192 }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRequest {
-    pub operation_id: String,
     pub template_id: String,
     pub runtime: Runtime,
 }
@@ -132,8 +178,8 @@ pub fn valid_id(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-// Validate both parts of a caller-chosen sandbox ID and return its owner. Keeping ownership in the ID
-// prevents retries or controller restarts from rerouting an accepted create.
+// The controller embeds the chosen owner in the generated ID, so later calls and
+// controller restarts route without an assignment table. Clients treat it as opaque.
 pub fn sandbox_owner(value: &str) -> Option<&str> {
     let (node, local) = value.split_once('.')?;
     (valid_id(node) && valid_id(local)).then_some(node)
@@ -171,7 +217,6 @@ impl NetworkPolicy {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRequest {
-    pub operation_id: String,
     pub port: u16,
     pub method: String,
     pub path: String,
@@ -186,7 +231,7 @@ impl HttpRequest {
     // Check HTTP operation fields, permitted methods and headers, and a relative request path. Enforce
     // hard body, response and deadline bounds without authorizing a service port here.
     pub fn valid(&self) -> bool {
-        valid_id(&self.operation_id) && self.port != 0 && matches!(self.method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
+        self.port != 0 && matches!(self.method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
             && self.path.starts_with('/') && !self.path.starts_with("//") && self.path.len() <= 2048
             && self.path.bytes().all(|b| b.is_ascii_graphic() && b != b'\\' && b != b'#')
             && self.body.len() <= 16384 && (1..=600000).contains(&self.timeout_ms)
@@ -199,6 +244,7 @@ impl HttpRequest {
         self.valid() && self.body.len() <= limits.max_body_bytes && self.max_response_bytes <= limits.max_response_bytes
             && self.timeout_ms <= limits.max_timeout_ms
     }
+    pub fn max_result_bytes(&self) -> usize { self.max_response_bytes as usize * 6 + 8192 }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

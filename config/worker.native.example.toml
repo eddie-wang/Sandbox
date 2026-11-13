@@ -16,6 +16,13 @@ max_body_bytes = 16384
 # max_body_bytes = 16384
 # max_response_bytes = 8388608
 # max_timeout_ms = 600000
+# Blocking requests wait for real outcomes. Defaults shown; exec/HTTP wait for
+# their timeout_ms plus margin_ms. Configure the same values on the controller.
+# [server.operation_deadlines]
+# create_ms = 120000
+# capture_ms = 300000
+# delete_ms = 120000
+# margin_ms = 30000
 
 [auth]
 env = "SANDBOX_WORKER_TOKEN"
@@ -37,14 +44,9 @@ cgroup_parent = "/sys/fs/cgroup/sandbox"
 cpu_overcommit = 3
 pids_max = 64                    # 16..65536, fixed across compatible templates
 max_records = 128               # 1..100000, includes durable tombstones
-max_operations_per_sandbox = 32 # 1..64, retained for idempotency
 max_concurrent_operations = 4  # 1..64 fixed threads; restore slots must fit
-max_retained_output_bytes = 16777216 # 1 MiB..4 GiB; excludes fixed metadata
-max_retained_output_per_sandbox_bytes = 8388608 # 1..64 MiB; default 8 MiB
-# Larger HTTP responses need BOTH budgets >= 6 * max_response_bytes + 8192.
-# Retained results plus concurrent reservations must fit the global budget.
-# For 8 MiB HTTP, explicitly raise the per-sandbox budget to 64 MiB and size
-# the global budget for the operator's bounded concurrency and retained data.
+# Results are returned inline and never stored. In-flight result memory is at most
+# max_concurrent_operations * (6 * largest exec/HTTP result bound + 8192) bytes.
 max_artifact_bytes = 67108864   # 1 MiB..1 TiB per artifact, NOT a disk quota
 command_timeout_seconds = 30   # 10..300, each host tool invocation
 

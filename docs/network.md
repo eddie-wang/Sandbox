@@ -7,7 +7,7 @@ storage, network daemon, outbound HTTP relay, domain-policy engine or S3 client.
 ## Authority and topology
 
 ```text
-controller: authenticated short acceptance/polling
+controller: authenticated blocking requests, routed by sandbox ID
     |
 worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |
@@ -15,7 +15,7 @@ worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |   192.0.2.2/30 eth0 -- veth inside -- 192.0.2.1/30
     |   runc workload                       nft default drop; exact TCP permits
     |   UID/GID 65534, no capabilities       private SNAT to unique pool address
-    |   filtered AF_INET/SOCK_STREAM            |
+    |   seccomp: io_uring/MPTCP guards only     |
     |                                         uplink -- veth -- operator bridge
     |                                                          stable MAC/gateway
     +-- bounded HTTP helper enters router slot only
@@ -32,8 +32,8 @@ kind/address/prefix and serialized bounds, not end-to-end routing or remote serv
 readiness. External routing and avoiding pool overlap with other workers/peers are
 operator responsibilities. The worker never repairs global routing/firewall/sysctls.
 
-Manifest v2 contains the policy. `isolated` creates no external links and keeps
-socket creation denied; this remains the default configuration. `tcp_allowlist`
+Manifest v2 contains the policy. `isolated` creates no external links (the guest
+netns has only loopback); this remains the default configuration. `tcp_allowlist`
 permits only its operator-approved subset. No create-time endpoint override exists
 in this milestone: changing a tool endpoint requires a different immutable template.
 Policies are not a universal reusable-template destination abstraction.
@@ -49,9 +49,12 @@ All other forwarding/input/output is dropped. Only its
 own approved service-port TCP requests can leave the router toward the guest;
 untrusted workload replies to those requests require established state. Unsolicited
 uplink ingress cannot reach guest services. IPv6 is disabled in both owned
-namespaces, and socket filtering independently excludes IPv6, UDP, raw, packet,
-netlink and Unix families/types. There is no implicit DNS. Namespace/mount/ptrace/
-bpf/perf/io_uring restrictions and empty workload capabilities remain in force.
+namespaces. There is no implicit DNS. Seccomp no longer filters socket families: it
+follows the AgentENV pattern (default-allow; io_uring returns ENOSYS and MPTCP sockets
+EPROTONOSUPPORT, for CRIU checkpointability only). Workloads may create UDP, IPv6
+or Unix sockets, but only the router nftables rules decide what leaves the guest.
+Empty workload capabilities still prevent raw/packet sockets, namespace changes
+and mounts; no_new_privs and cgroups remain in force.
 
 ## Ownership and ordering
 
@@ -96,7 +99,7 @@ is no silent interpretation of old deny-all artifacts as network-enabled images.
 
 ## Application HTTP boundary
 
-`POST /v1/sandboxes/{id}/http` accepts a durable operation, not a URL proxy. The
+`POST /v1/sandboxes/{id}/http` is a blocking bounded request, not a URL proxy. The
 worker validates fixed-target service authorization and launches its own executable
 via the verified `ip` into **only the selected router namespace**. Namespace entry
 never touches a pooled worker/Tokio thread. The request is a protected private JSON
@@ -106,7 +109,7 @@ The maintained reqwest client has no proxy or redirects, one HTTP/1 request,
 bounded deadline/body/result, and no connection pooling across operations. Inputs
 are a small method set, relative path/query, optional accept/content-type and UTF-8
 text. Management bearer, Host and arbitrary headers are not forwarded. Results
-retain status, content-type and UTF-8 body only. Invalid UTF-8 is rejected, not
+contain status, content-type and UTF-8 body only and are returned inline, never stored. Invalid UTF-8 is rejected, not
 silently corrupted. Whole helper-cgroup drainage bounds descendants, output and
 restart lifetime. Application failures do not kill an otherwise healthy sandbox.
 See [API bounds](api.md#application-http) and the

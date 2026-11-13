@@ -17,7 +17,7 @@ exclusive to that worker; operators must not share it between worker roots.
 <root>/
   worker.lock
   worker-status.json              durable shutdown cleanup error, if any
-  records/<node>.<id>.json         atomic lifecycle/idempotency records
+  records/<sandbox-id>.json        atomic lifecycle records (schema 2; metadata only)
   private/<node>.<id>/
     upper/ work/ rootfs/           ordinary directories; rootfs is OverlayFS
     config.json exec.json         worker-authored OCI/process input
@@ -27,8 +27,9 @@ exclusive to that worker; operators must not share it between worker roots.
   templates/<template-id>/
     manifest.json manifest.sha256
     upper.tar checkpoint.tar      present together only for warm templates
-  staging/<sandbox-length>-<sandbox>-<operation>/
-                                  unpublished capture; exclusively owned per job
+  staging/<template-id>/          unpublished capture; exclusively created by the
+                                  one in-flight capture reserving that template ID;
+                                  a failed removal blocks that ID until restart
   runc/                           private runc state root
 ```
 
@@ -69,13 +70,13 @@ Strict JSON fields (unknown fields are rejected):
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | Exactly `2`; v1 is rejected, not silently migrated |
-| `template_id`, `generation` | Validated immutable publication and capture-generation IDs |
+| `template_id`, `generation` | Validated immutable publication ID and worker-generated capture-generation ID |
 | `runtime` | Exactly `runc_criu` |
 | `compatibility` | Architecture, exact kernel release, SHA-256 of CPU feature string, exact runc and CRIU version output, fixed mount/network/seccomp layout version |
 | `base` | `{ "sha256": "...", "bytes": ... }` for `layers/<digest>.erofs` |
 | `upper`, `checkpoint` | Both null for cold, or descriptors for `upper.tar` and `checkpoint.tar` from one stopped generation |
 | `init_argv` | Trusted absolute in-container executable + argv; not an OCI config/host executable |
-| `memory_mib`, `vcpus` | Null cold; exact required resource settings warm |
+| `memory_mib`, `vcpus` | Cold: optional create defaults (1–1,048,576 MiB, 1–4,096); warm: required, exact captured resources |
 | `pids_max` | Exact configured pids limit |
 | `oci_config_sha256` | Null cold; warm SHA-256 of canonical worker-generated OCI JSON, with private cgroup, guest-netns and CRIU-config paths replaced by fixed reconstruction markers |
 | `network` | Strict tagged `isolated` or `tcp_allowlist` policy; see API. Endpoints remain fixed across capture. |
@@ -83,8 +84,9 @@ Strict JSON fields (unknown fields are rejected):
 
 `compatibility` is emitted by read-only `preflight` and has exactly:
 `architecture`, `kernel`, `cpu_features_sha256`, `runc_version`, `criu_version`,
-`layout`. The OCI network-policy digest annotation is preserved during normalization. `layout` is `erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v3`. The profile permits the read-only `getpgrp` query needed by ordinary shell startup;
-process-group setters and additional socket families remain denied. Older layout
+`layout`. The OCI network-policy digest annotation is preserved during normalization. `layout` is `erofs-overlay-upper-v2-fixed-slot-tcp-pmtu-v1-seccomp-v4-agentenv`. The seccomp profile is the
+default-allow AgentENV pattern described below; templates captured under the earlier
+deny-by-default profiles carry older layouts and are rejected. Older layout
 fingerprints are incompatible rather than silently reinterpreted. The local fixture
 script demonstrates complete cold publication; do not guess compatibility strings.
 Exact matching deliberately rejects more hosts than might technically work. Version
@@ -141,14 +143,17 @@ blocking runtime tools. A fixed 1–64-thread pool bounds operation concurrency,
 per-sandbox exclusion serializes each lifecycle, and separate restore slots bound
 create/capture/restore. Shared lower mount creation has its own bounded mailbox;
 there is no shared-state lock across mount/process I/O. Template names in capture
-are reserved against concurrent publication. In-flight output budgets are reserved
-before exec as well as retained afterward. The mailbox is bounded and short HTTP
-deadlines do not cancel jobs owned by the coordinator.
-Caller-chosen sandbox/operation IDs make ambiguous response retries idempotent.
-Result bytes/counts and tombstones are bounded and retained; no automatic pruning
-can silently reopen an ID for execution. Operations with neither exec nor HTTP output
-consume no retained-output bytes; record/operation limits bound their metadata.
-Present outputs include serialization overhead in both admission and restart accounting.
+are reserved against concurrent publication. The mailbox is bounded.
+Create admission also reads the bounded template manifest on the coordinator thread
+(never a Tokio thread) and resolves default resources before the record is written.
+Each admitted job carries a one-shot reply: the waiting management request receives
+the job's real outcome. Neither a client disconnect nor an expired wait cancels a job
+owned by the coordinator; its result is simply discarded. The exception is a create
+whose reply cannot be delivered: nobody can learn that generated ID, so the
+coordinator requests deletion (`create_response_lost`). A capacity rejection writes
+no record. Results are never stored,
+so records hold only lifecycle metadata. Tombstones are bounded by `max_records` and
+retained; no automatic pruning can silently reopen an ID.
 
 Network policy and cgroup limits precede runc launch and restore. A slot index is
 reserved in the durable record before network side effects. Unique root/sandbox
@@ -157,13 +162,17 @@ cover creation, cancellation and restart; unexplained namespace state fails clos
 Cleanup retains the reservation/marker on failures, including delayed kernel link
 destruction, and retries without global flushes. See [network details](network.md). The workload has UID/GID
 65534, empty capabilities, no_new_privs, minimal /dev, its own proc/PID/mount/net/IPC/
-UTS/cgroup namespaces and an explicit default-errno seccomp allowlist. Namespace
-creation via clone is filtered; clone3 returns ENOSYS for libc fallback; mount,
-setns/unshare, ptrace, bpf, perf, io_uring are not allowed. Isolated templates still prohibit sockets; the opt-in
-network profile permits only AF_INET/SOCK_STREAM with TCP or protocol zero, plus
-stream operations. IPv6/UDP/raw/packet/netlink/Unix socket creation stays denied.
+UTS/cgroup namespaces and a seccomp profile matching the AgentENV container backend:
+`SCMP_ACT_ALLOW` by default, with only two checkpointability guards that CRIU needs:
+`io_uring_setup/enter/register` return ENOSYS and `socket(..., IPPROTO_MPTCP)` returns
+EPROTONOSUPPORT, so libraries fall back. Seccomp is not an isolation layer here:
+isolation relies on the namespaces, empty capabilities (so mount, namespace creation,
+ptrace, raw/packet sockets and similar privileged operations fail), no_new_privs,
+cgroups and network policy (no external links when isolated; router-namespace nftables
+for `tcp_allowlist`). Workloads may create any unprivileged socket family; network
+reachability is decided by the namespace and its rules, not by socket filtering.
 Host authority, not workload privilege, performs checkpoints. This profile is
-intentionally narrow and unqualified for general applications.
+unqualified for general applications.
 
 TTL has a separate cgroup-kill watchdog so a long archive cannot keep an expired
 workload running until a job completes. Deletion durably records cancellation and
@@ -178,7 +187,7 @@ Reservation release follows successful cleanup exactly once. Failure remains
 `cleanup_failed`, reserved, observable and retryable. Never recurse into a live mount.
 
 On restart, records are loaded and ownership validated before admission. Previously
-live/interrupted workloads are killed/cleaned, pending operations fail, and stopped
+live/interrupted workloads are killed/cleaned, in-flight requests lose their responses, and stopped
 private resources are reconciled. Unexplained runc/private/cgroup entries fail startup
 rather than being silently adopted/deleted. Published templates survive source and
 child deletion. Abrupt worker death does not itself kill containers; an operator
@@ -194,8 +203,8 @@ runtime behavior. XFS ftype/xattr details, EROFS options, actual seccomp compati
 restore cgroup placement and lifecycle/isolation/cleanup claims require the
 privileged gate. The static-fixture local gate passed, including independently
 overlapping commands, final worker admission, rejected template compatibility/digest/
-symlink inputs, command descendants, response-loss replay and pending-exec restart
-cleanup. Host trust was not qualified: the approved validation host used
+symlink inputs, command descendants, client disconnect mid-exec and mid-create, in-flight exec/
+capture/HTTP restart cleanup. Host trust was not qualified: the approved validation host used
 administrator-staged binaries but retained indirect system library/fixed-shell
 dependencies. No performance, S3, general hostile-workload isolation or two-node
 result is claimed.

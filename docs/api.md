@@ -26,38 +26,89 @@ variables, validates HTTPS certificates and never follows redirects. There is no
 registration, download URL or arbitrary-upstream proxy API. DNS and configuration
 are trusted infrastructure.
 
-## Ownership and asynchronous operations
+## Placement, IDs and blocking operations
 
-Sandbox IDs are caller-chosen **`<node_id>.<local_id>`**. Each component is 1–64
-ASCII alphanumeric, hyphen or underscore characters. Template and operation IDs
-use one component. The controller validates/routes only configured owners; changing
-node membership or restarting the controller cannot move an existing ID. Clients
-choose a node from authenticated status. Scheduling is deliberately conservative:
-create checks that owner's fresh compatible status and advisory capacity; it does
-not silently fail over an ambiguous create to another worker. The worker atomically
-checks memory, live slots, restore slots and `vcpus * cpu_overcommit` quota budget.
+Clients talk only to the controller and never choose or need to know nodes. For
+create, the controller ranks every fresh, ready worker by advisory reserved load
+(least projected memory/vCPU/slot load, then fewer active restores, then node ID),
+generates the sandbox ID and forwards the create. The controller does not read
+templates: a worker without a valid, compatible template answers before creating
+anything. IDs are currently `<node_id>.<32 hex>`; treat them as **opaque**. The owner
+prefix lets later calls and controller restarts route without an assignment table.
+A worker rejects an ID whose prefix is not its own node. Direct worker create
+remains behind the worker credential only (controller and operator use).
 
-Mutations return `202` **only after durable worker acceptance**. Accepted is not
-running or successful. Poll sandbox state or the operation result. The worker has
-a bounded 32-entry mailbox and serializes short admission/durable state transitions
-off Tokio. A fixed `max_concurrent_operations` thread pool (default 16, range 1–64)
-runs blocking work concurrently across different sandboxes; one job per sandbox and
-separate restore slots prevent conflicting mutations. Same-sandbox contention or a
-full operation/restore pool returns `503 busy` without accepting a new operation. A short
-HTTP deadline can expire before the actor acknowledges or after acceptance. On
-**any transport error, 408 or 503, first read state or retry the identical ID and
-payload**. Never invent another ID merely because a response was lost. Work that
-was queued but not durably accepted can disappear on worker crash; retry is safe.
-No external resource is created before its owning durable record exists.
+**Every management request is blocking** and returns its real outcome, like an
+ordinary RPC: create returns `201` after the container is running or restored (or
+an error after failure cleanup); exec returns exit code and bounded output; HTTP
+returns the application's status/content-type/body; capture returns after template
+publication **and** source recovery; delete returns after cleanup. There is no
+operation ID, operation endpoint or stored result. Different sandboxes run
+concurrently on the worker's fixed operation pool (`max_concurrent_operations`,
+default 16, range 1–64); `max_concurrent_restores` bounds create/restore/capture.
 
-Create is idempotent for the complete original payload. Exec/capture/HTTP require
-`operation_id`; the same ID/kind/payload replays the existing operation, while
-changed input returns `409 idempotency_conflict`. Delete is idempotent. Deleted and
-failed records are retained as tombstones; IDs cannot be reused. Retention limits
-return `503 retention_limit`, rather than silently dropping idempotency records.
-An admission rejection is a durable `failed` create record; use a new ID after
-correcting the request/capacity. A retry through the controller can fail its advisory
-capacity gate even for an existing ID; GET still routes to the owner.
+At most one create/exec/HTTP/capture runs per sandbox. A conflicting request for a
+sandbox with work in flight gets an immediate `409 sandbox_busy`; it is never queued.
+Concurrent exec/HTTP in one sandbox is deliberately not supported: a bound-violating
+exec terminates the whole sandbox, which would race a parallel command's cleanup.
+`DELETE` is the exception: it cancels in-flight work of that sandbox (whose request
+then returns its failed or interrupted outcome) and returns after cleanup. A second
+concurrent DELETE of the same sandbox gets `409 sandbox_busy`. A full operation pool
+or restore budget returns `503 busy` before anything starts.
+
+**Deadlines cover the operation.** Each route's worker waits for at most:
+
+| Route | Outcome wait |
+| --- | --- |
+| create | `[server.operation_deadlines] create_ms` (default 120,000) |
+| capture | `capture_ms` (default 300,000) |
+| delete | `delete_ms` (default 120,000) |
+| exec / HTTP | the request's `timeout_ms` + `margin_ms` (default 30,000; covers teardown and bound-kill cleanup) |
+| status, GET, preflight | `request_timeout_ms` (default 5,000) |
+
+The request body is always read within `request_timeout_ms`. A service's route
+deadline is the route's longest valid wait plus one `request_timeout_ms` per
+forwarding hop, and the controller's per-request forward timeout is the owner's
+wait plus one `request_timeout_ms`, so the innermost layer reports first. Configure
+`[server.operation_deadlines]` (and `[server.application_http]`) identically on the
+controller and workers. Ranges: create/delete 1,000–1,800,000 ms, capture
+1,000–3,600,000 ms, margin 1,000–300,000 ms. If a wait expires the worker returns
+`504 operation_timeout`; the controller returns `504 owner_response_timeout`, or
+`503 owner_response_unavailable` when the owner's answer is lost.
+
+**Client disconnect or timeout never orphans work.** The worker's admission thread,
+not the HTTP handler, owns every job. An exec, HTTP, capture or delete job runs to a
+terminal state with normal cleanup, TTL and bound enforcement; only its result is
+discarded, so read the sandbox with GET afterward. A create is different: the client
+cannot learn a controller-generated ID whose reply was lost, so when the worker
+finds the create reply undeliverable (client disconnect, any layer's expired wait)
+it deletes the new sandbox, recording `error:"create_response_lost"`. Only in the
+small window where the worker delivered the reply but a later hop failed to write it
+can a sandbox remain unknown to its client; its TTL bounds it.
+
+**Lost responses are not exactly-once.** Retrying a create after a lost response
+may create a second sandbox, as with other gateway-assigned sandbox APIs. The first
+is normally deleted as above (otherwise TTL bounds it), and an ambiguous create error
+names its generated `sandbox_id` so the caller can GET or DELETE it. A direct worker create with an existing ID is idempotent
+(`200` with current state; `409 sandbox_busy` while that create is in flight;
+`409 idempotency_conflict` for different input). An exec or HTTP request runs at most
+once, but a client retry runs it again: a lost response may hide a command or
+application side effect that already happened. A capture retry for a published
+template ID returns `409 template_already_exists`. Delete is safe to repeat after it
+completes (a concurrent second DELETE gets `409 sandbox_busy`).
+
+Create failover is limited to **definitive pre-launch rejections**, where the worker
+answered before creating any resource: `busy`, `admission_exhausted`,
+`record_limit`, `runtime_unavailable`, `worker_unavailable` or `template_unavailable`.
+The controller then tries the next candidate with a new ID, at most three attempts.
+A capacity rejection writes no record, so failover cannot consume `max_records`. All
+attempts share one budget (`create_ms` + one `request_timeout_ms`) that ends before
+the controller's route deadline; a later attempt gets only the remaining budget, and
+none starts with less than `request_timeout_ms` left. It never fails over on
+transport errors (including refused connections), timeouts or a failure after launch;
+those errors include the generated `sandbox_id`. No candidates or capacity rejections
+give `503 no_capacity`; only template rejections give `422 template_unavailable`.
+Records are retained as tombstones; IDs are never reused.
 
 ## Endpoints
 
@@ -66,54 +117,53 @@ capacity gate even for an existing ID; GET still routes to the owner.
 | `GET /healthz` | `200 {"service":"worker" or "controller","live":true}`; not readiness |
 | `GET /v1/status` | Worker: configured budgets, reserved usage, CPU overcommit, admission/runtime status and `qualification:"unvalidated"`. Controller: cached validated nodes and freshness; `lifecycle_implemented:true` describes dispatch code, not runtime qualification. |
 | `GET /v1/preflight` | Worker only: cached read-only startup checks, versions/compatibility fingerprint; authenticated |
-| `POST /v1/sandboxes` | Durable create/restore acceptance; no arbitrary rootfs/config/path fields |
-| `GET /v1/sandboxes/{id}` | State, static error code, absolute Unix `expires_at`, operation summaries |
-| `DELETE /v1/sandboxes/{id}` | Durable deletion request; poll until `deleted` |
-| `POST /v1/sandboxes/{id}/exec` | Durable bounded command operation |
-| `POST /v1/sandboxes/{id}/http` | Durable bounded application HTTP operation (not a management proxy) |
-| `POST /v1/sandboxes/{id}/capture` | Durable warmed-template capture operation |
-| `GET /v1/sandboxes/{id}/operations/{operation_id}` | Pending/complete/failed operation, static error, result/template ID |
+| `POST /v1/sandboxes` | Blocking create/restore; `201` with the sandbox view once running. No caller ID, rootfs/config/path fields |
+| `GET /v1/sandboxes/{id}` | `200` view: `sandbox_id`, `template_id`, `state`, static `error`, absolute Unix `expires_at` |
+| `DELETE /v1/sandboxes/{id}` | Blocking; `200` view after cleanup (`deleted`, or `failed` for a never-launched ID); `500 cleanup_failed` otherwise |
+| `POST /v1/sandboxes/{id}/exec` | Blocking bounded command; `200` result |
+| `POST /v1/sandboxes/{id}/http` | Blocking bounded application HTTP (not a management proxy); `200` result |
+| `POST /v1/sandboxes/{id}/capture` | Blocking warmed-template capture; `200` after publication and source recovery |
 
-Example acceptance: `{"sandbox_id":"node-a.example","operation_id":null}`.
-Create progresses `creating -> running` or `failed/cleanup_failed`. Capture uses
-`capturing`, then returns the source to `running` only after actual recovery, or
-makes it terminal through deletion. Delete/TTL/restart uses `deleting -> deleted`
-or `cleanup_failed`. Cleanup failures keep memory/live admission reserved and
-retry on the lifecycle thread. GET of an unknown sandbox/operation is 404.
+Create example: `201 {"sandbox_id":"node-a.3f0c…","template_id":"example-template",
+"state":"running","error":null,"expires_at":1700000000}`. States are `creating`,
+`running`, `capturing`, `deleting`, `deleted`, `failed` and `cleanup_failed`. Capture
+returns the source to `running` only after actual recovery, or makes it terminal
+through deletion. Delete/TTL/restart uses `deleting -> deleted` or `cleanup_failed`.
+Cleanup failures keep memory/live admission reserved and retry in the background.
+GET of an unknown sandbox is 404.
 
-Worker restart deliberately terminates previous live workloads and fails pending
-operations with `worker_restarted`; it does not resume them from arbitrary in-memory
-state. Completed operation outputs and template publications survive restart.
+Worker restart deliberately terminates previous live workloads; it does not resume
+them from arbitrary in-memory state. Requests in flight lose their responses.
+Template publications survive restart.
 
 ### Create
 
 ```json
-{
-  "sandbox_id": "node-a.example",
-  "template_id": "example-template",
-  "runtime": "runc_criu",
-  "architecture": "x86_64",
-  "memory_mib": 64,
-  "vcpus": 1,
-  "ttl_seconds": 120
-}
+{"template_id": "example-template", "ttl_seconds": 120}
 ```
 
-All fields required; unknown fields rejected. Runtime is exactly `runc_criu`;
-architecture is `x86_64` or `aarch64` and must match the worker/template. Memory:
-1–1,048,576 MiB; vCPUs: 1–4,096; TTL: 1–86,400 seconds. Operator budgets further
-restrict these. Cold init argv comes only from the trusted template, never from a
-create request. Warm restore requires exactly the captured memory/vCPU/pids/config
-and host compatibility. Filesystem/digest/compatibility failures become failed
-records, not running IDs. TTL starts at durable acceptance. A dedicated expiry
-watchdog kills the cgroup at expiration independently of long artifact work;
-private cleanup follows on the lifecycle thread. Timer/scheduling granularity is
-not a hard real-time guarantee.
+`template_id` and `ttl_seconds` (1–86,400) are required; optional `memory_mib`
+(1–1,048,576) and `vcpus` (1–4,096) default to the template's values. Unknown fields
+are rejected, including the former `sandbox_id`, `runtime` and `architecture`: only
+`runc_criu` exists, and the owner's template fixes the architecture. Operator budgets
+further restrict resources. A warm template rejects explicit values that differ from
+its captured resources (`422 template_resource_mismatch`); a cold template that
+declares no defaults needs both values (`422 resources_required`). Cold init argv
+comes only from the trusted template, never from a create request. Warm restore
+requires the captured memory/vCPU/pids/config and host compatibility.
+
+During admission the worker checks the template manifest (digest sidecar, strict
+fields, exact host compatibility including architecture, network policy and pids);
+failure is a pre-launch `422 template_unavailable`. The create job verifies artifact
+digests, so a damaged artifact is a failed create with a tombstone and static error,
+never a running ID. TTL starts at admission. A dedicated expiry watchdog kills the
+cgroup at expiration independently of long artifact work; private cleanup follows.
+Timer/scheduling granularity is not a hard real-time guarantee.
 
 ### Exec
 
 ```json
-{"operation_id":"command-1","argv":["/fixture","counter"],"timeout_ms":1000,"max_output_bytes":4096}
+{"argv":["/fixture","counter"],"timeout_ms":1000,"max_output_bytes":4096}
 ```
 
 Argv is executed **inside the container by runc**, with no shell interpolation or
@@ -121,32 +171,36 @@ host executable selection. No inherited management environment; UID/GID 65534,
 fixed PATH/HOME/LANG and cwd `/workspace`. Argv: 1–64 arguments, each at most 4096
 bytes, no NUL and a nonempty first argument. Timeout: 1–60,000 ms, additionally
 clamped to remaining TTL. Combined raw stdout/stderr limit: 1–1,048,576 bytes;
-invalid UTF-8 is replaced for JSON, so JSON encoding may be larger. Results contain
-`exit_code`, `stdout`, `stderr`, `interrupted`. A nonzero program exit is a completed
-operation, not necessarily a service error. Timeout, output overflow or surviving
-output-pipe descendants terminate the whole sandbox and fail the operation. This
+invalid UTF-8 is replaced for JSON, so JSON encoding may be larger. The `200` result
+contains `exit_code`, `stdout`, `stderr`, `interrupted`, `error` and `sandbox_state`.
+A nonzero program exit is a normal result. Timeout, output overflow or surviving
+output-pipe descendants terminate the whole sandbox: the result then has
+`interrupted:true`, `error:"exec_deadline_or_output_limit"`, the bounded output and
+`sandbox_state:"deleted"` (or `cleanup_failed`). Other exec failures return a static
+error and also terminate the sandbox. This
 conservative behavior prevents killing only a detached runc client and leaking its
 workload. Every exec joins its own worker-created child cgroup; successful completion
 also kills remaining descendants and removes that group. Closing inherited output
 pipes does not permit a background child to escape command cleanup. Background jobs
 are not a supported exec contract.
 
-Results are retained and authenticated. Worker retained-output budget defaults to
-16 MiB; one sandbox's encoded outputs default to an 8 MiB ceiling. Explicit native
-configuration can raise the global budget to at most 4 GiB and the per-sandbox
-budget to at most 64 MiB. In-flight worst-case JSON output is reserved before
-acceptance, in addition to retained results. Operation count and record count are
-separately bounded. Commands are not logged; the worker-authored
-process JSON is temporarily stored under the protected private directory. Checkpoint
-artifacts and exec outputs can contain workload secrets: protect the entire root.
+Results are returned once and never stored. Commands are not logged; the
+worker-authored process JSON is temporarily stored under the protected private
+directory. Checkpoint artifacts can contain workload secrets: protect the entire root.
 
 ### Capture
 
 ```json
-{"operation_id":"capture-1","template_id":"warmed-example","runtime":"runc_criu"}
+{"template_id":"warmed-example","runtime":"runc_criu"}
 ```
 
-Template IDs are immutable; existing publication names are rejected. Capture stops
+Success is `200 {"sandbox_id":"...","template_id":"warmed-example","generation":"<32 hex>",
+"state":"running"}`; the worker generates the capture generation. Template IDs are
+immutable; existing publication names are rejected (`409 template_already_exists`),
+and a concurrent capture to the same name gets `409 template_busy`. Unpublished work
+is staged in `staging/<template-id>`; if removing a failed stage itself fails, the
+capture reports that error and the template ID stays unusable (capture returns
+`directory_create_failed`) until the worker restarts and reconciles staging. Capture stops
 and checkpoints the source, archives its upper (not a merged rootfs or promoted
 lower), recovers the source from its own images, then publishes matching digests.
 Failure publishes no incomplete pair. A failed checkpoint with uncertain process
@@ -164,7 +218,7 @@ and slot conntrack/NAT state are never captured.
 ### Networking
 
 Create has no caller-authored network field: callers select an immutable template.
-Manifest v2 specifies either `{"mode":"isolated"}` (no links or socket syscalls) or:
+Manifest v2 specifies either `{"mode":"isolated"}` (loopback only, no external links) or:
 
 ```json
 {"mode":"tcp_allowlist","egress":[{"ip":"198.51.100.20","port":8443}],"service_ports":[8080]}
@@ -191,12 +245,11 @@ operator bridge/pool prerequisites and the fixed-address restore boundary.
 ### Application HTTP
 
 ```json
-{"operation_id":"request-1","port":8080,"method":"POST","path":"/tool?mode=small","headers":{"content-type":"application/json"},"body":"{\"input\":\"example\"}","timeout_ms":2000,"max_response_bytes":4096}
+{"port":8080,"method":"POST","path":"/tool?mode=small","headers":{"content-type":"application/json"},"body":"{\"input\":\"example\"}","timeout_ms":2000,"max_response_bytes":4096}
 ```
 
-`POST /v1/sandboxes/{id}/http` has the same authentication, durable acceptance,
-idempotency, polling and per-sandbox exclusion as exec/capture. It uses worker I/O
-capacity, not long-lived controller proxy connections. Only the selected sandbox's
+`POST /v1/sandboxes/{id}/http` has the same authentication, blocking outcome and
+per-sandbox exclusion as exec/capture. It runs on the worker's bounded operation pool. Only the selected sandbox's
 fixed guest IP and an explicitly template/operator-approved service port are
 reachable. GET/POST/PUT/DELETE/HEAD, relative absolute-path-form paths up to 2048
 ASCII bytes (optional query), no URL/authority, `//`, backslash or fragment. The
@@ -212,30 +265,30 @@ with `max_body_bytes` up to 16,384, `max_response_bytes` up to 8,388,608, and
 configure them consistently. These are opt-in ceilings, not new defaults.
 
 Every operation deadline remains clamped to remaining TTL; an owned helper is
-killed/drained within a further one-second startup/exit allowance. Increasing this
-application deadline does **not** increase management request deadlines or make
-acceptance synchronous. Responses remain UTF-8 only; headers are checked against
+killed/drained within a further one-second startup/exit allowance. The route
+deadline follows `max_timeout_ms` plus `margin_ms` (see above), so a long
+application deadline is waited for in full. Responses remain UTF-8 only; headers are checked against
 16 KiB and only content-type (at most 256 bytes) is returned. Client parsing has its
 own bounded HTTP/1 buffers.
-The normal management body/retained-result limits still apply. A 16 KiB text body
+The normal management body limit still applies. A 16 KiB text body
 can expand toward 96 KiB inside its JSON request envelope; opt-in body configuration
 requires sufficient `server.max_body_bytes` (128 KiB covers all supported fields).
-The helper's private request file is bounded at 128 KiB. Output admission retains
-its conservative `6 * max_response_bytes + 8192` encoded-byte reservation: an 8 MiB
-raw response can occupy approximately 48 MiB when JSON-escaped. Startup rejects a
-worker whose configured HTTP response ceiling cannot fit either native retained
-budget. Controller forwarding stays bounded by the larger of 8 MiB and its configured
-worst-case HTTP result reservation, not by the long application deadline.
+The helper's private request file is bounded at 128 KiB. Results are carried inline
+and never stored: a result's worst-case JSON size is `6 * max_response_bytes + 8192`
+(an 8 MiB raw response can be about 48 MiB when JSON-escaped). Helper output,
+controller forwarding and memory are bounded by that per-request size; in-flight
+result memory is bounded by the operation pool size times the configured ceiling.
 
 Non-UTF-8, oversized, invalid or timed-out responses fail with a static error, never
 an upstream error body. No response is truncated into a successful result. Unlike exec bounds, an HTTP bound failure does not terminate the sandbox.
 
-Completed operations contain `http_output:{"status":200,"content_type":"text/plain",
-"body":"..."}`; non-2xx and redirects are returned as application statuses, not
-followed. GET operation responses remain authenticated. A retry of a completed
-ID never sends the application request twice. On worker crash an accepted pending
-request is failed as `worker_restarted`; application side effects may already have
-occurred, so callers must not infer exactly-once remote application semantics.
+Success is `200 {"status":200,"content_type":"text/plain","body":"..."}`; non-2xx
+and redirects are returned as application statuses, not followed. A port outside
+the template's approved service ports is `403 service_port_not_authorized`; an
+application failure, timeout or bound is `502 application_http_failed_or_bounded`.
+A client retry sends the application request again. On a lost response or worker
+crash, application side effects may already have occurred: there are no
+exactly-once remote application semantics.
 
 ## Status and bounds
 
@@ -253,29 +306,32 @@ does not attest an installation from a separately run smoke.
 Controller polls at bounded fanout, with 64 KiB responses, total per-call deadlines
 and identity/schema checks. Failed polls retain last status but mark it unreachable
 and not fresh; aged successful observations are also excluded. No state lock spans
-network/filesystem/subprocess I/O. Ownership routes require a fresh validated owner;
+network/filesystem/subprocess I/O. Routing requires a fresh validated owner;
 worker rejection is authoritative even if controller usage is stale.
 
-Default HTTP bounds: 64 active requests, 16 KiB body, 5-second body/handler deadline,
-no waiting HTTP admission queue. Full request or lifecycle queues return `503 busy`.
-Worker forwarding responses default to an 8 MiB cap; the explicitly configured
-application HTTP ceiling can increase this bounded encoded-result allowance.
+Default HTTP bounds: 64 active requests, 16 KiB body, 5-second body deadline,
+route-specific handler deadlines (above), no waiting HTTP admission queue. Blocked
+requests hold their permit while they wait, so size the controller's `max_in_flight`
+above the sum of its workers' operation pools. Full request or lifecycle queues
+return `503 busy`. Controller forwarding accepts at most the request's largest valid
+result (64 KiB for sandbox views; `6 * max_*_bytes + 8192` for exec/HTTP).
 Subprocess output/deadlines and artifact sizes are independently bounded. Configuration files are capped at 64 KiB.
 Startup fields are strict; credentials/error bodies are not parser diagnostics.
 
 Static errors use `{"error":{"code":"invalid_input","message":"..."}}`.
-Common statuses: 400 invalid fields/IDs, 401 unauthorized, 404 missing route/resource,
-408 HTTP deadline, 409 idempotency conflict, 413 body limit, 503 disabled/preflight,
-owner unavailability, busy, retention or durability failures. An enabled worker can
-return a 202 acceptance followed by a failed resource operation; always poll results.
+Common statuses: 200 result, 201 created, 400 invalid fields/IDs, 401 unauthorized,
+403 unapproved service port, 404 missing route/sandbox, 408 request/body deadline,
+409 `sandbox_busy`/`sandbox_not_running`/template conflicts, 413 body limit, 422
+template unavailable or resource rules, 500 failed operation or `cleanup_failed`,
+502 application HTTP failure, 503 disabled/preflight, owner unavailability, busy or
+capacity, 504 outcome wait expired. Failed operations name a static code; read the
+sandbox state afterward, because failed exec/capture can terminate the sandbox.
 
 Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–131,072 bytes.
-Native output budgets count retained encoded results plus in-flight reservations,
-not anonymous memory alone. Record reads are bounded by the configured per-sandbox
-retained-output ceiling plus 1 MiB of metadata headroom. Lowering output budgets
-below existing records fails startup/reconciliation; it never discards outputs or
-idempotency IDs. Restore the previous budgets to reconcile/clean safely before
-making a compatible configuration change.
+Durable records hold lifecycle metadata only (bounded at 64 KiB each, `max_records`
+including tombstones); there are no output-retention budgets. Records written by
+the earlier polling API (schema 1) fail startup closed; reconcile such a root with
+the binary that wrote it before upgrading.
 Poll: interval 100–30,000 ms, timeout 100–10,000 ms, freshness 500–60,000 ms and at least
 interval, fanout 1–16, workers at most 128. Capacity: memory/CPU as above, sandbox
 slots 1–1,000,000, restore slots 1–1024 and at most sandbox slots. Native bounds are

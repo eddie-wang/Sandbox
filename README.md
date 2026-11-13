@@ -9,7 +9,9 @@ smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This in
 IPv4 TCP allowlists and text application HTTP inside a disposable outer test netns,
 restored listening sockets/fresh connections, and the existing lifecycle cases:
 cold create, capture/source recovery, independent warm restore, overlapping commands,
-private writes/whiteouts, idempotent retry, TTL/delete and crash/restart cleanup.
+private writes/whiteouts, blocking inline results, cleanup after client disconnect
+mid-exec and mid-create, TTL/delete
+and crash/restart cleanup.
 This is a targeted functional result, **not production isolation, general workload
 readiness, cross-node portability or capacity qualification**. The validation host's
 indirect system-library/shell trust was not established; see the operator recipe.
@@ -49,8 +51,11 @@ RBAC, built-in TLS or Internet-facing connection defense.
   **ordinary private OverlayFS upper/work directories**, no per-container block
   devices or storage daemon. Only the shared EROFS mount uses a loop device.
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
-  65534, empty capabilities, `no_new_privs`, a default-deny seccomp syscall profile
-  and cgroup-v2 memory/swap/CPU/pids limits installed before launch.
+  65534, empty capabilities, `no_new_privs` and cgroup-v2 memory/swap/CPU/pids
+  limits installed before launch. Seccomp follows the AgentENV container pattern:
+  default-allow, blocking only io_uring (`ENOSYS`) and MPTCP sockets
+  (`EPROTONOSUPPORT`), which CRIU cannot checkpoint. Isolation relies on the
+  namespaces, absent capabilities, `no_new_privs`, cgroups and network policy.
 - Fully isolated networking remains the default. Opt-in immutable templates can
   use **IPv4 TCP literal destination/port allowlists**, bounded by operator policy.
   A worker-owned routing namespace per sandbox enforces default-drop nftables
@@ -59,9 +64,16 @@ RBAC, built-in TLS or Internet-facing connection defense.
   No global firewall, routing or sysctl repair; no DNS, UDP, IPv6 or host-network mode.
 - One durable admission/state coordinator per worker, a fixed bounded pool for
   parallel runtime I/O across sandboxes, per-sandbox exclusion, separate restore
-  slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic records,
-  caller-chosen idempotency IDs, short asynchronous HTTP acceptance and separate
-  operation polling. Worker admission is final; stale controller capacity cannot
+  slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic
+  lifecycle records. **Blocking API:** each request returns its real outcome
+  (create when running, exec/HTTP results, capture after publication and source
+  recovery, delete after cleanup) within a route-specific bounded deadline. A client
+  disconnect or timeout does not orphan a sandbox (exec/HTTP/capture/delete finish
+  with normal cleanup; a create whose reply the worker could not deliver is deleted
+  as `create_response_lost`), except when a later hop loses a reply the worker
+  already handed over; the sandbox's TTL bounds that case. The controller chooses the
+  worker and generates an opaque sandbox ID that routes later calls; clients never
+  name nodes. Worker admission is final; stale controller capacity cannot
   reserve memory or start a workload. CPU quota admission has an explicit bounded
   operator overcommit factor, rather than assuming each idle quota consumes a
   physical CPU.
@@ -76,10 +88,10 @@ RBAC, built-in TLS or Internet-facing connection defense.
   exact kernel/CPU/architecture/runc/CRIU/config compatibility. All published
   templates/layers are retained; automatic cache eviction/GC and S3 transfer are
   not implemented.
-- `runc exec` with argv, bounded output/deadline and durable results. A bound
+- `runc exec` with argv, bounded output/deadline and inline results. A bound
   violation conservatively terminates the **whole sandbox**, not just its runc
   client. Each exec uses an owned child cgroup and cleans descendants even after
-  a successful parent exit. Application HTTP is a distinct bounded, asynchronous operation: a tracked helper
+  a successful parent exit. Application HTTP is a distinct bounded, blocking request: a tracked helper
   reaches only that sandbox's fixed guest address and template-approved service port.
   Text-only requests/results, no arbitrary upstream, redirects or management credentials.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private

@@ -13,6 +13,7 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
@@ -212,14 +213,25 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "isolation") || !strcmp(argv[1], "network-isolation")) {
         if (getuid() != 65534 || getgid() != 65534 || getpid() == 1) return 4;
-        int fd = socket(!strcmp(argv[1], "network-isolation") ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
-        if (fd >= 0 || errno != EPERM) return 5;
-        if (!strcmp(argv[1], "network-isolation")) {
-            for (int family=0; family<2; family++) {
-                fd = socket(family ? AF_PACKET : AF_INET, family ? SOCK_RAW : SOCK_DGRAM, 0);
-                if (fd >= 0 || errno != EPERM) return 5;
-            }
-        }
+        /* Seccomp only guards CRIU checkpointability (AgentENV pattern). */
+        if (syscall(__NR_io_uring_setup, 1, NULL) != -1 || errno != ENOSYS) return 5;
+        if (socket(AF_INET, SOCK_STREAM, 262 /* IPPROTO_MPTCP */) >= 0 || errno != EPROTONOSUPPORT) return 5;
+        /* Raw packet sockets need a capability the workload does not have. */
+        if (socket(AF_PACKET, SOCK_RAW, 0) >= 0 || errno != EPERM) return 5;
+        /* Isolated: loopback only. Both modes: IPv6 has no route. */
+        struct sockaddr_in v4 = {.sin_family=AF_INET, .sin_port=htons(80)};
+        struct sockaddr_in6 v6 = {.sin6_family=AF_INET6, .sin6_port=htons(80)};
+        if (inet_pton(AF_INET, "198.51.100.1", &v4.sin_addr) != 1 || inet_pton(AF_INET6, "2001:db8::1", &v6.sin6_addr) != 1) return 2;
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) fail("tcp socket");
+        if (strcmp(argv[1], "network-isolation") && (connect(fd, (struct sockaddr *)&v4, sizeof(v4)) == 0 || errno != ENETUNREACH)) return 5;
+        close(fd);
+        fd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (fd < 0) fail("tcp6 socket");
+        if (connect(fd, (struct sockaddr *)&v6, sizeof(v6)) == 0 || (errno != ENETUNREACH && errno != EADDRNOTAVAIL)) return 5;
+        close(fd);
+        printf("seccomp_guards io_uring=ENOSYS mptcp=EPROTONOSUPPORT\n");
+        fflush(stdout);
         if (!access("/sys", F_OK) || !access("/dev/nvidia0", F_OK)) return 6;
         return read_file("/proc/self/status");
     }

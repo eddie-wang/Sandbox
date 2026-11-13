@@ -117,10 +117,9 @@ pub fn verify(path: &Path, expected: &Artifact, max: u64) -> Result<()> {
     if actual.sha256 != expected.sha256 || actual.bytes != expected.bytes { Err("artifact_digest_mismatch") } else { Ok(()) }
 }
 
-// Verify the manifest's ownership and digest, schema, compatibility and matching checkpoint fields.
-// Fully hash the base image and any upper/checkpoint archives before returning the template; no
-// verified-artifact cache is used.
-pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> Result<Manifest> {
+// Bounded manifest-only checks (digest sidecar, strict fields, exact host
+// compatibility), cheap enough for admission. Artifact digests are not read.
+pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Result<Manifest> {
     if !valid_id(id) { return Err("invalid_template_id"); }
     let dir = root.join("templates").join(id);
     trusted_directory(&dir)?;
@@ -135,13 +134,21 @@ pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> R
         || m.runtime != "runc_criu" || &m.compatibility != compatibility
         || !m.network.valid() || m.uid != 65534 || m.gid != 65534
         || m.upper.is_some() != m.checkpoint.is_some()
-        || m.upper.is_some() != m.memory_mib.is_some() || m.upper.is_some() != m.vcpus.is_some()
+        // Warm templates require exact resources; cold ones may declare create defaults.
+        || (m.upper.is_some() && (m.memory_mib.is_none() || m.vcpus.is_none()))
+        || m.memory_mib.is_some_and(|v| !(1..=1_048_576).contains(&v)) || m.vcpus.is_some_and(|v| !(1..=4_096).contains(&v))
         || m.upper.is_some() != m.oci_config_sha256.is_some()
         || m.oci_config_sha256.as_ref().is_some_and(|d| !hex_digest(d))
         || m.init_argv.is_empty() || m.init_argv.len() > 64
         || m.init_argv.iter().any(|a| a.len() > 4096 || a.contains('\0')) || !m.init_argv[0].starts_with('/')
     { return Err("incompatible_template"); }
     if !hex_digest(&m.base.sha256) { return Err("invalid_artifact_descriptor"); }
+    Ok(m)
+}
+
+pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> Result<Manifest> {
+    let m = load_manifest(root, id, compatibility)?;
+    let dir = root.join("templates").join(id);
     verify(&root.join("layers").join(format!("{}.erofs", m.base.sha256)), &m.base, max)?;
     if let Some(a) = &m.upper { verify(&dir.join("upper.tar"), a, max)?; }
     if let Some(a) = &m.checkpoint { verify(&dir.join("checkpoint.tar"), a, max)?; }
