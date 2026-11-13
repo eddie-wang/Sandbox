@@ -73,7 +73,8 @@ The controller does not launch containers itself. The worker uses existing Linux
 
 | Piece | What it does |
 | --- | --- |
-| **runc** | Starts a container or runs another command inside it. |
+| **runc** | Creates/starts a container or runs another command inside it. |
+| **conmon 2.1.10** | Supervises container init, completes startup/PID synchronization and saves exit/OOM evidence. |
 | **CRIU** | Saves and restores running processes, including their memory. The worker asks runc to perform these operations. |
 | **EROFS** | Stores the shared, read-only base filesystem in an image. |
 | **OverlayFS** | Makes the shared base and one sandbox's private changes appear as one filesystem. |
@@ -91,7 +92,7 @@ Suppose a client wants a sandbox from template `example-template`. It sends only
 6. **If the worker said no before starting anything, the controller tries another node.** Examples are "no capacity", "busy" and "I don't have a usable copy of this template". It makes at most three attempts, each with a new ID. If the outcome is uncertain — the connection broke, the wait ran out, or the worker failed after it started — the controller does **not** try elsewhere. It reports the error together with the ID, so the client can look at or delete that sandbox.
 7. **Background work checks the template files.** The create's own background job verifies each layer's checksum the first time the node uses it (two creates needing the same new layer check it once; creates whose layers are already checked never wait for someone else's check). The result is saved with the file's identity, so a worker restart does not check an unchanged layer again; a changed file is checked again. Then the template's shared read-only layers are mounted (its base and, for a warm template, the layers sealed by captures); later creates reuse the verified mount. For a warm template it also takes the node's copy of the saved processes, unpacked and verified once per template, written safely to disk before it is used, and shared by every later restore.
 8. **The worker prepares this sandbox's private environment.** It creates the writable directories, mounts OverlayFS, installs resource limits and any permitted networking, and writes the container's configuration file.
-9. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions. The first process in every container is a tiny standard init program, `tini`, which starts the template's application, passes signals on to it and cleans up finished child processes ("zombies"), much like Docker's `--init`.
+9. **The worker starts or restores the application.** For a files-only template it uses conmon's create/PID handshake, then explicitly calls `runc start`. For saved processes it uses conmon `--restore`, forwarding CRIU options to runc and keeping the worker's CRIU annotation. These are descriptions of worker-generated commands, not standalone setup instructions. The first process in every container is a tiny standard init program, `tini`, which starts the template's application, passes signals on to it and cleans up finished child processes ("zombies"), much like Docker's `--init`.
 10. **The worker verifies the container is running, and only then does the client get its answer.** The response (`201 Created`) contains the new ID and `running`. If creation failed, the worker first cleans up and the client receives the reason.
 
 The status budget counts **resources already promised to sandboxes**, not a live measurement of free host RAM. The controller's check is an early filter; it cannot reserve resources on a worker. For example, two requests can pass the same cached check, but the worker must still prevent them from reserving the same remaining capacity.
@@ -201,7 +202,9 @@ Lazy-page restoration remains unimplemented: a small-image experiment is not eno
 
 ### Built resource and mount ownership
 
-runc alone creates and configures each sandbox's resource group from the execution specification, including memory, no swap, CPU, process count and whole-group out-of-memory killing. Restores create independent target groups even when CRIU ignores captured group reconstruction. Helper groups, command child groups and the expiry watchdog remain worker-owned; the driver is cgroupfs, not systemd.
+runc alone creates and configures each sandbox's resource group from the execution specification, including memory, no swap, CPU, process count and whole-group out-of-memory killing. Restores create independent target groups even when CRIU ignores captured group reconstruction. Helper groups, monitor groups, command child groups and the expiry watchdog remain worker-owned; the driver is cgroupfs, not systemd.
+
+Init supervision is built using conmon 2.1.10, following its startup protocol and Podman's create/start sequence. Passthrough logging keeps workload standard streams on `/dev/null`; command execution stays on the existing runc path. Each monitor has a durable group outside the short-lived helper tree. Deletion and worker restart drain monitors before reclaiming their resources, preserving exit codes, OOM markers and counters before the workload group is removed. The watcher uses real init exit evidence; loss of a monitor fails closed. Saved monitor evidence stays with records. This adds an operator-staged conmon prerequisite, not a service or CNI integration. Older templates must be republished/recaptured for the new layout fingerprint.
 
 Before starting threads, the worker checks its operator-provided pod-private mount boundary and detaches the namespace-anchor propagation locally. It never changes node mount propagation. Mount inventory decodes escaped paths and optional fields. Teardown retries only busy errors for a bounded time and never treats lazy detachment as completed cleanup. Reservations and backing files stay owned until real cleanup succeeds. Hardlinks in sealed layers are qualified, but the unchanged index-off options can split lower hardlinks on copy-up; stable inode numbers are not promised.
 
@@ -221,7 +224,8 @@ Before starting threads, the worker checks its operator-provided pod-private mou
 | [`model.rs`](../src/model.rs) | Defines request/status fields and checks valid values. |
 | [`phases.rs`](../src/phases.rs) | Records operation step durations and bounded cumulative histograms. |
 | [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work and its results, running commands, expiry and restart cleanup. |
-| [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU; runs each command in its own resource group. |
+| [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; coordinates conmon/runc/CRIU; runs each command in its own resource group. |
+| [`monitor.rs`](../src/monitor.rs) | Completes conmon startup, owns monitor groups and retains exit/OOM evidence through cleanup and restart. |
 | [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time (passing command output on as it arrives), and safely writes saved JSON records. |
 | [`storage.rs`](../src/storage.rs) | Checks template files, handles file archives and publishes complete templates. |
 | [`network.rs`](../src/network.rs) | Keeps the pool of pre-built routing environments, connects each sandbox's private network to one, applies and resets its traffic rules. |
@@ -260,7 +264,7 @@ There is no full E2B-compatible API, public fork/pause/resume API, automatic tem
 
 ### What has passed
 
-Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linux host, with at most three containers (33 in the burst test), each limited to 64 MiB, one vCPU and 64 processes. They checked:
+Real tests used runc 1.3.6, conmon 2.1.10, CRIU 4.3 and a tiny application on one approved Linux host, with at most three containers (33 in the burst test), each limited to 64 MiB, one vCPU and 64 processes. They checked:
 
 - Cold startup, private file changes, capture without stopping the source (and a failed capture that leaves it running, a checkpoint stopped at its time limit that is reported as interrupted and leaves the source running, and a failed capture whose source died that deletes it), independent restore, a capture of a restored copy and a restore from that two-layer template, and reuse of the node's saved-process copy.
 - Layer checking in the create job (once for two simultaneous creates), trusted again after a worker restart, checked again after the file changes, and a damaged layer rejected; with the real image, a cold create after a restart that does not check the base again.

@@ -5,7 +5,7 @@ A small Rust controller/scheduler and Linux node worker for stateful tool execut
 **[Current architecture and implementation status](plans/container-architecture-eddie-wang-2026-11-12.md)**
 
 **Status: experimental real-runtime implementation; the bounded native lifecycle
-smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This includes
+smoke passed on one approved Linux x86-64 host (runc 1.3.6, conmon 2.1.10, CRIU 4.3).** This includes
 IPv4 TCP allowlists and the streaming app proxy (path and host forms, binary and
 chunked bodies) inside a disposable outer test netns, restored listening
 sockets/fresh connections, and the existing lifecycle cases: cold create, capture
@@ -171,15 +171,23 @@ RBAC, built-in TLS or Internet-facing connection defense.
   sealed layer; checkpoint-cache sync touches only extracted files.
   Lazy-page restore is not enabled or supported.
 - runc alone creates/configures sandbox cgroups from OCI memory/swap/CPU/pids and
-  whole-group OOM limits, including restored copies; helpers and per-exec groups
-  remain worker-owned. The driver is cgroupfs, not systemd.
+  whole-group OOM limits, including restored copies; helpers, monitors and per-exec
+  groups remain worker-owned. The driver is cgroupfs, not systemd.
+- Conmon 2.1.10 supervises each init, using the complete startup/PID handshake:
+  cold create then runc start, or conmon restore with CRIU options. Passthrough
+  logging preserves `/dev/null` workload stdio. Exit codes and cgroup-v2 OOM evidence
+  are retained under `monitors/<id>/`, not inferred from an empty workload group.
+  Monitor loss fails closed. Exec remains the existing bounded `runc exec` path.
 - Worker startup verifies pod-private mount propagation before threads start.
   Mount inventory decodes escaped paths and propagation fields; overlay/lower and
   netns-pin teardown retries only busy unmounts, never lazy-detaches as success.
-- Deletion kills the owned cgroup, deletes runc state, unmounts only the private
+- Deletion kills the workload, drains its separately owned monitor, saves exit/OOM
+  evidence before runc removes the group, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting
-  unverified running state. Shared layers outlive individual sandboxes.
+  unverified running state, including monitors left by a worker crash. Shared layers
+  outlive individual sandboxes. The conmon layout fingerprint rejects older templates;
+  republish cold templates and recapture warm templates before upgrading.
 
 See [network architecture](docs/network.md), [API](docs/api.md), [serialized contracts](docs/contracts.md) and the
 [explicitly privileged qualification recipe](docs/runtime.md). The latter builds

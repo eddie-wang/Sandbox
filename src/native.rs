@@ -23,6 +23,7 @@ pub struct Native {
     tools: BTreeMap<String, String>,
     pub search_path: String,
     pub helpers: process::Helpers,
+    pub monitors: crate::monitor::Monitors,
     // Result of the active backing-directory probe, chosen once under the root lock.
     pub volatile_overlay: bool,
     // Chosen once by a tiny active probe under the root lock; never changed after a lower failure.
@@ -171,7 +172,7 @@ fn remove_group(path: &Path) -> Result<()> {
     }
 }
 
-const TOOL_NAMES: &[&str] = &["runc", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini"];
+const TOOL_NAMES: &[&str] = &["runc", "conmon", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini"];
 
 // Decide whether a trusted tool is a statically linked ELF executable (no program interpreter), so
 // it runs inside any image's root filesystem. Unreadable or malformed files count as not static.
@@ -279,13 +280,14 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let output = process::version(tools.get(name)?, search_path.as_ref().ok()?).ok()?;
         (!output.interrupted && output.exit_code == Some(0)).then(|| output.stdout.trim().to_owned())
     };
+    add("conmon_protocol_version", version("conmon").is_some_and(|v| v.lines().next() == Some("conmon version 2.1.10")));
     // CPU features are not fingerprinted here: CRIU checks them per warm template (cpu_compatible).
     let compatibility = (|| {
         // Restored processes map the init executable, so its exact bytes are part of compatibility.
         let init = storage::artifact(Path::new(tools.get("tini")?), 1 << 26).ok()?;
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             runc_version: version("runc")?, criu_version: version("criu")?,
-            init_sha256: init.sha256, layout: "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1".to_owned() })
+            init_sha256: init.sha256, layout: "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1".to_owned() })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
     let erofs = ErofsStatus { file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };
@@ -293,8 +295,8 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
 }
 
 impl Native {
-    // Lock the root, drain old helpers, then verify pod-private mounts before starting threads.
-    // Create private storage and discard interrupted cache entries, rejecting unknown state.
+    // Lock the root, drain old helpers and open durable monitor ownership before starting threads.
+    // Verify private mounts/storage and discard interrupted cache entries, rejecting unknown state.
     // Probe EROFS and actual overlay features under the lock before advertising readiness.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
@@ -320,7 +322,8 @@ impl Native {
             }
         }
         let verified = load_verified(root);
-        let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, volatile_overlay: false, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
+        let monitors = crate::monitor::Monitors::open(root, Path::new(&config.cgroup_parent))?;
+        let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, monitors, volatile_overlay: false, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
             verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock };
         native.volatile_overlay = native.probe_overlay()?;
         native.clear_erofs_probe()?;
@@ -432,22 +435,28 @@ impl Native {
         let program = if tool == "self" { format!("/proc/{}/exe", std::process::id()) } else { self.tool(tool)?.to_owned() };
         process::checked(&program, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers, Some(netns))
     }
-    // Run runc with bounded time and output; log every failure with bounded diagnostics. Detached
-    // runs/restores inherit /dev/null (CRIU-restorable); only runc's own messages go to runc.log.
+    // Run short-lived runc control commands with bounded time/output and failure diagnostics.
+    // Init creation and restore instead run under conmon, never the kill-on-return helper leaf.
     pub fn runc(&self, args: Vec<String>, timeout: Duration, limit: usize) -> Result<process::Output> {
-        let detached = args.first().is_some_and(|a| a == "run" || a == "restore");
-        let log = match args.last() { Some(id) if detached => self.private(id).join("runc.log").display().to_string(), _ => "/dev/null".into() };
         let tool = format!("runc {}", args.first().map_or("", String::as_str));
-        let mut all = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), log.clone()];
+        let mut all = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), "/dev/null".into()];
         all.extend(args);
-        let out = self.helpers.run(self.tool("runc")?, &all, timeout, limit, detached, &self.search_path, None)
+        let out = self.helpers.run(self.tool("runc")?, &all, timeout, limit, false, &self.search_path, None)
             .inspect_err(|code| process::log_failure(&tool, code, None, ""))?;
         if out.interrupted || out.exit_code != Some(0) {
-            let stderr = if detached { tail(Path::new(&log), 4096) } else { out.stderr.clone() };
             let code = if out.interrupted { "runc_deadline_or_output_limit" } else { "runc_failed" };
-            process::log_failure(&tool, code, out.exit_code, &stderr);
+            process::log_failure(&tool, code, out.exit_code, &out.stderr);
         }
         Ok(out)
+    }
+    // Start init through conmon's create/PID handshake, then explicitly start cold containers.
+    // Restore starts inside conmon already (Podman v4.9.0 createOCIContainer/StartContainer).
+    fn start_init(&self, id: &str, images: Option<&Path>) -> Result<()> {
+        let pid = self.monitors.launch(id, self.tool("conmon")?, self.tool("runc")?, &self.private(id),
+            &self.root().join("runc"), images, &self.search_path, Duration::from_secs(self.config.command_timeout_seconds))
+            .inspect_err(|e| process::log_failure("conmon", e, None, &tail(&self.private(id).join("runc.log"), 4096)))?;
+        if images.is_none() { self.runc_checked(vec!["start".into(), id.into()]).map_err(|_| "runtime_start_failed")?; }
+        self.monitors.started(id, pid)
     }
     // Require an uninterrupted successful runc exit; runc logs the bounded failure diagnostics.
     fn runc_checked(&self, args: Vec<String>) -> Result<()> {
@@ -516,11 +525,11 @@ impl Native {
         self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).insert(cpuinfo.sha256.clone(), true);
         Ok(Some(cpuinfo))
     }
-    // Check that no network, private storage, runtime state or resource group already uses this sandbox
-    // ID.
+    // Check that no network, private storage, runtime state or workload/monitor group uses this ID.
+    // Retained monitor exit evidence is not a live resource.
     pub fn resources_absent(&self, id: &str) -> bool {
         self.network_absent(id) && !self.private(id).exists() && !self.root().join("runc").join(id).exists()
-            && !Path::new(&self.config.cgroup_parent).join(id).exists()
+            && !Path::new(&self.config.cgroup_parent).join(id).exists() && !self.monitors.path.join(id).exists()
     }
     // Return the shared read-only mount point of one EROFS layer.
     fn lower(&self, digest: &str) -> PathBuf { self.root().join("lowers").join(digest) }
@@ -698,7 +707,7 @@ impl Native {
     }
     // Build a sandbox: private directories, an overlay root whose lowers are the template's verified
     // sealed layers above its base, with a fresh empty upper, plus its resource group, network and
-    // execution specification. Then start it cold or restore it from the shared checkpoint images and
+    // execution specification. Then use conmon for cold start or shared-image restore and
     // confirm it runs, timing each step. Partial state is left for the caller's cleanup.
     pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, images: Option<&Path>, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool, phases: &mut Phases) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -737,7 +746,7 @@ impl Native {
         phases.mark("oci_spec");
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
         if let Some(images) = images { self.restore(id, images)?; phases.mark("runc_restore"); }
-        else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; phases.mark("runc_run"); }
+        else { self.start_init(id, None)?; phases.mark("runc_run"); }
         self.ensure_running(id)?;
         phases.mark("ensure_running");
         Ok(())
@@ -810,11 +819,20 @@ impl Native {
             "capabilities":{"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]},
             "noNewPrivileges":true,"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":1024},{"type":"RLIMIT_CORE","hard":0,"soft":0}]})
     }
-    // Ask runc for container state and require a successful response reporting it as running.
+    // Require both a live monitor and runc's running state. An early init exit is a workload end,
+    // not a runtime-start failure; conmon may need a short interval to publish that exit.
     pub fn ensure_running(&self, id: &str) -> Result<()> {
+        let workload = Path::new(&self.config.cgroup_parent).join(id);
+        if let Some(reason) = self.monitors.ended(id, &workload)? { return Err(reason); }
         let out = self.runc(vec!["state".into(), id.into()], Duration::from_secs(5), 16384)?;
         let state: Value = serde_json::from_str(&out.stdout).map_err(|_| "container_not_running")?;
-        if out.exit_code != Some(0) || state["status"] != "running" { return Err("container_not_running"); }
+        if out.exit_code != Some(0) || state["status"] != "running" {
+            for _ in 0..100 {
+                if let Some(reason) = self.monitors.ended(id, &workload)? { return Err(reason); }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return Err("container_not_running");
+        }
         Ok(())
     }
     // Freeze every process of the sandbox (cgroup freezer) through runc.
@@ -862,15 +880,13 @@ impl Native {
             "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), id.into()])
             .map_err(|e| if e == "runc_deadline_or_output_limit" { "checkpoint_interrupted" } else { "checkpoint_failed" })
     }
-    // Restore captured processes, including established TCP connections, external Unix sockets and
-    // file locks, into a new target group. runc v1.3.6 criuApplyCgroups applies/sets OCI resources even
-    // with CRIU manage-cgroups=ignore; never reuse the captured source group. Images stay read-only.
+    // Restore through conmon's --restore/runtime-opt bridge (v2.1.10 runtime_args.c), retaining
+    // AgentENV's TCP/Unix/file-lock flags and CRIU annotation. runc applies fresh target resources
+    // even with manage-cgroups=ignore; images stay read-only and stdio stays /dev/null.
     pub fn restore(&self, id: &str, images: &Path) -> Result<()> {
         // Same restore-only options as the AgentENV container backend, plus the network lock method.
         fs::write(self.private(id).join("criu.conf"), "allow-uprobes\nmntns-compat-mode\nnetwork-lock nftables\n").map_err(|_| "criu_config_failed")?;
-        self.runc_checked(vec!["restore".into(), "--detach".into(), "--bundle".into(), self.private(id).display().to_string(),
-            "--image-path".into(), images.display().to_string(), "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
-            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()])
+        self.start_init(id, Some(images))
             .map_err(|_| {
                 // CRIU's own reason is in its restore log, which cleanup removes: log its error lines.
                 let log = tail(&self.private(id).join("criu-work").join("restore.log"), 65536);
@@ -920,13 +936,14 @@ impl Native {
         }
         Ok(())
     }
-    // Tear down everything a sandbox owns: kill its processes and remove its exec groups, wait until
-    // its processes are gone, delete runc state, remove its resource group, return its network slot
+    // Tear down owned resources: kill the workload/execs, drain its monitor and save exit/OOM
+    // evidence before deleting runc state or its group, then return its network slot
     // to the pool and remove its guest network, unmount its root and delete private files, timing
     // each step. Stop at the first failure so the caller can retry.
     pub fn cleanup(&self, id: &str, network_slot: Option<usize>, phases: &mut Phases) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
+        self.monitors.stop_startup(id)?;
         let cgroup = Path::new(&self.config.cgroup_parent).join(id);
         if cgroup.exists() {
             fs::write(cgroup.join("cgroup.kill"), "1").map_err(|_| "cgroup_kill_failed")?;
@@ -938,6 +955,7 @@ impl Native {
         // A container runc does not yet see as stopped (or still sees as paused) is force-deleted.
         if cgroup.exists() { wait_unpopulated(&cgroup)?; }
         phases.mark("cgroup_drain");
+        self.monitors.finish(id, &cgroup)?;
         let state_dir = self.root().join("runc").join(id);
         if state_dir.exists() {
             let plain = self.runc(vec!["delete".into(), id.into()], Duration::from_secs(self.config.command_timeout_seconds), 65536);
@@ -963,8 +981,8 @@ impl Native {
         phases.mark("private_remove");
         Ok(())
     }
-    // Drain and remove the worker-owned host-command resource groups.
-    pub fn remove_helpers(&self) -> Result<()> { self.helpers.remove() }
+    // Remove empty monitor ownership, then drain and remove host-command resource groups.
+    pub fn remove_helpers(&self) -> Result<()> { self.monitors.remove().and_then(|_| self.helpers.remove()) }
     // Unmount known shared layer mounts (bases and sealed capture layers) after helper cleanup is
     // healthy, verifying each mount before removal.
     pub fn unmount_lowers(&self) -> Result<()> {

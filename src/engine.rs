@@ -67,7 +67,7 @@ pub struct Handle {
 // their phase timings include the wait for this mailbox.
 pub enum Work {
     Create(CreateRequest, Instant, Reply), Exec(String, ExecRequest, Instant, ExecSink), Kill(String, u64, Reply), Capture(String, CaptureRequest, Instant, Reply), Delete(String, Instant, Reply),
-    Complete(usize, Box<Done>), ExecDone(String, u64, Box<ExecDone>), CpuChecked(String, Result<bool>), Exited(String), Stop(mpsc::Sender<Result<()>>),
+    Complete(usize, Box<Done>), ExecDone(String, u64, Box<ExecDone>), CpuChecked(String, Result<bool>), Exited(String, &'static str), Stop(mpsc::Sender<Result<()>>),
 }
 enum Action { Create, Capture(CaptureRequest, String), Delete }
 // A finished job as its operation worker reports it: the updated record, whether the job saved it as
@@ -109,7 +109,7 @@ fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = 
 
 impl Handle {
     // Fail closed if disabled or preflight fails; otherwise reconcile and start admission, operation,
-    // lower-mount, CPU-check and expiry workers. Work survives HTTP disconnects. Shutdown waits for
+    // lower-mount, CPU-check and expiry/monitor watchers. Work survives HTTP disconnects. Shutdown waits for
     // jobs, commands and per-sandbox cleanup, then removes shared mounts and the slot pool. Startup
     // records active EROFS/overlay checks separately from read-only CLI prerequisites.
     pub fn start(config: &WorkerConfig, mut report: Preflight) -> Result<Self> {
@@ -186,6 +186,7 @@ impl Handle {
         let view = snapshot.clone();
         let events = tx.clone();
         let parent = native.config.cgroup_parent.clone();
+        let monitored = native.clone();
         std::thread::Builder::new().name("sandbox-expiry".into()).spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let scan: Vec<_> = {
@@ -197,9 +198,11 @@ impl Handle {
                     if kill {
                         if let Some(c) = cancelled { c.store(true, Ordering::Relaxed); }
                         let _ = fs::write(Path::new(&parent).join(&id).join("cgroup.kill"), "1");
-                    } else if running && cancelled.is_none() && fs::read_to_string(Path::new(&parent).join(&id).join("cgroup.events"))
-                        .is_ok_and(|text| text.lines().any(|l| l == "populated 0")) {
-                        let _ = events.try_send(Work::Exited(id));
+                    } else if running && cancelled.is_none() {
+                        match monitored.monitors.ended(&id, &Path::new(&parent).join(&id)) {
+                            Ok(None) => {},
+                            Ok(Some(reason)) | Err(reason) => { let _ = events.try_send(Work::Exited(id, reason)); }
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(250));
@@ -212,9 +215,9 @@ impl Handle {
                     Ok(Work::ExecDone(id, exec, done)) => engine.exec_done(&id, exec, *done),
                     Ok(Work::CpuChecked(digest, answer)) => engine.cpu_checked(&digest, answer),
                     Ok(Work::Stop(done)) => { engine.healthy = false; engine.stopping = Some(done); engine.publish(); },
-                    Ok(Work::Exited(id)) => {
+                    Ok(Work::Exited(id, reason)) => {
                         if !engine.flights.contains_key(&id) && engine.records.get(&id).is_some_and(|r| r.state == "running") {
-                            engine.records.get_mut(&id).unwrap().error = Some("workload_exited".into());
+                            engine.records.get_mut(&id).unwrap().error = Some(reason.into());
                             engine.request_delete(&id, None);
                         }
                     }
@@ -610,7 +613,7 @@ impl Engine {
         eprintln!("{}", phases.log_line(operation, id, result));
         phases::record(&mut self.snapshot.write().expect("snapshot poisoned").status.phases, operation, phases);
     }
-    // Load saved sandbox records and reject invalid or untracked resources. Kill and clean up every
+    // Load saved sandbox records and reject invalid or untracked workload/monitor resources. Kill and clean up every
     // sandbox left from before the restart and remove abandoned staging. Release unused lower mounts,
     // replace the network slot pool with freshly built slots and save cleanup status; durability or
     // slot-removal failures prevent startup.
@@ -628,6 +631,7 @@ impl Engine {
             self.records.insert(id.into(), r);
         }
         self.native.verify_network_names(self.records.keys().map(String::as_str))?;
+        self.native.monitors.reconcile(&self.records.keys().cloned().collect())?;
         for name in ["private", "runc"] {
             for entry in fs::read_dir(self.native.root().join(name)).map_err(|_| "private_scan_failed")? {
                 if !entry.map_err(|_| "private_scan_failed")?.file_name().to_str().is_some_and(|id| self.records.contains_key(id)) { return Err("untracked_private_state"); }
@@ -635,7 +639,7 @@ impl Engine {
         }
         for entry in fs::read_dir(&self.native.config.cgroup_parent).map_err(|_| "cgroup_scan_failed")? {
             let e = entry.map_err(|_| "cgroup_scan_failed")?;
-            if e.file_type().map_err(|_| "cgroup_scan_failed")?.is_dir() && e.path() != self.native.helpers.path() && !e.file_name().to_str().is_some_and(|id| self.records.contains_key(id)) { return Err("untracked_cgroup_state"); }
+            if e.file_type().map_err(|_| "cgroup_scan_failed")?.is_dir() && e.path() != self.native.helpers.path() && e.path() != self.native.monitors.path && !e.file_name().to_str().is_some_and(|id| self.records.contains_key(id)) { return Err("untracked_cgroup_state"); }
         }
         let ids: Vec<_> = self.records.keys().cloned().collect();
         for id in ids {

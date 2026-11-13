@@ -14,6 +14,7 @@ mod proxy;
 mod storage;
 mod mounts;
 mod overlay;
+mod monitor;
 
 use std::path::Path;
 

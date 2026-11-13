@@ -41,6 +41,11 @@ exclusive to that worker; operators must not share it between worker roots.
                                   one in-flight capture reserving that template ID;
                                   a failed removal blocks that ID until restart
   runc/                           private runc state root
+  monitors/<sandbox-id>/          retained conmon exit/OOM evidence, not a guest mount
+    conmon.pid init.pid           diagnostic PIDs, never used alone to signal a process
+    started.json                  successful runtime start/PID handshake
+    exit oom                      conmon exit code and optional OOM-event marker
+    result.json                   synced exit/OOM summary saved before group deletion
 ```
 
 The manifest sidecar is lowercase SHA-256 plus LF over the exact JSON bytes.
@@ -292,9 +297,10 @@ PID 1 of every sandbox is the operator-staged static `tini` (a required trusted 
 checked static by preflight), bind-mounted read-only at `/.sandbox-init`. It runs the
 template's `init_argv` as its child, forwards signals and reaps orphaned processes
 (for example killed exec descendants), and is checkpointed with the workload. Its
-stdio, like the workload's, is `/dev/null`: detached runc runs/restores inherit
-`/dev/null`, which CRIU can restore (a pipe hangs a detached run; a file is not
-restorable), and runc's own log goes to `/dev/null`. The workload has UID/GID
+stdio, like the workload's, is `/dev/null`: conmon's passthrough mode keeps the
+runtime's inherited null descriptors (no logging pipes or attach API). Conmon is
+outside the guest, subreaps init and persists exit/OOM files. Runc startup diagnostics
+use the private `runc.log`, not workload stdio. The workload has UID/GID
 65534, empty capabilities, no_new_privs, minimal /dev, its own proc/PID/mount/net/IPC/
 UTS/cgroup namespaces and a seccomp profile matching the AgentENV container backend:
 `SCMP_ACT_ALLOW` by default, with only two checkpointability guards that CRIU needs:
@@ -320,19 +326,29 @@ on successful completion too, including children that keep stdout/stderr open.
 Exec clamps its deadline to remaining TTL; a deadline, output overflow, kill request
 or sandbox deletion kills **only that command's group**, never the sandbox. A group
 that cannot be emptied within five seconds deletes the sandbox (fail closed). Delete
-first kills the owned cgroup (all descendants), removes leftover `exec-<n>` groups
-(any other child group is unknown state and fails), force-deletes private runc
-state, checks for no populated cgroup, unmounts the private overlay, then removes
-private state.
+first stops unfinished monitor startup, kills the workload group (all descendants),
+removes leftover `exec-<n>` groups (other children fail closed), waits for conmon to
+reap and persist exit/OOM evidence, then drains its separately owned monitor group.
+Before runc can remove the workload group, cleanup saves `result.json` containing
+`exit_code` (nullable), `oom` (an event/marker), `oom_kill` (nullable counter),
+`monitor_lost` and `runtime_started`. A 137 exit alone is not classified as OOM.
+Cleanup tries plain runc delete before force deletion, checks for no populated
+group, unmounts the private overlay, then removes private state. Monitor evidence
+stays with retained records and does not reserve capacity after successful cleanup.
 Reservation release follows successful cleanup exactly once. Failure remains
 `cleanup_failed`, reserved, observable and retryable. Never recurse into a live mount.
 
 On restart, records are loaded and ownership validated before admission. Previously
 live/interrupted workloads are killed/cleaned, in-flight requests lose their responses, and stopped
-private resources are reconciled. Unexplained runc/private/cgroup entries fail startup
+private resources and durable `.monitors-<root-digest>/<id>` groups are reconciled.
+The monitor is never in a kill-on-return helper leaf. The watcher detects real init
+exits from conmon's file and fails closed on monitor loss, not workload-group
+emptiness. Unexplained runc/private/monitor/cgroup entries fail startup
 rather than being silently adopted/deleted. Published templates survive source and
 child deletion. Abrupt worker death does not itself kill containers; an operator
 must restart the worker with the same root/config promptly to reconcile them.
+The `-conmon-null-v1` layout requires republished cold and recaptured warm templates;
+older templates are rejected even though the null-descriptor model is preserved.
 
 ## Qualification
 

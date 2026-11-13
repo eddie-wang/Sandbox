@@ -196,6 +196,15 @@ creates reuse the verified mounts and cache. TTL starts at admission. A dedicate
 cgroup at expiration independently of long artifact work; private cleanup follows.
 Timer/scheduling granularity is not a hard real-time guarantee.
 
+Init is supervised by conmon, using create/PID synchronization followed by cold
+start, or restore. A cold runtime startup failure is `runtime_start_failed` (or
+`runtime_start_timeout`); warm startup failures remain `restore_failed`. A workload
+that started and then exited is `workload_exited`, or `workload_oom` when a cgroup-v2
+OOM kill was observed. An immediate exit can fail create; a later exit triggers
+cleanup of the running sandbox. Loss of its monitor without an exit file triggers
+`monitor_lost` cleanup. Exit/OOM files are retained with worker records for operator
+inspection; no new guest-log or public exit-event endpoint is added.
+
 ### Exec
 
 ```json
@@ -222,10 +231,11 @@ final event, in both buffered and streaming modes; it cannot report `running`
 after a sandbox-cancelled exec. A normal end also kills what the command left behind (for
 example background children that kept its output open) and removes its group, so
 background jobs are not a supported exec contract. A nonzero program exit is a
-normal result. A start failure (for example runc refusing the command) is a result
-with a static `error` and no exit code; only a command whose group cannot be emptied
-within five seconds also deletes the sandbox (`exec_cleanup_failed`), because it
-may have left unknown processes.
+normal result. Exec still observes the runc client, not a conmon exec handshake:
+a runc startup refusal can also appear as a nonzero exit code. Worker-side setup
+failures return a static `error` with no exit code. Only a command whose group
+cannot be emptied within five seconds also deletes the sandbox
+(`exec_cleanup_failed`), because it may have left unknown processes.
 
 **Blocking mode** returns `200 {"exec_id":7,"exit_code":0,"stdout":"…","stderr":"…",
 "interrupted":false,"error":null,"sandbox_state":"running"}` after the command ended;

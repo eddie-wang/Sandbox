@@ -51,13 +51,23 @@ static void loopback_pair(int *client, int *server) {
     if (setsockopt(*client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))
         || setsockopt(*server, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) fail("loopback timeout");
 }
-/* Dispatch the smoke workload modes: persistent counter/mappings, a loopback TCP round trip and */
-/* optional HTTP service (echo, sized, binary pattern, chunked, counted upload and delay routes), */
-/* file operations, process-group, PID 1, zombie, isolation and syscall-guard checks, TCP connect and */
-/* path-MTU transfer, or deliberate delay/tick/output/descendant cases. Return each check's result; */
-/* init and stress modes keep running until stopped. */
+/* Dispatch persistent counter/TCP/HTTP services, file/isolation/guard checks and command bounds. */
+/* Monitor modes exit immediately, wait for a trigger then exit, or exceed the sandbox memory cap. */
+/* Return each check's result; init and stress modes keep running until stopped. */
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
+    if (!strcmp(argv[1], "exit-now")) return 23;
+    if (!strcmp(argv[1], "monitor-exit") || !strcmp(argv[1], "monitor-oom")) {
+        while (access("/workspace/go", F_OK) != 0) usleep(10000);
+        if (!strcmp(argv[1], "monitor-exit")) return 37;
+        /* The gate caps this container at 64 MiB; touch real pages rather than just reserving them. */
+        for (int i = 0; i < 128; i++) {
+            volatile char *memory = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (memory == MAP_FAILED) fail("oom allocation");
+            for (int offset = 0; offset < (1 << 20); offset += 4096) memory[offset] = 1;
+        }
+        return 99;
+    }
     if (!strcmp(argv[1], "process-group")) {
         pid_t group = getpgrp();
         if (group < 0) fail("getpgrp");

@@ -237,7 +237,7 @@ def mount_inventory_gate(binary, root, worker_config):
 
 
 # Run real lifecycle, rejection, bounds and restart gates with at most three live containers.
-# Check mount retries, active backing probes, OCI limits on cold/restored groups and sealed hardlinks.
+# Check mounts/storage, OCI limits and conmon ownership, including ordered exit and sync faults.
 # --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
 def main():
@@ -270,6 +270,7 @@ def main():
     owned_prefix = "sb-" + hashlib.sha256(str(root).encode()).hexdigest()[:16] + "-"
     slot_link_prefix = "sb" + hashlib.sha256(str(root).encode()).hexdigest()[:10]
     helpers = cgroup / (".helpers-" + hashlib.sha256(str(root).encode()).hexdigest())
+    monitors = cgroup / (".monitors-" + hashlib.sha256(str(root).encode()).hexdigest())
     worker_port, controller_port = port(), port()
     assert worker_port != controller_port
     token = secrets.token_urlsafe(48)
@@ -356,6 +357,16 @@ url = "http://127.0.0.1:{worker_port}"
                              ({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}),
                              memory_mib=64, vcpus=1, pids_max=64)
     write_template(root, manifest)
+    for mode in ("monitor-exit", "monitor-oom", "exit-now"):
+        write_template(root, dict(manifest, template_id=mode, init_argv=["/fixture", mode]))
+    # A non-directory at the fixed working path makes runc create fail, unlike a program's own exit.
+    bad_root = root / "bad-start-rootfs"
+    shutil.copytree(rootfs, bad_root)
+    shutil.rmtree(bad_root / "workspace")
+    (bad_root / "workspace").write_text("not a directory")
+    bad_image = root / "bad-start.erofs"
+    subprocess.run(["mkfs.erofs", str(bad_image), str(bad_root)], check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    write_template(root, dict(manifest, template_id="bad-start", base=publish_layer(root, bad_image)))
     # Two more cold bases for the layer-verification checks: "probe" adds 16 MiB of ballast (so
     # hashing it shows in the worker's read counter) and "probe-small" only a marker file.
     probe_bases = {}
@@ -418,9 +429,54 @@ url = "http://127.0.0.1:{worker_port}"
     def get(sandbox):
         return expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, timeout=4), 200)
 
-    # Require that the sandbox's private directory, cgroup and runc state are all gone.
+    # Require no private directory, workload/monitor group or runc state; retained exit files are OK.
     def gone(sandbox):
         assert not (root / "private" / sandbox).exists() and not (cgroup / sandbox).exists() and not (root / "runc" / sandbox).exists()
+        assert not (monitors / sandbox).exists()
+
+    # Check that conmon owns init in a durable group, never a host-helper leaf, with null init stdio.
+    def monitor_identity(sandbox):
+        evidence = root / "monitors" / sandbox
+        pid = int((evidence / "conmon.pid").read_text())
+        init = int((evidence / "init.pid").read_text())
+        assert str(pid) in (monitors / sandbox / "cgroup.procs").read_text().split()
+        assert os.readlink(f"/proc/{pid}/cwd") == str(evidence)
+        assert str(init) in (cgroup / sandbox / "cgroup.procs").read_text().split()
+        assert int(next(line for line in Path(f"/proc/{init}/status").read_text().splitlines() if line.startswith("PPid:")).split()[1]) == pid
+        assert all(os.readlink(f"/proc/{init}/fd/{fd}") == "/dev/null" for fd in range(3))
+        assert json.loads((evidence / "started.json").read_text())["pid"] == init
+        return pid
+
+    # Attach bounded, path-filtered syscall faults only to this worker's named threads. Never trace
+    # runtime children or credentials; the caller must detach before capture or service shutdown.
+    def trace_monitor(prefix, path, calls, fault, label):
+        tids = [int(p.name) for p in Path(f"/proc/{worker.pid}/task").iterdir() if (p / "comm").read_text().strip().startswith(prefix)]
+        assert tids, prefix
+        log = root / f"{label}.trace"
+        command = ["strace", "-I", "1", "-qq", "-y", "-o", str(log), "-e", f"trace={calls}", "-P", str(path), "-e", f"inject={fault}"]
+        for tid in tids:
+            command.extend(["-p", str(tid)])
+        with (root / f"{label}-tracer.log").open("wb") as errors:
+            tracer = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errors, env={"PATH": os.defpath, "LANG": "C"})
+        try:
+            eventually(lambda: tracer.poll() is None and all(f"TracerPid:\t{tracer.pid}\n" in Path(f"/proc/{tid}/status").read_text() for tid in tids), timeout=5)
+        except BaseException:
+            stop_trace(tracer)
+            raise
+        return tracer, log
+
+    # Resume any group stop injected by the exit-ordering case and detach the owned tracer promptly.
+    def stop_trace(tracer):
+        if worker.poll() is None:
+            worker.send_signal(signal.SIGCONT)
+        if tracer.poll() is None:
+            tracer.terminate()
+        try:
+            tracer.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tracer.kill()
+            tracer.wait(timeout=5)
+            raise
 
     # Send one create through the controller, remember any returned sandbox ID for cleanup and return
     # the status and body.
@@ -595,6 +651,7 @@ url = "http://127.0.0.1:{worker_port}"
             pool_identities = slot_identities()
         # Omitted resources come from the cold template defaults (64 MiB, 1 vCPU).
         source = create()
+        observations["conmon_cold_pid"] = monitor_identity(source)
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
         assert (cgroup / source / "memory.oom.group").read_text().strip() == "1"
         spec = json.loads((root / "private" / source / "config.json").read_text())
@@ -722,6 +779,98 @@ url = "http://127.0.0.1:{worker_port}"
             slot_reset(third_slot)
             observations["network_slot_reset_not_deleted_with_guest_namespace_held"] = third_slot
         print("PASS template rejection without IDs, failed-launch tombstone, final worker admission without a record and inline delete")
+        # A real runtime create failure differs from an early successful start followed by init exit.
+        failed = expect(create_call(dict(template_id="bad-start", ttl_seconds=60)), 500, "runtime_start_failed")
+        failed_id = failed["sandbox_id"]
+        gone(failed_id)
+        failed_exit = json.loads((root / "monitors" / failed_id / "result.json").read_text())
+        assert failed_exit["exit_code"] is None and not failed_exit["runtime_started"], failed_exit
+        code, early = create_call(dict(template_id="exit-now", ttl_seconds=60))
+        assert code in (201, 500), (code, early)
+        if code == 500:
+            assert early["error"]["code"] == "workload_exited", early
+        early_id = early["sandbox_id"]
+        eventually(lambda: get(early_id)["state"] in ("deleted", "failed"), timeout=15)
+        early_exit = json.loads((root / "monitors" / early_id / "result.json").read_text())
+        assert early_exit["exit_code"] == 23 and early_exit["runtime_started"] and not early_exit["monitor_lost"], early_exit
+        gone(early_id)
+        observations["conmon_start_failure_vs_early_exit"] = [failed_exit, early_exit]
+        # Trigger a natural exit and an actual cgroup-v2 whole-group OOM, then check retained evidence.
+        for template, expected, reason in (("monitor-exit", 37, "workload_exited"), ("monitor-oom", 137, "workload_oom")):
+            ending = create(template)
+            monitor_identity(ending)
+            (root / "private" / ending / "rootfs/workspace/go").touch()
+            eventually(lambda: get(ending)["state"] == "deleted", timeout=15)
+            assert get(ending)["error"] == reason, get(ending)
+            evidence = root / "monitors" / ending
+            result = json.loads((evidence / "result.json").read_text())
+            assert int((evidence / "exit").read_text()) == expected == result["exit_code"] and result["runtime_started"] and not result["monitor_lost"], result
+            assert result["oom"] == (template == "monitor-oom")
+            assert (result["oom_kill"] > 0) == (template == "monitor-oom")
+            if template == "monitor-oom":
+                assert (evidence / "oom").exists(), "conmon did not persist the OOM marker"
+            gone(ending)
+            observations["conmon_" + template] = result
+        # Hold the watcher after its first missing-exit observation, let real conmon publish and
+        # drain, then release it. An empty group must cause a second exit check, never monitor_lost.
+        for template, expected, reason in (("monitor-exit", 37, "workload_exited"), ("monitor-oom", 137, "workload_oom")):
+            ending = create(template)
+            monitor_identity(ending)
+            evidence = root / "monitors" / ending
+            tracer, trace = trace_monitor("sandbox-expiry", evidence / "exit", "%%stat",
+                                          "%%stat:error=ENOENT:signal=SIGSTOP:when=1", "ordered-" + template)
+            try:
+                eventually(lambda: "stopped by SIGSTOP" in trace.read_text(), timeout=5)
+                assert not (evidence / "exit").exists(), "exit already existed at the first observation"
+                (root / "private" / ending / "rootfs/workspace/go").touch()
+                eventually(lambda: (evidence / "exit").exists() and "populated 0" in (monitors / ending / "cgroup.events").read_text(), timeout=10)
+                assert int((evidence / "exit").read_text()) == expected
+                worker.send_signal(signal.SIGCONT)
+                eventually(lambda: get(ending)["state"] == "deleted", timeout=15)
+                assert get(ending)["error"] == reason, get(ending)
+            finally:
+                stop_trace(tracer)
+            checks = [line for line in trace.read_text().splitlines() if '"' + str(evidence / "exit") + '"' in line]
+            assert len(checks) >= 2 and "ENOENT" in checks[0] and "INJECTED" in checks[0] and " = 0" in checks[1], checks
+            gone(ending)
+            observations["conmon_ordered_" + template] = dict(reason=reason, exit_code=expected, trace=trace.name)
+        # Fail the parent-directory sync after result.json was renamed, then fail the retry too.
+        # Both failures must retain all groups/runc state; a third successful sync permits teardown.
+        syncing = create()
+        evidence = root / "monitors" / syncing
+        tracer, trace = trace_monitor("sandbox-operat", evidence, "fsync", "fsync:error=EIO:when=1..2", "monitor-result-sync")
+        try:
+            expect(request(worker_port, f"/v1/sandboxes/{syncing}", worker_token, method="DELETE"), 500, "cleanup_failed")
+            summary = (evidence / "result.json").read_bytes()
+            assert json.loads(summary)["exit_code"] == 137 and get(syncing)["error"] == "record_sync_failed"
+            assert all(p.exists() for p in (monitors / syncing, cgroup / syncing, root / "runc" / syncing, root / "private" / syncing))
+            # The retry must preserve the summary, even if the raw exit evidence is unavailable.
+            (evidence / "exit").rename(evidence / "exit-held-by-gate")
+            try:
+                expect(request(worker_port, f"/v1/sandboxes/{syncing}", worker_token, method="DELETE"), 500, "cleanup_failed")
+                assert (evidence / "result.json").read_bytes() == summary
+                assert all(p.exists() for p in (monitors / syncing, cgroup / syncing, root / "runc" / syncing, root / "private" / syncing))
+                expect(request(worker_port, f"/v1/sandboxes/{syncing}", worker_token, method="DELETE"), 200)
+            finally:
+                (evidence / "exit-held-by-gate").rename(evidence / "exit")
+        finally:
+            stop_trace(tracer)
+        syncs = [line for line in trace.read_text().splitlines() if "fsync(" in line]
+        assert len(syncs) >= 3 and all("EIO" in line and "INJECTED" in line for line in syncs[:2]) and " = 0" in syncs[2], syncs
+        assert (evidence / "result.json").read_bytes() == summary
+        gone(syncing)
+        observations["conmon_post_rename_sync_retry"] = dict(failed_syncs=2, successful_sync=True, preserved_summary=json.loads(summary), trace=trace.name)
+        print("PASS ordered conmon exit/OOM observations and post-rename sync failure/retry retain ownership until durable")
+        # A lost monitor fails closed and must not be mistaken for a healthy workload or OOM.
+        lost = create()
+        os.kill(monitor_identity(lost), signal.SIGKILL)
+        eventually(lambda: get(lost)["state"] == "deleted", timeout=15)
+        assert get(lost)["error"] == "monitor_lost", get(lost)
+        lost_exit = json.loads((root / "monitors" / lost / "result.json").read_text())
+        assert lost_exit["monitor_lost"] and lost_exit["exit_code"] is None and not lost_exit["oom"], lost_exit
+        gone(lost)
+        observations["conmon_lost_fails_closed"] = lost_exit
+        print("PASS conmon runtime-start failure versus early/natural exit, real OOM marker/counter and monitor loss")
 
         # A client that disconnects mid-exec leaves no orphan: the command still runs
         # to completion with normal exec-cgroup cleanup, then the sandbox is free again.
@@ -1145,6 +1294,7 @@ url = "http://127.0.0.1:{worker_port}"
         remove(isolated)
         expect(create_call(dict(template_id="warm", ttl_seconds=60, memory_mib=128)), 422, "template_resource_mismatch")
         child = create("warm")
+        observations["conmon_restore_pid"] = monitor_identity(child)
         time.sleep(0.3)
         restored, child_nonce = map(int, execute(child, "counter").split())
         assert child_nonce == nonce and restored >= before
@@ -1274,11 +1424,39 @@ url = "http://127.0.0.1:{worker_port}"
         observations["layer_verification"] = dict(first_use_two_creates_read_bytes=first_use_read, probe_bytes=probe_bytes, saved_layers=len(saved))
         pending_thread, _ = in_background(lambda: exec_call(source, ["/fixture", "hang"], timeout_ms=60000, max_output_bytes=1024))
         eventually(lambda: exec_cgroup_populated(source), timeout=10)
+        old_monitor = monitor_identity(source)
         kill_and_restart_worker()
         pending_thread.join(timeout=10)
+        eventually(lambda: not Path(f"/proc/{old_monitor}").exists(), timeout=5)
+        restarted_exit = json.loads((root / "monitors" / source / "result.json").read_text())
+        assert restarted_exit["exit_code"] == 137 and not restarted_exit["oom"] and not restarted_exit["monitor_lost"], restarted_exit
+        observations["conmon_restart_drained"] = restarted_exit
         assert get(source)["state"] == "deleted"
         gone(source)
         observations["restart_inflight_exec_reconciled"] = True
+        # Stop startup before conmon can fork, kill the worker, then require restart to drain the
+        # durably owned incomplete monitor without allowing a late restore to create a workload.
+        (monitors / "cgroup.freeze").write_text("1")
+        startup_thread, startup_reply = in_background(lambda: create_call(dict(template_id="warm", ttl_seconds=60)))
+        try:
+            unfinished = eventually(lambda: [p for p in monitors.iterdir() if p.is_dir() and "populated 1" in (p / "cgroup.events").read_text()], timeout=15)
+            assert len(unfinished) == 1
+            unfinished_id = unfinished[0].name
+            ids.append(unfinished_id)
+            assert not (root / "monitors" / unfinished_id / "started.json").exists()
+            worker.kill()
+            worker.wait(timeout=5)
+        finally:
+            (monitors / "cgroup.freeze").write_text("0")
+        worker = start("worker", worker_config)
+        fresh()
+        startup_thread.join(timeout=20)
+        assert not startup_thread.is_alive(), startup_reply
+        assert get(unfinished_id)["state"] == "deleted"
+        gone(unfinished_id)
+        unfinished_exit = json.loads((root / "monitors" / unfinished_id / "result.json").read_text())
+        assert not unfinished_exit["runtime_started"] and unfinished_exit["exit_code"] is None, unfinished_exit
+        observations["conmon_incomplete_startup_reconciled"] = unfinished_exit
         if args.network:
             # Restart never adopts old slots: every pooled slot was removed and built fresh.
             rebuilt = slot_identities()
@@ -1392,6 +1570,8 @@ url = "http://127.0.0.1:{worker_port}"
         assert len(observations["erofs_after_32"]["lower_sources"]) == 32
         print("PASS 32 distinct retained EROFS lowers; mode and loop backing counts " + json.dumps(observations["erofs_after_32"]), flush=True)
     finally:
+        if monitors.exists():
+            (monitors / "cgroup.freeze").write_text("0")
         if helpers.exists():
             (helpers / "cgroup.freeze").write_text("0")
         # All cleanup goes through the owner. Never recurse through potentially

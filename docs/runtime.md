@@ -1,7 +1,7 @@
 # Explicitly privileged real-runtime qualification
 
 **Targeted functional gate passed on one explicitly approved Linux x86-64 host,
-with runc 1.3.6 and CRIU 4.3.** The real script exercised shared EROFS/private OverlayFS,
+with runc 1.3.6, conmon 2.1.10 and CRIU 4.3.** The real script exercised shared EROFS/private OverlayFS,
 capture without stopping the source (pause, sealed EROFS layer, `--leave-running`),
 established loopback TCP and independent restored memory/file state, the node
 checkpoint cache, the reaping PID 1, concurrent, streamed and killed commands,
@@ -25,7 +25,7 @@ An operator must separately provision and approve:
   Linux 6.12+ with `CONFIG_EROFS_FS_BACKED_BY_FILE`; older kernels need available
   loop device nodes for the shared lowers. No module loading or package installation
   is done by the service/script.
-- Trusted standard `runc`, `criu`, `mount`, `umount`, GNU `tar`, `mkfs.erofs`, `ip`,
+- Trusted standard `runc`, **`conmon` 2.1.10**, `criu`, `mount`, `umount`, GNU `tar`, `mkfs.erofs`, `ip`,
   `nft`, `iptables`, `iptables-save`, `iptables-restore`, `ip6tables-save`,
   `ip6tables-restore`, `gzip` and a **statically linked `tini`** (preflight rejects a
   dynamic one: it is bind-mounted read-only into every sandbox as PID 1, so it must run
@@ -37,7 +37,9 @@ An operator must separately provision and approve:
   egress support. GNU tar also invokes its
   fixed `/bin/sh`, and dynamic binaries depend on system libraries/loaders. Review
   administrator system CRIU configuration; request options do not replace host trust.
-  For the smoke: Python 3, a C compiler with static libc, `nsenter`, and sandboxd.
+  For the smoke: Python 3, a C compiler with static libc, `nsenter`, sandboxd and
+  `strace` with syscall fault injection (qualified with 6.8). The runtime gate uses
+  path-filtered faults on its own worker threads, never on runtime children.
   No rootfs or tool downloads are performed by the smoke.
 - A new dedicated administrator-owned root with actual OverlayFS d_type and
   user/trusted-xattr support; XFS needs ftype=1. Startup tests the backing directory,
@@ -53,7 +55,8 @@ An operator must separately provision and approve:
   It must have no processes in `cgroup.procs`; `cgroup.subtree_control` must already
   contain `cpu memory pids`, and cgroup.kill/swap accounting must be available.
   The worker service itself runs **outside** this parent. Its workload children and
-  a separately owned `.helpers-<root-digest>` subtree for host commands belong inside it. Do not share the parent with another worker, root or service.
+  separately owned `.helpers-<root-digest>` host-command and `.monitors-<root-digest>`
+  init-monitor subtrees belong inside it. Do not share the parent with another worker, root or service.
 - Isolated validation-host access and trusted loopback ingress. Do not expose bearer
   HTTP on an untrusted network.
 
@@ -105,9 +108,16 @@ The local gates use a disposable outer mount/network namespace for the same reas
 Delegate one empty cgroup-v2 parent to the worker; run the worker outside it. runc's
 cgroupfs driver alone creates/configures sandbox children, including CRIU restore
 with manage-cgroups ignore. The worker retains helper and exec children, whole-tree
-kill and orphan cleanup. No in-pod systemd service is required. This change adds no
-conmon/CNI binary or package prerequisite; those are separate integrations. Root/tool
-trust and the existing verified-tool list remain unchanged.
+kill and orphan cleanup. No in-pod systemd service is required. Stage **conmon 2.1.10**
+from Canonical's noble `conmon` package (`2.1.10+ds1-1build2` in the local qualification)
+with `apt-get download`, verify the archive signature/index and package SHA-256, then
+extract with `dpkg-deb -x` and copy its executable root-owned into the trusted tools
+directory. Do not install a system service or run `apt install` on the node. Include
+conmon and its system-library dependencies in the worker image/tool inventory; the
+worker verifies conmon ownership and its protocol version during preflight. No CNI
+plugins are required by this stage. Preserve the root and delegated monitor subtree
+across worker process restarts so reconciliation can drain old monitors. The private
+cluster harness must stage conmon and republish templates before deploying this worker.
 
 ## Bounded command plan
 
@@ -293,7 +303,7 @@ an interruption. Before this, such a pipe made a fast tool look interrupted
 output limit and deadline are unchanged. A failing host tool is written to the
 worker's error output with its name, static error, exit code and at most the last
 512 input bytes of stderr, escaped onto one line. This includes storage tar,
-runc's direct/checked paths (detached diagnostics come from its log), and CRIU's
+runc's direct/checked paths (conmon startup diagnostics come from runc's log), and CRIU's
 CPU check. Guest command output is delivered to its caller, not copied to worker
 logs. Logs can contain workload paths or tool diagnostics; protect them.
 
@@ -356,6 +366,61 @@ already succeeded. Permission/I/O/helper errors fail startup; later failed mount
 never change mode or reuse a volatile work directory. Capture still freezes and seals matching files/processes and syncs
 the published layer. Lazy pages are not shipped: small-image experiments are not
 proof of reliable page-server ownership and restore under sustained load.
+
+### Init supervision and retained exit evidence
+
+Conmon 2.1.10 is a required binary, not another runtime service. Its start gate is
+released only after the fresh helper joins a durable per-sandbox monitor group;
+the worker waits for the launcher and bounded JSON PID reply. Cold creation then
+calls `runc start`; warm creation uses conmon `--restore` and `--runtime-opt` for
+TCP-established, external Unix sockets, file locks, cgroup-ignore and private CRIU
+work paths. The worker-authored `org.criu.config` annotation still supplies restore
+compatibility/network-lock options. Conmon's passthrough mode inherits null standard
+streams, keeping the checkpoint descriptor model unchanged. No logging/attach/TTY
+API is added; commands still use the existing `runc exec` implementation.
+
+Conmon lives in `.monitors-<root-digest>/<sandbox-id>`, **never** a kill-on-return
+helper leaf. It subreaps init, persists its exit status and observes cgroup-v2 OOM.
+The watcher uses those files, not workload `cgroup.events`, to detect init exit;
+a missing/dead monitor without an exit file fails closed as `monitor_lost`. It
+rechecks exit evidence after observing an empty monitor group, because conmon can
+publish its exit between the watcher's initial file check and group check.
+`runtime_start_failed` means the create/start handshake failed, while an already
+started workload ending is `workload_exited` (or `workload_oom` with an actual OOM
+kill counter). An early exit may fail create, but never masquerades as runtime
+startup failure. Restore startup failures keep the existing `restore_failed` error.
+
+Deletion and restart kill the workload, allow conmon five seconds to reap and
+write its files, then drain any stuck monitor before reclaiming resources. An
+unfinished create/restore is stopped first so it cannot race workload cleanup.
+The worker reads conmon's OOM marker and `memory.events` **before runc delete**,
+and atomically saves `monitors/<id>/result.json`. Cleanup retries republish the
+existing summary and complete both file and directory sync before removing groups:
+a visible result file alone does not prove its prior directory sync succeeded.
+Raw `exit`, `oom`, PID files and
+the summary stay with retained records after private-state deletion. Exit 137
+alone is not OOM evidence. A lost monitor has no known exit code. Unknown monitor
+ownership blocks restart; restart still kills/cleans rather than adopting tasks.
+There is no new retention/GC policy: monitor evidence shares record retention.
+
+The layout now ends in `-conmon-null-v1`: older cold templates must be republished
+and warm templates recaptured. Conmon is outside the guest and is not checkpointed;
+the layout change deliberately requires requalification rather than assuming old
+images are compatible. Preflight requires the qualified 2.1.10 protocol version.
+
+Behavioral references: conmon v2.1.10 `src/conmon.c`, `runtime_args.c`,
+`ctr_logging.c`, `cgroup.c`; Podman v4.9.0 `libpod/oci_conmon_common.go`
+`createOCIContainer`, `readConmonPipeData`, `StartContainer`. These are fresh small
+protocol integrations; no third-party source was copied into this repository.
+
+The runtime gate checks cold/restored null descriptors and monitor parentage,
+runtime-start failure versus immediate and natural workload exits, a real 64 MiB
+whole-group OOM with marker/counter, monitor loss, and worker-crash reconciliation
+of both running monitors and incomplete startup. Deterministic syscall-fault cases
+exercise an exit published between watcher observations and repeated post-rename
+directory-sync failures; teardown must wait for a successful retry that preserves
+the original summary. It retains the exit evidence and fault traces for inspection. See the qualification scope above;
+this is not cluster, arbitrary-application or hostile-workload qualification.
 
 ### Mount and filesystem qualification
 
