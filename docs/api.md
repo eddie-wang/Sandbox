@@ -180,7 +180,9 @@ requires the captured memory/vCPU/pids/config and host compatibility.
 During admission the worker checks the template manifest (digest sidecar, strict
 fields, exact host compatibility including architecture, network policy and pids)
 and, for a warm template, CRIU's own CPU check of its saved `cpuinfo.img` on this
-host (`criu cpuinfo check`, once per template per worker; see contracts.md);
+host (`criu cpuinfo check`, definitive answers cached per CPU-description digest;
+see contracts.md). Cache misses wait on a bounded helper thread, not the admission
+coordinator; environment failures are retried on the next create. A check
 failure is a pre-launch `422 template_unavailable`, so the controller tries another
 node. CPU compatibility can be one-directional between two hosts. The create job itself hashes
 each layer image this worker does not yet trust (creates hash in parallel; two
@@ -214,7 +216,10 @@ stops only that command:** the worker kills its resource group (the command and
 everything it started) and the result reports `interrupted:true`, `exit_code:null`
 and `error` `exec_timeout`, `exec_output_limit`, `exec_killed` or
 `sandbox_cancelled_or_expired`, with the output delivered up to the limit. The
-sandbox keeps running. A normal end also kills what the command left behind (for
+sandbox keeps running for a command-only bound. For deletion or expiry, the engine
+publishes the sandbox's post-cancellation state before releasing the command's
+final event, in both buffered and streaming modes; it cannot report `running`
+after a sandbox-cancelled exec. A normal end also kills what the command left behind (for
 example background children that kept its output open) and removes its group, so
 background jobs are not a supported exec contract. A nonzero program exit is a
 normal result. A start failure (for example runc refusing the command) is a result
@@ -385,7 +390,15 @@ the request again; there are no exactly-once application semantics.
 
 ## Status and bounds
 
-Worker status schema is `1`. `usage` counts reservations, not measured utilization;
+Worker status schema is `1`. Authenticated status includes `phases`, at most 160
+cumulative histograms keyed `<operation>.<phase>` since worker start. Each has
+`count`, `total_ms`, `max_ms` and 15 non-overlapping `buckets`: upper bounds in ms
+are 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 60000, then overflow.
+Operations are create, restore, capture, delete and exec; phases absent on a path
+are omitted. `first_ready` measures request arrival to the confirmed running
+create/restore result, not application HTTP readiness. It overlaps step durations
+and must not be added to them. Pre-launch rejections and repeated/coalesced requests
+do not start another operation histogram. `usage` counts reservations, not measured utilization;
 null means disabled/failed preflight, not zero. `vcpus` in usage sums quotas, compared
 with configured physical/admission `capacity.vcpus * cpu_overcommit` (factor 1–16).
 The fixed operation pool bounds parallel create/capture/delete jobs.

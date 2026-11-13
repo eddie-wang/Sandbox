@@ -20,7 +20,7 @@ worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |                                         uplink -- veth -- operator bridge
     |                                                          stable MAC/gateway
     +-- app proxy: a fresh TCP connection opened inside the router slot only
-        (short-lived thread setns) -> 192.0.2.2:<approved service port>
+        (bounded connector threads, setns) -> 192.0.2.2:<approved service port>
 ```
 
 Every guest has the same address, isolated by its own guest **and router** netns.
@@ -150,12 +150,19 @@ token, routes by the ID's owner prefix to a fresh owner and streams the exchange
 the worker with the worker token. The worker accepts only a running (or capturing)
 sandbox and a port in its template's approved `service_ports` (which the operator
 ceiling already bounds), then opens a **new TCP connection from inside the sandbox's
-router slot**: a short-lived thread enters the pinned slot namespace with `setns`,
-creates the socket and exits, so no shared worker or Tokio thread ever changes
-namespace and nothing listens on or routes from the host network. The slot's
+router slot**: one of four dedicated connector threads enters the pinned slot
+namespace with `setns`, creates the socket and returns to its original namespace.
+The mailbox holds at most 1024 requests; full or failed entry returns no socket.
+No shared worker or Tokio thread ever changes namespace, idle connectors keep no
+slot pinned, and nothing listens on or routes from the host network. The slot's
 existing nftables rules allow exactly the slot-to-guest service-port flow
 (`output oifname inside ... tcp dport <port>` and established replies). One request
-per connection; nothing is pooled across exchanges (guest addresses are reused).
+per guest connection; sockets are never pooled across exchanges (guest addresses
+are reused). Threads are shared, not guest connections.
+
+Host network helpers enter only the requested network namespace, not a fresh
+copy of the worker's mount namespace. Related link/address/route operations use
+`ip -batch`; nftables policy still completes before any guest link is brought up.
 
 The request and response are forwarded as HTTP/1.1 messages, not reinterpreted:
 the method, raw path and query, headers and status are the application's; bodies

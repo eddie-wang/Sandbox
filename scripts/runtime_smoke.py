@@ -683,6 +683,9 @@ url = "http://127.0.0.1:{worker_port}"
         cancelled = create()
         thread, box = in_background(lambda: exec_call(cancelled, ["/fixture", "hang"], timeout_ms=30000))
         eventually(lambda: exec_cgroup_populated(cancelled), timeout=10)
+        streamed_exec, stream_box = in_background(lambda: exec_events(controller_port, f"/v1/sandboxes/{cancelled}/exec", token,
+                                                                     dict(argv=["/fixture", "hang"], timeout_ms=30000, max_output_bytes=4096)))
+        eventually(lambda: len(exec_groups(cancelled)) == 2, timeout=10)
         if args.network:
             stream = http.client.HTTPConnection("127.0.0.1", controller_port, timeout=30)
             stream.request("GET", f"/v1/sandboxes/{cancelled}/proxy/8080/chunked/60/200", headers={"Authorization": "Bearer " + token})
@@ -693,7 +696,13 @@ url = "http://127.0.0.1:{worker_port}"
         assert time.monotonic() - started < 20
         thread.join(timeout=30)
         code, result = box["result"]
-        assert code == 200 and result["interrupted"] and result["error"] == "sandbox_cancelled_or_expired" and result["sandbox_state"] != "running", result
+        assert code == 200 and result["interrupted"] and result["error"] == "sandbox_cancelled_or_expired" and result["sandbox_state"] in ("deleting", "deleted", "cleanup_failed"), result
+        streamed_exec.join(timeout=30)
+        stream_status, stream_events = stream_box["result"]
+        stream_end = stream_events[-1][2]
+        assert stream_status == 200 and stream_events[-1][1] == "exit" and stream_end["error"] == "sandbox_cancelled_or_expired", stream_events
+        assert stream_end["sandbox_state"] in ("deleting", "deleted", "cleanup_failed"), stream_end
+        observations["delete_cancels_streamed_exec_state"] = stream_end["sandbox_state"]
         observations["delete_cancels_inflight_exec"] = {"delete_seconds": round(time.monotonic() - started, 3), "exec_status": code}
         if args.network:
             try:

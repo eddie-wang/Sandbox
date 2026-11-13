@@ -1,4 +1,6 @@
-//! Serialized durable admission/state transitions, bounded parallel runtime I/O.
+//! Serialized admission/state transitions, bounded parallel runtime I/O. While a sandbox has a job in
+//! flight, only that job writes its record file (the create's record before any resource, the final
+//! state at its end). Capture admission and exceptional completion/recovery saves stay on the coordinator.
 //! Each sandbox has at most one in-flight create, capture or delete job, which
 //! excludes commands; several commands (execs) may run at once, each on its own
 //! thread and in its own resource group. A management request waits on a reply for
@@ -8,11 +10,11 @@
 //! sandbox (`create_response_lost`); a reply lost after hand-over is bounded by TTL.
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path, sync::{Arc, RwLock, mpsc, atomic::{AtomicBool, AtomicU8, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
-use crate::{config::{ProxyLimits, WorkerConfig}, model::{CaptureRequest, CreateRequest, ExecRequest, Runtime, RuntimeCapability, SandboxSpec, Usage, WorkerStatus}, native::{ExecEnd, Native, Preflight}, process::{self, Result}, storage};
+use crate::{config::{ProxyLimits, WorkerConfig}, model::{CaptureRequest, CreateRequest, ExecRequest, Runtime, RuntimeCapability, SandboxSpec, Usage, WorkerStatus}, native::{ExecEnd, Native, Preflight}, phases::{self, Phases}, process::{self, Result}, storage};
 
 const RECORD_SCHEMA: u32 = 2;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
     pub schema_version: u32,
@@ -61,15 +63,27 @@ pub struct Handle {
     pub deadlines: crate::config::OperationDeadlines, pub native: Option<Arc<Native>>,
     pub proxy: ProxyLimits, pub proxy_permits: Arc<tokio::sync::Semaphore>,
 }
+// Work for the admission coordinator. A create and an exec carry the time their request arrived, so
+// their phase timings include the wait for this mailbox.
 pub enum Work {
-    Create(CreateRequest, Reply), Exec(String, ExecRequest, ExecSink), Kill(String, u64, Reply), Capture(String, CaptureRequest, Reply), Delete(String, Reply),
-    Complete(usize, Box<(Record, Result<Outcome>)>), ExecDone(String, u64, bool), Exited(String), Stop(mpsc::Sender<Result<()>>),
+    Create(CreateRequest, Instant, Reply), Exec(String, ExecRequest, Instant, ExecSink), Kill(String, u64, Reply), Capture(String, CaptureRequest, Instant, Reply), Delete(String, Instant, Reply),
+    Complete(usize, Box<Done>), ExecDone(String, u64, Box<ExecDone>), CpuChecked(String, Result<bool>), Exited(String), Stop(mpsc::Sender<Result<()>>),
 }
 enum Action { Create, Capture(CaptureRequest, String), Delete }
+// A finished job as its operation worker reports it: the updated record, whether the job saved it as
+// it is, the outcome, the operation kind for timing (create, restore, capture or delete) and its step
+// timings.
+pub struct Done { record: Record, persisted: bool, outcome: Result<Outcome>, operation: &'static str, phases: Phases }
+// A command's final result and response channel. Only admission publishes its end, after updating
+// any deletion state, so a cancelled command cannot race a still-running snapshot.
+pub struct ExecDone { end: ExecEnd, events: tokio::sync::mpsc::UnboundedSender<ExecEvent>, phases: Phases }
+// A create waiting for CRIU's first answer about a warm template's CPU description (see
+// await_cpu_check), with its timings so far.
+struct CpuWaiter { request: CreateRequest, phases: Phases, reply: Reply }
 // A running command: why it must stop (0 not, 1 killed by request, 2 sandbox deleted or expired) and
 // the kill requests waiting for it to end.
 struct RunningExec { stop: Arc<AtomicU8>, kill_waiters: Vec<Reply> }
-struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool> }
+struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool>, phases: Phases }
 // One in-flight job of a sandbox: its operation worker slot, whether it holds a restore slot (create
 // or capture), whether it is the delete cleanup (which has no reply of its own; waiting DELETEs are
 // answered when it completes), the template name a capture reserves, its cancel flag and its reply.
@@ -80,6 +94,9 @@ struct Lower { layers: Vec<storage::Artifact>, done: mpsc::Sender<Result<()>> }
 // Concurrent DELETE requests waiting for one sandbox's cleanup (and kill requests waiting for one
 // command's end); more are refused as busy.
 const MAX_DELETE_WAITERS: usize = 64;
+// Creates that may wait for CRIU CPU checks at once, and distinct checks that may be queued.
+const MAX_CPU_WAITERS: usize = 64;
+const MAX_CPU_CHECKS_QUEUED: usize = 16;
 const STOP_KILLED: u8 = 1;
 const STOP_SANDBOX: u8 = 2;
 // Return seconds since the Unix epoch, falling back to zero if the clock is earlier.
@@ -91,15 +108,13 @@ pub fn fingerprint<T: Serialize>(input: &T) -> String { storage::digest(&serde_j
 fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = reply { let _ = reply.send(result); } }
 
 impl Handle {
-    // Return an unavailable handle if the runtime is disabled or preflight fails. Otherwise reconcile
-    // durable state (rebuilding the network slot pool), then start the lower-mount thread, operation
-    // workers, admission and expiry/exit monitoring; jobs and commands continue independently of HTTP
-    // connections. Shutdown waits for jobs, commands and one cleanup per sandbox, then removes shared
-    // mounts and the slot pool.
+    // Fail closed if disabled or preflight fails; otherwise reconcile and start admission, operation,
+    // lower-mount, CPU-check and expiry workers. Work survives HTTP disconnects. Shutdown waits for
+    // jobs, commands and per-sandbox cleanup, then removes shared mounts and the slot pool.
     pub fn start(config: &WorkerConfig, report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
-            capacity: config.capacity.clone(), usage: enabled.then_some(Usage { memory_mib: 0, vcpus: 0, sandboxes: 0, restores: 0 }), admission_ready: false,
+            capacity: config.capacity.clone(), usage: enabled.then_some(Usage { memory_mib: 0, vcpus: 0, sandboxes: 0, restores: 0 }), admission_ready: false, phases: BTreeMap::new(),
             runtimes: vec![RuntimeCapability { runtime: Runtime::RuncCriu, ready: false, reason: if enabled { "reconciling" } else if config.native.as_ref().is_some_and(|c| c.enabled) { "preflight_failed" } else { "runtime_disabled" }.into() }],
             cpu_overcommit: config.native.as_ref().map_or(1, |c| c.cpu_overcommit), qualification: "unvalidated".into() };
         let snapshot = Arc::new(RwLock::new(Snapshot { status, records: BTreeMap::new(), cancels: BTreeMap::new(), proxy_close: BTreeMap::new() }));
@@ -109,9 +124,19 @@ impl Handle {
         if !enabled { return Ok(handle(None, None)); }
         let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
         let (tx, rx) = mpsc::sync_channel(32);
+        // CRIU's CPU check of a warm template runs here, never on the admission coordinator, which
+        // answers the waiting creates when the result arrives (see Engine::await_cpu_check).
+        let (cpu_tx, cpu_rx) = mpsc::sync_channel::<(String, storage::Artifact)>(MAX_CPU_CHECKS_QUEUED);
+        let (cpu_native, cpu_done) = (native.clone(), tx.clone());
+        std::thread::Builder::new().name("sandbox-cpu-check".into()).spawn(move || {
+            while let Ok((template, cpuinfo)) = cpu_rx.recv() {
+                let answer = cpu_native.cpu_check(&template, &cpuinfo);
+                if cpu_done.send(Work::CpuChecked(cpuinfo.sha256, answer)).is_err() { break; }
+            }
+        }).map_err(|_| "cpu_check_thread_failed")?;
         let mut engine = Engine { native: native.clone(), snapshot: snapshot.clone(), records: BTreeMap::new(), healthy: true,
             pool: Vec::new(), flights: BTreeMap::new(), delete_waiters: BTreeMap::new(), retry_after: BTreeMap::new(), stopping: None, stop_attempted: BTreeSet::new(),
-            execs: BTreeMap::new(), next_exec: 0, events: tx.clone() };
+            execs: BTreeMap::new(), next_exec: 0, events: tx.clone(), cpu_checks: cpu_tx, cpu_waiters: BTreeMap::new(), delete_phases: BTreeMap::new() };
         engine.reconcile()?;
         let restored = engine.records.iter().map(|(id, r)| (id.clone(), Arc::new(r.clone()))).collect();
         snapshot.write().expect("snapshot poisoned").records = restored;
@@ -130,13 +155,18 @@ impl Handle {
             let lowers = lower_tx.clone();
             std::thread::Builder::new().name(format!("sandbox-operation-{slot}")).spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let mut runner = Runner { native: &runtime, lowers: &lowers, record: job.record, cancelled: job.cancelled };
+                    let mut runner = Runner { native: &runtime, lowers: &lowers, record: job.record, cancelled: job.cancelled, phases: job.phases, operation: "delete" };
+                    runner.phases.mark("dispatch");
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.perform(job.action))).unwrap_or_else(|_| {
                         runner.record.state = "cleanup_failed".into();
                         runner.record.error = Some("operation_worker_panicked".into());
                         Err("operation_worker_panicked")
                     });
-                    if completion.send(Work::Complete(slot, Box::new((runner.record, outcome)))).is_err() { break; }
+                    // The job saves its final record itself, off the coordinator.
+                    let persisted = runner.persist().is_ok();
+                    runner.phases.mark("record_final");
+                    let done = Done { record: runner.record, persisted, outcome, operation: runner.operation, phases: runner.phases };
+                    if completion.send(Work::Complete(slot, Box::new(done))).is_err() { break; }
                 }
             }).map_err(|_| "operation_thread_failed")?;
             engine.pool.push(job_tx);
@@ -170,8 +200,9 @@ impl Handle {
         std::thread::Builder::new().name("sandbox-admission".into()).spawn(move || {
             loop {
                 match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Work::Complete(slot, done)) => { let (record, outcome) = *done; engine.complete(slot, record, outcome) },
-                    Ok(Work::ExecDone(id, exec, cleanup_failed)) => engine.exec_done(&id, exec, cleanup_failed),
+                    Ok(Work::Complete(slot, done)) => engine.complete(slot, *done),
+                    Ok(Work::ExecDone(id, exec, done)) => engine.exec_done(&id, exec, *done),
+                    Ok(Work::CpuChecked(digest, answer)) => engine.cpu_checked(&digest, answer),
                     Ok(Work::Stop(done)) => { engine.healthy = false; engine.stopping = Some(done); engine.publish(); },
                     Ok(Work::Exited(id)) => {
                         if !engine.flights.contains_key(&id) && engine.records.get(&id).is_some_and(|r| r.state == "running") {
@@ -184,7 +215,7 @@ impl Handle {
                     Err(mpsc::RecvTimeoutError::Disconnected) => { engine.healthy = false; },
                 }
                 engine.maintenance();
-                if engine.stopping.is_some() && engine.flights.is_empty() && engine.execs.is_empty()
+                if engine.stopping.is_some() && engine.flights.is_empty() && engine.execs.is_empty() && engine.cpu_waiters.is_empty()
                     && engine.records.iter().all(|(id, r)| !r.reserved() || engine.stop_attempted.contains(id)) {
                     let cleanup = if !engine.records.values().any(Record::reserved) {
                         engine.native.unmount_lowers().and_then(|_| engine.native.remove_slot_pool()).and_then(|_| engine.native.remove_helpers())
@@ -209,21 +240,33 @@ struct Engine {
     // Running commands per sandbox (no empty entries), the last exec ID and this loop's own mailbox,
     // which exec threads use to report that they ended.
     execs: BTreeMap<String, BTreeMap<u64, RunningExec>>, next_exec: u64, events: mpsc::SyncSender<Work>,
+    // The CRIU CPU check thread's mailbox, and the creates waiting for each queued check (by
+    // cpuinfo.img digest; no empty entries).
+    cpu_checks: mpsc::SyncSender<(String, storage::Artifact)>, cpu_waiters: BTreeMap<String, Vec<CpuWaiter>>,
+    // First caller's timing while cleanup waits for this sandbox's active work to finish.
+    delete_phases: BTreeMap<String, Phases>,
 }
 impl Engine {
-    // Persist a sandbox record and refresh its public snapshot. A sandbox that is no longer running
-    // (or capturing) or whose deletion was requested loses its proxy close signal, which ends its open
-    // proxy exchanges. A save failure closes admission, even though the in-memory view is still updated.
+    // Persist a sandbox record and refresh its public snapshot (see refresh). Only for a sandbox with
+    // no job in flight. A save failure closes admission, even though the in-memory view is still
+    // updated.
     fn save(&mut self, id: &str) -> Result<()> {
         let result = process::atomic_json(&self.native.root().join("records").join(format!("{id}.json")), &self.records[id]);
         if result.is_err() { self.healthy = false; }
+        self.refresh(id);
+        result
+    }
+    // Refresh a sandbox's public snapshot from its in-memory record without writing its file. A
+    // sandbox that is no longer running (or capturing) or whose deletion was requested loses its proxy
+    // close signal, which ends its open proxy exchanges.
+    fn refresh(&mut self, id: &str) {
         let record = Arc::new(self.records[id].clone());
         {
             let mut snapshot = self.snapshot.write().expect("snapshot poisoned");
             if record.delete_requested || !matches!(record.state.as_str(), "running" | "capturing") { snapshot.proxy_close.remove(id); }
             snapshot.records.insert(id.into(), record);
         }
-        self.publish(); result
+        self.publish();
     }
     // Total reserved memory, CPUs and sandbox slots, plus in-flight create/capture slots; not measured
     // memory use.
@@ -242,17 +285,18 @@ impl Engine {
     }
     // Find the first operation worker slot not assigned to an in-flight job.
     fn idle_slot(&self) -> Option<usize> { (0..self.pool.len()).find(|slot| !self.flights.values().any(|f| f.slot == *slot)) }
-    // Hand a job to the chosen idle operation worker and record it as in flight with a cancel flag. A
-    // delete has no reply of its own: waiting DELETE requests are answered when it completes. If the
-    // worker cannot take the job, mark the sandbox cleanup_failed, close admission and fail the reply.
-    fn launch(&mut self, id: &str, action: Action, slot: usize, reply: Option<Reply>) {
+    // Hand a job, with its timings so far, to the chosen idle operation worker and record it as in
+    // flight with a cancel flag. A delete has no reply of its own: waiting DELETE requests are answered
+    // when it completes. If the worker cannot take the job, mark the sandbox cleanup_failed, close
+    // admission and fail the reply.
+    fn launch(&mut self, id: &str, action: Action, slot: usize, reply: Option<Reply>, phases: Phases) {
         let restore = matches!(action, Action::Create | Action::Capture(..));
         let delete = matches!(action, Action::Delete);
         let template = match &action { Action::Capture(r, _) => Some(r.template_id.clone()), _ => None };
         let cancelled = Arc::new(AtomicBool::new(false));
         self.flights.insert(id.into(), Flight { slot, restore, delete, template, cancelled: cancelled.clone(), reply });
         self.snapshot.write().expect("snapshot poisoned").cancels.insert(id.into(), cancelled.clone());
-        if self.pool[slot].try_send(Job { record: self.records[id].clone(), action, cancelled }).is_err() {
+        if self.pool[slot].try_send(Job { record: self.records[id].clone(), action, cancelled, phases }).is_err() {
             self.healthy = false;
             let flight = self.flights.remove(id);
             self.snapshot.write().expect("snapshot poisoned").cancels.remove(id);
@@ -264,21 +308,22 @@ impl Engine {
         }
         self.publish();
     }
-    // Save a finished job's record, turning it into a pending delete if deletion, expiry or ill health
-    // arrived meanwhile, and deliver its outcome with the current state. Answer every waiting DELETE
-    // once the sandbox is gone, or with the failure of a delete job, and delete a new sandbox whose
-    // create reply could not be delivered.
-    fn complete(&mut self, slot: usize, mut record: Record, outcome: Result<Outcome>) {
+    // Reconcile a finished job with cancellation, expiry and health; save only changed or unsaved state.
+    // Deliver its result and waiting deletes, log timings, and delete an undeliverable new sandbox.
+    fn complete(&mut self, slot: usize, done: Done) {
+        let Done { mut record, persisted, outcome, operation, mut phases } = done;
         if self.native.helpers.ensure_healthy().is_err() { self.healthy = false; }
         let id = record.request.sandbox_id.clone();
         if !self.flights.get(&id).is_some_and(|f| f.slot == slot) { self.healthy = false; self.publish(); return; }
         let mut flight = self.flights.remove(&id).unwrap();
         self.snapshot.write().expect("snapshot poisoned").cancels.remove(&id);
+        let saved = record.clone();
         record.delete_requested |= self.records[&id].delete_requested || !self.healthy || record.expires_at <= now();
         if record.reserved() && record.delete_requested && record.state != "cleanup_failed" { record.state = "deleting".into(); }
         if record.state == "cleanup_failed" { self.retry_after.insert(id.clone(), Instant::now() + Duration::from_secs(2)); }
+        let unchanged = persisted && record == saved;
         self.records.insert(id.clone(), record);
-        let _ = self.save(&id);
+        if unchanged { self.refresh(&id); } else { let _ = self.save(&id); }
         let record = &self.records[&id];
         let outcome = match outcome {
             Ok(Outcome::Created(_)) if record.state != "running" => Err("sandbox_cancelled_or_expired"),
@@ -287,8 +332,13 @@ impl Engine {
             other => other,
         };
         let created = matches!(outcome, Ok(Outcome::Created(_)));
+        phases.mark("completion");
+        if created { phases.first_ready(); }
+        let result = outcome.as_ref().map(|_| ()).map_err(|e| *e);
         let delivered = flight.reply.take().is_some_and(|reply| reply.send(outcome).is_ok());
+        self.timed(operation, &id, &phases, result);
         if !record.reserved() || flight.delete {
+            self.delete_phases.remove(&id);
             for waiter in self.delete_waiters.remove(&id).unwrap_or_default() {
                 answer(Some(waiter), if record.reserved() { Err("cleanup_failed") } else { Ok(Outcome::Sandbox(record.view())) });
             }
@@ -306,25 +356,43 @@ impl Engine {
     fn accept(&mut self, work: Work) {
         if self.native.helpers.ensure_healthy().is_err() { self.healthy = false; self.publish(); }
         match work {
-            Work::Delete(id, reply) => self.request_delete(&id, Some(reply)),
+            Work::Delete(id, received, reply) => {
+                self.request_delete(&id, Some(reply));
+                if self.records.get(&id).is_some_and(Record::reserved) && !self.flights.get(&id).is_some_and(|f| f.delete) {
+                    self.delete_phases.entry(id).or_insert_with(|| {
+                        let mut phases = Phases::since(received);
+                        phases.mark("admission_wait");
+                        phases
+                    });
+                }
+            }
             Work::Kill(id, exec, reply) => self.kill(&id, exec, reply),
-            Work::Create(r, reply) => { if self.healthy { self.create(r, reply); } else { let _ = reply.send(Err("worker_unavailable")); } },
-            Work::Exec(id, r, sink) => { if self.healthy { self.exec(id, r, sink); } else { let _ = sink.started.send(Err("worker_unavailable")); } },
-            Work::Capture(id, r, reply) => {
+            Work::Create(r, received, reply) => {
+                let mut phases = Phases::since(received);
+                phases.mark("admission_wait");
+                if self.healthy { self.create(r, phases, reply); } else { let _ = reply.send(Err("worker_unavailable")); }
+            }
+            Work::Exec(id, r, received, sink) => {
+                let mut phases = Phases::since(received);
+                phases.mark("admission_wait");
+                if self.healthy { self.exec(id, r, phases, sink); } else { let _ = sink.started.send(Err("worker_unavailable")); }
+            }
+            Work::Capture(id, r, received, reply) => {
                 if !self.healthy { let _ = reply.send(Err("worker_unavailable")); return; }
                 // Worker-generated, so callers need no operation identifier.
                 let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
                 let generation = storage::digest(format!("{id}:{}:{nanos}", r.template_id).as_bytes())[..32].to_owned();
-                self.operation(&id, Action::Capture(r, generation), reply);
+                let mut phases = Phases::since(received);
+                phases.mark("admission_wait");
+                self.operation(&id, Action::Capture(r, generation), reply, phases);
             }
             _ => unreachable!(),
         }
     }
-    // Admit a create. A known ID returns its state for an identical retry (conflict or busy otherwise).
-    // Reject without writing a record when records, operation or restore slots, the template, its
-    // resources, leftover resource names, capacity or network slots do not allow it. Otherwise save a
-    // creating record and launch the job.
-    fn create(&mut self, request: CreateRequest, reply: Reply) {
+    // Admit a create after template, capacity, ownership and CPU checks; refuse before saving anything.
+    // Unknown CPU answers wait off this thread. Identical known IDs return state, conflict or busy.
+    // Reserve accepted work in memory; its job saves ownership before creating any resources.
+    fn create(&mut self, request: CreateRequest, mut phases: Phases, reply: Reply) {
         let id = request.sandbox_id.clone();
         if let Some(r) = self.records.get(&id) {
             // Identical retry returns current state; it never launches a second time.
@@ -339,11 +407,17 @@ impl Engine {
         // Bounded manifest read on this dedicated thread (never Tokio). A template this
         // worker cannot launch is rejected before any record, so the controller may
         // place the create elsewhere; that includes a warm template whose CPU CRIU
-        // rejects here (one short `criu cpuinfo check` per template, then remembered).
-        // The job hashes each layer image once per node (first use, kept across
-        // restarts while the file is unchanged) and each checkpoint archive once (first
-        // unpack).
+        // rejected (its answer is remembered per CPU description). The job hashes each
+        // layer image once per node (first use, kept across restarts while the file is
+        // unchanged) and each checkpoint archive once (first unpack).
         let Ok((manifest, _)) = self.native.template_manifest(&request.template_id) else { let _ = reply.send(Err("template_unavailable")); return; };
+        if let Some(cpuinfo) = &manifest.cpuinfo {
+            match self.native.cpu_known(&cpuinfo.sha256) {
+                Some(true) => {}
+                Some(false) => { let _ = reply.send(Err("template_unavailable")); return; }
+                None => { self.await_cpu_check(CpuWaiter { request, phases, reply }, cpuinfo.clone()); return; }
+            }
+        }
         let warm = manifest.checkpoint.is_some();
         let resolve = |explicit: Option<u64>, template: Option<u64>| match (explicit, template) {
             (Some(e), Some(t)) if warm && e != t => Err("template_resource_mismatch"),
@@ -363,15 +437,35 @@ impl Engine {
         if !admitted || (self.native.config.network.is_some() && network_slot.is_none()) { let _ = reply.send(Err("admission_exhausted")); return; }
         self.records.insert(id.clone(), Record { schema_version: RECORD_SCHEMA, expires_at: now() + spec.ttl_seconds as u64, request: spec, state: "creating".into(),
             error: None, delete_requested: false, network_slot, network_policy: None });
-        match self.save(&id) {
-            Err(e) => { let _ = reply.send(Err(e)); }
-            Ok(()) => self.launch(&id, Action::Create, slot, Some(reply)),
+        self.refresh(&id);
+        phases.mark("admission");
+        self.launch(&id, Action::Create, slot, Some(reply), phases);
+    }
+    // Park a create until CRIU has judged its warm template's CPU description: queue one check per
+    // description on the CPU check thread and wait with the other creates of that description. Too
+    // many waiting creates, or a full check queue, answer busy at once (nothing was started).
+    fn await_cpu_check(&mut self, waiter: CpuWaiter, cpuinfo: storage::Artifact) {
+        if self.cpu_waiters.values().map(Vec::len).sum::<usize>() >= MAX_CPU_WAITERS { let _ = waiter.reply.send(Err("busy")); return; }
+        let queued = self.cpu_waiters.contains_key(&cpuinfo.sha256);
+        if !queued && self.cpu_checks.try_send((waiter.request.template_id.clone(), cpuinfo.clone())).is_err() { let _ = waiter.reply.send(Err("busy")); return; }
+        self.cpu_waiters.entry(cpuinfo.sha256).or_default().push(waiter);
+    }
+    // Resume the creates that waited for CRIU's answer about one CPU description. A clear answer is
+    // already remembered, so each create is admitted again normally (and refused before launch if CRIU
+    // refused the CPU); a check that could not finish refuses them as template_unavailable before
+    // launch (nothing is remembered, so a later create checks again).
+    fn cpu_checked(&mut self, digest: &str, answer: Result<bool>) {
+        for mut waiter in self.cpu_waiters.remove(digest).unwrap_or_default() {
+            waiter.phases.mark("cpu_check_wait");
+            if !self.healthy { let _ = waiter.reply.send(Err("worker_unavailable")); }
+            else if answer.is_err() { let _ = waiter.reply.send(Err("template_unavailable")); }
+            else { self.create(waiter.request, waiter.phases, waiter.reply); }
         }
     }
     // Start a capture on a running sandbox, rejecting it at once if the sandbox is missing, busy (a job
     // or a command is running), not running or no slot is free. A capture also needs a restore slot
     // and an unused template name, and is saved as capturing first.
-    fn operation(&mut self, id: &str, action: Action, reply: Reply) {
+    fn operation(&mut self, id: &str, action: Action, reply: Reply, mut phases: Phases) {
         let Some(record) = self.records.get(id) else { let _ = reply.send(Err("sandbox_not_found")); return; };
         // Conflicting same-sandbox work is rejected immediately, never queued. Commands hold pipes to the
         // host, which a checkpoint cannot capture.
@@ -385,18 +479,19 @@ impl Engine {
             self.records.get_mut(id).unwrap().state = "capturing".into();
             if let Err(e) = self.save(id) { let _ = reply.send(Err(e)); return; }
         }
-        self.launch(id, action, slot, Some(reply));
+        phases.mark("admission");
+        self.launch(id, action, slot, Some(reply), phases);
     }
     // Admit a command into a running sandbox and start it on its own thread, outside the operation
     // pool. Refuse it at once if the sandbox is missing, not running, or has a create, capture or delete
     // in flight, or if the per-sandbox or worker command limit is reached. The thread streams events to
-    // the requester and reports its end here.
-    fn exec(&mut self, id: String, request: ExecRequest, sink: ExecSink) {
+    // the requester and reports its end, with its step timings, here.
+    fn exec(&mut self, id: String, request: ExecRequest, phases: Phases, sink: ExecSink) {
         let ExecSink { started, events } = sink;
-        let _ = started.send(self.start_exec(id, request, events));
+        let _ = started.send(self.start_exec(id, request, phases, events));
     }
     // Check exec admission and spawn the command's thread (see exec); return its exec ID or the refusal.
-    fn start_exec(&mut self, id: String, request: ExecRequest, events: tokio::sync::mpsc::UnboundedSender<ExecEvent>) -> Result<u64> {
+    fn start_exec(&mut self, id: String, request: ExecRequest, mut phases: Phases, events: tokio::sync::mpsc::UnboundedSender<ExecEvent>) -> Result<u64> {
         let record = self.records.get(&id).ok_or("sandbox_not_found")?;
         if self.flights.contains_key(&id) || self.delete_waiters.get(&id).is_some_and(|w| !w.is_empty()) { return Err("sandbox_busy"); }
         if record.state != "running" || record.expires_at <= now() || record.delete_requested { return Err("sandbox_not_running"); }
@@ -405,7 +500,9 @@ impl Engine {
         let exec = self.next_exec + 1;
         let stop = Arc::new(AtomicU8::new(0));
         let (native, done, flag, sandbox, expires_at) = (self.native.clone(), self.events.clone(), stop.clone(), id.clone(), record.expires_at);
+        phases.mark("admission");
         let spawned = std::thread::Builder::new().name(format!("sandbox-exec-{exec}")).spawn(move || {
+            phases.mark("thread_start");
             // The deadline is the command's timeout, capped by the remaining TTL.
             let remaining = expires_at.saturating_sub(now()).saturating_mul(1000);
             let timeout = Duration::from_millis(request.timeout_ms.min(remaining.max(1)));
@@ -415,11 +512,10 @@ impl Engine {
                 _ => (expires_at <= now()).then_some("sandbox_cancelled_or_expired"),
             };
             let mut sink = |stderr: bool, bytes: &[u8]| { let _ = events.send(if stderr { ExecEvent::Stderr(bytes.to_vec()) } else { ExecEvent::Stdout(bytes.to_vec()) }); };
-            let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native.exec(&sandbox, exec, request.argv, timeout, request.max_output_bytes as usize, &mut sink, &reason)))
+            let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native.exec(&sandbox, exec, request.argv, timeout, request.max_output_bytes as usize, &mut sink, &reason, &mut phases)))
                 .unwrap_or(ExecEnd { exit_code: None, interrupted: false, error: Some("exec_worker_panicked"), cleanup_failed: true });
-            let cleanup_failed = end.cleanup_failed;
-            let _ = events.send(ExecEvent::End(end));
-            let _ = done.send(Work::ExecDone(sandbox, exec, cleanup_failed));
+            let report = ExecDone { end, events, phases };
+            let _ = done.send(Work::ExecDone(sandbox, exec, Box::new(report)));
         });
         spawned.map_err(|_| "busy")?;
         self.next_exec = exec;
@@ -438,9 +534,12 @@ impl Engine {
         if running.kill_waiters.len() >= MAX_DELETE_WAITERS { let _ = reply.send(Err("waiter_limit")); return; }
         running.kill_waiters.push(reply);
     }
-    // Forget a finished command and answer the kill requests waiting for it. A command whose resource
-    // group could not be emptied may have left processes behind, so its sandbox is deleted.
-    fn exec_done(&mut self, id: &str, exec: u64, cleanup_failed: bool) {
+    // Forget a command and settle cancellation or failed cleanup before sending its end event.
+    // Both streamed and buffered results then see the published post-cancellation state.
+    // Log timings and answer waiting kill requests after the command group has ended.
+    fn exec_done(&mut self, id: &str, exec: u64, done: ExecDone) {
+        let ExecDone { end, events, phases } = done;
+        self.timed("exec", id, &phases, end.error.map_or(Ok(()), Err));
         if let Some(commands) = self.execs.get_mut(id) {
             if let Some(running) = commands.remove(&exec) {
                 for waiter in running.kill_waiters {
@@ -449,15 +548,15 @@ impl Engine {
             }
             if commands.is_empty() { self.execs.remove(id); }
         }
-        if cleanup_failed && self.records.get(id).is_some_and(Record::reserved) {
-            self.records.get_mut(id).unwrap().error = Some("exec_cleanup_failed".into());
-            self.request_delete(id, None);
+        if self.records.get(id).is_some_and(Record::reserved) {
+            if end.cleanup_failed { self.records.get_mut(id).unwrap().error = Some("exec_cleanup_failed".into()); }
+            if end.cleanup_failed || end.error == Some("sandbox_cancelled_or_expired") { self.request_delete(id, None); }
         }
+        let _ = events.send(ExecEvent::End(end));
     }
-    // Mark a sandbox for deletion and cancel its in-flight job and running commands; maintenance
-    // launches the cleanup once they have ended. An already gone sandbox is answered at once. Every
-    // concurrent DELETE waits for the same cleanup and gets its result (up to MAX_DELETE_WAITERS;
-    // abandoned waits are dropped first).
+    // Mark deletion, cancel active work and queue bounded waiters for the same cleanup; gone IDs answer
+    // at once. Maintenance launches cleanup after active work ends. No disk write is needed here:
+    // restart cleans every reserved record anyway, and the cleanup job saves its outcome.
     fn request_delete(&mut self, id: &str, reply: Option<Reply>) {
         let Some(record) = self.records.get_mut(id) else { answer(reply, Err("sandbox_not_found")); return; };
         if !record.reserved() { let view = record.view(); answer(reply, Ok(Outcome::Sandbox(view))); return; }
@@ -475,7 +574,7 @@ impl Engine {
         let record = self.records.get_mut(id).unwrap();
         if !record.delete_requested {
             record.delete_requested = true; record.state = "deleting".into();
-            let _ = self.save(id);
+            self.refresh(id);
         }
     }
     // Arrange deletion for expired, cancelled or unhealthy sandboxes and retry failed cleanup. Wait for
@@ -492,8 +591,16 @@ impl Engine {
             if self.stopping.is_some() { self.stop_attempted.insert(id.clone()); }
             // Previously durable ownership permits cleanup even if saving its
             // transition fails. A disk error cannot disable termination.
-            self.launch(&id, Action::Delete, slot, None);
+            let mut phases = self.delete_phases.remove(&id).unwrap_or_else(|| Phases::since(Instant::now()));
+            phases.mark("cleanup_wait");
+            self.launch(&id, Action::Delete, slot, None, phases);
         }
+    }
+    // Write one finished operation's timing line to the worker log and add its steps to the status
+    // histograms. The log write happens without holding the snapshot lock.
+    fn timed(&self, operation: &str, id: &str, phases: &Phases, result: Result<()>) {
+        eprintln!("{}", phases.log_line(operation, id, result));
+        phases::record(&mut self.snapshot.write().expect("snapshot poisoned").status.phases, operation, phases);
     }
     // Load saved sandbox records and reject invalid or untracked resources. Kill and clean up every
     // sandbox left from before the restart and remove abandoned staging. Release unused lower mounts,
@@ -528,7 +635,7 @@ impl Engine {
                 let r = self.records.get_mut(&id).unwrap();
                 r.delete_requested = true; r.state = "deleting".into();
                 let _ = self.save(&id);
-                let cleanup = self.native.cleanup(&id, self.records[&id].network_slot);
+                let cleanup = self.native.cleanup(&id, self.records[&id].network_slot, &mut Phases::since(Instant::now()));
                 let r = self.records.get_mut(&id).unwrap();
                 r.state = if cleanup.is_ok() { "deleted" } else { "cleanup_failed" }.into(); r.error = cleanup.err().map(str::to_owned);
                 let _ = self.save(&id);
@@ -545,8 +652,14 @@ impl Engine {
     }
 }
 
-struct Runner<'a> { native: &'a Native, lowers: &'a mpsc::SyncSender<Lower>, record: Record, cancelled: Arc<AtomicBool> }
+// One job on an operation worker: the sandbox record it updates, its cancel flag, its step timings and
+// the operation kind they are reported under.
+struct Runner<'a> { native: &'a Native, lowers: &'a mpsc::SyncSender<Lower>, record: Record, cancelled: Arc<AtomicBool>, phases: Phases, operation: &'static str }
 impl Runner<'_> {
+    // Write this job's record to its file (only the job does so while it is in flight).
+    fn persist(&self) -> Result<()> {
+        process::atomic_json(&self.native.root().join("records").join(format!("{}.json", self.record.request.sandbox_id)), &self.record)
+    }
     // Refuse further runtime work once the sandbox is cancelled or expired.
     fn active(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Relaxed) || self.record.expires_at <= now() { Err("sandbox_cancelled_or_expired") } else { Ok(()) }
@@ -555,36 +668,47 @@ impl Runner<'_> {
     // finished.
     fn perform(&mut self, action: Action) -> Result<Outcome> {
         match action {
-            Action::Create => self.create(), Action::Capture(r, generation) => self.capture(r, generation),
+            Action::Create => { self.operation = "create"; self.create() }
+            Action::Capture(r, generation) => { self.operation = "capture"; self.capture(r, generation) }
             Action::Delete => { self.delete(); if self.record.state == "deleted" { Ok(Outcome::Sandbox(self.record.view())) } else { Err("cleanup_failed") } }
         }
     }
     // Remove the sandbox's owned resources (returning its network slot to the pool) and mark it
     // deleted, or retain a cleanup failure.
     fn delete(&mut self) {
-        let result = self.native.cleanup(&self.record.request.sandbox_id, self.record.network_slot);
+        let result = self.native.cleanup(&self.record.request.sandbox_id, self.record.network_slot, &mut self.phases);
         self.record.state = if result.is_ok() { "deleted" } else { "cleanup_failed" }.into();
         if let Err(e) = result { self.record.error = Some(e.into()); }
     }
-    // Check the template manifest, verify its layer images here (hashing only those not yet trusted on
-    // this node), wait for their shared mounts, take the node's cached checkpoint images of a warm
-    // template (unpacked once per manifest digest), then prepare and start or restore the sandbox. On
-    // failure, clean up and record it as failed (or cleanup_failed).
+    // Save ownership, recheck the manifest/CPU, verify untrusted layers, obtain shared lower mounts
+    // and cached checkpoint images, then start or restore, timing each step. Already-mounted layers
+    // skip the lower queue but are still checked in prepare. Failures clean up and retain their state.
     fn create(&mut self) -> Result<Outcome> {
         let result = (|| -> Result<()> {
+            // Durable before any resource of the sandbox exists.
+            self.persist()?;
+            self.phases.mark("record");
             self.active()?;
             let (manifest, digest) = self.native.template_manifest(&self.record.request.template_id)?;
+            if manifest.checkpoint.is_some() { self.operation = "restore"; }
             self.record.network_policy = Some(manifest.network.clone());
+            self.phases.mark("manifest_read");
+            if let Some(cpuinfo) = &manifest.cpuinfo { self.native.cpu_compatible(&manifest.template_id, cpuinfo)?; self.phases.mark("cpu_check"); }
             let (tx, rx) = mpsc::channel();
             let layers: Vec<_> = manifest.layers.iter().chain(std::iter::once(&manifest.base)).cloned().collect();
             self.native.verify_layers(&layers)?;
+            self.phases.mark("layer_verify");
             self.active()?;
-            self.lowers.send(Lower { layers, done: tx }).map_err(|_| "lower_worker_unavailable")?;
-            rx.recv().map_err(|_| "lower_worker_unavailable")??;
+            if !self.native.lowers_mounted(&layers) {
+                self.lowers.send(Lower { layers, done: tx }).map_err(|_| "lower_worker_unavailable")?;
+                rx.recv().map_err(|_| "lower_worker_unavailable")??;
+            }
+            self.phases.mark("lower_mount");
             self.active()?;
             let images = if manifest.checkpoint.is_some() { Some(self.native.checkpoint_images(&manifest, &digest)?) } else { None };
+            if images.is_some() { self.phases.mark("checkpoint_cache"); }
             self.active()?;
-            self.native.prepare(&self.record.request, &manifest, images.as_deref(), self.record.network_slot, self.record.expires_at, &self.cancelled)
+            self.native.prepare(&self.record.request, &manifest, images.as_deref(), self.record.network_slot, self.record.expires_at, &self.cancelled, &mut self.phases)
         })();
         match result {
             Ok(()) => { self.record.state = "running".into(); Ok(Outcome::Created(self.record.view())) }
@@ -595,13 +719,10 @@ impl Runner<'_> {
             }
         }
     }
-    // Capture a running sandbox as a new warm template without stopping it (AgentENV order): save CRIU's
-    // description of this host's CPU, freeze it, flush and seal its upper directory into an EROFS layer,
-    // checkpoint it with CRIU leaving it running, then thaw it. Afterwards archive the images, write the
-    // manifest and publish the layer and template.
-    // On any failure, including a dump stopped at its deadline (`checkpoint_interrupted`), thaw the
-    // source and keep it if it runs (AgentENV recover); a source that stays frozen, is not running
-    // or was cancelled is deleted. Success means publication and a running source.
+    // Capture in AgentENV order: save CPU info, freeze, seal files, checkpoint leaving it running,
+    // thaw, then archive and publish matching files/process state. Time each step.
+    // Even an interrupted dump thaws and keeps a running source; frozen, dead or cancelled sources
+    // are deleted. Success means a published template and running source.
     fn capture(&mut self, request: CaptureRequest, generation: String) -> Result<Outcome> {
         let id = self.record.request.sandbox_id.clone();
         let max = self.native.config.max_artifact_bytes;
@@ -622,16 +743,22 @@ impl Runner<'_> {
             let cpuinfo = self.native.save_cpuinfo(&stage)?;
             let images = stage.join("images"); storage::private_dir(&images)?;
             let sealed = stage.join("layer.erofs");
+            self.phases.mark("cpuinfo");
             // Frozen window: the sealed files and the process images describe one instant.
             paused = true;
             self.native.pause(&id)?;
+            self.phases.mark("freeze");
             let uprobes = self.native.uprobes_present(&id)?;
-            self.native.seal_upper(&id, &sealed)?;
+            self.native.seal_upper(&id, &sealed, &mut self.phases)?;
             self.native.checkpoint(&id, &images, uprobes)?;
+            self.phases.mark("checkpoint");
             self.native.resume(&id)?;
             paused = false;
+            self.phases.mark("thaw");
             let layer = storage::artifact(&sealed, max)?;
+            self.phases.mark("layer_hash");
             storage::archive(self.native.tool("tar")?, &images, &stage.join("checkpoint.tar"), self.native.config.command_timeout_seconds, &self.native.search_path, &self.native.helpers)?;
+            self.phases.mark("archive");
             manifest.template_id = request.template_id.clone(); manifest.generation = generation.clone();
             manifest.layers.insert(0, layer.clone());
             manifest.checkpoint = Some(storage::artifact(&stage.join("checkpoint.tar"), max)?);
@@ -640,6 +767,7 @@ impl Runner<'_> {
             manifest.oci_config_sha256 = Some(self.native.spec_digest(&id)?);
             storage::write_manifest(&stage, &manifest)?;
             storage::remove_private(&images)?;
+            self.phases.mark("manifest");
             self.active()?;
             // Content-addressed and hashed just above: restores never rehash it on this node.
             storage::publish_layer(&sealed, &self.native.root().join("layers"), &layer, max)?;
@@ -648,6 +776,7 @@ impl Runner<'_> {
             fs::rename(&stage, &destination).map_err(|_| "template_publish_failed")?;
             stage_owned = false;
             fs::File::open(destination.parent().ok_or("invalid_template_path")?).and_then(|f| f.sync_all()).map_err(|_| "template_sync_failed")?;
+            self.phases.mark("publish");
             Ok(())
         })();
         // CRIU leaves the dumped tasks alive, so a failed step needs only a thaw. A

@@ -209,18 +209,48 @@ fn failed(status: StatusCode, code: &'static str, message: &'static str) -> Resp
     ApiError(status, code, message).into_response()
 }
 
-// Create a TCP socket inside the routing namespace pinned at `netns` on a short-lived thread, so no
-// shared thread ever changes namespace; the socket stays in that namespace after the thread ends.
+// Threads that only create sockets inside routing namespaces for the app proxy (see
+// namespace_socket), and how many requests may wait for them.
+const CONNECTORS: usize = 4;
+const CONNECTOR_QUEUE: usize = 1024;
+// One socket request: the routing namespace pin and where to send the socket.
+type SocketRequest = (PathBuf, tokio::sync::oneshot::Sender<Option<OwnedFd>>);
+
+// Start bounded socket-making threads on first use. Each enters only the requested namespace,
+// creates a socket and returns home, never retaining a released slot while idle. Failed entry
+// returns no socket; failed return ends the thread. No shared runtime thread changes namespace.
+fn connectors() -> Option<&'static std::sync::mpsc::SyncSender<SocketRequest>> {
+    static MAILBOX: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<SocketRequest>>> = std::sync::OnceLock::new();
+    MAILBOX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SocketRequest>(CONNECTOR_QUEUE);
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..CONNECTORS {
+            let rx = rx.clone();
+            let home = File::open("/proc/thread-self/ns/net").ok()?;
+            std::thread::Builder::new().name(format!("sandbox-proxy-netns-{index}")).spawn(move || loop {
+                let next = rx.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                let Ok((netns, reply)) = next else { return };
+                let mut entered = false;
+                let socket = File::open(&netns).ok().and_then(|namespace| {
+                    if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return None; }
+                    entered = true;
+                    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+                    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+                });
+                let _ = reply.send(socket);
+                if entered && unsafe { libc::setns(home.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return; }
+            }).ok()?;
+        }
+        Some(tx)
+    }).as_ref()
+}
+
+// Create a TCP socket inside the routing namespace pinned at `netns` on one of the connector threads,
+// so no thread that serves other work ever changes namespace; the socket stays in that namespace. A
+// full connector queue yields no socket.
 async fn namespace_socket(netns: PathBuf) -> Option<OwnedFd> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new().name("sandbox-proxy-netns".into()).spawn(move || {
-        let socket = File::open(&netns).ok().and_then(|namespace| {
-            if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 { return None; }
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
-            (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
-        });
-        let _ = tx.send(socket);
-    }).ok()?;
+    connectors()?.try_send((netns, tx)).ok()?;
     rx.await.ok().flatten()
 }
 

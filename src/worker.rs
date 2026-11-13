@@ -70,10 +70,11 @@ fn millis(ms: u64) -> Duration { Duration::from_millis(ms) }
 // Accept a controller create only for a valid request whose ID names this worker, and wait for it
 // to finish.
 async fn create(State(handle): State<Handle>, input: Result<Json<CreateRequest>, JsonRejection>) -> Result<Response, ApiError> {
+    let received = std::time::Instant::now();
     let request = http::json(input)?;
     let node = handle.snapshot.read().map_err(|_| unavailable())?.status.node_id.clone();
     if !request.valid() || sandbox_owner(&request.sandbox_id) != Some(node.as_str()) { return Err(http::invalid_input()); }
-    call(&handle, millis(handle.deadlines.create_ms), |reply| Work::Create(request, reply)).await
+    call(&handle, millis(handle.deadlines.create_ms), |reply| Work::Create(request, received, reply)).await
 }
 // Return a sandbox's current state from the published snapshot without contacting the engine.
 async fn get_sandbox(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
@@ -82,10 +83,10 @@ async fn get_sandbox(State(handle): State<Handle>, path: Result<Path<String>, Pa
     let record = snapshot.records.get(&id).ok_or(ApiError(StatusCode::NOT_FOUND, "sandbox_not_found", "Sandbox does not exist"))?;
     Ok(Json(record.view()).into_response())
 }
-// Ask the engine to delete a sandbox and wait for the cleanup result.
+// Timestamp and submit a delete, then wait for its cleanup result.
 async fn delete(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
     let id = id(&handle, path)?;
-    call(&handle, millis(handle.deadlines.delete_ms), |reply| Work::Delete(id, reply)).await
+    call(&handle, millis(handle.deadlines.delete_ms), |reply| Work::Delete(id, std::time::Instant::now(), reply)).await
 }
 #[derive(Serialize)]
 struct ExecResult {
@@ -141,6 +142,7 @@ impl hyper::body::Body for ExecStream {
 // (up to its own timeout plus the margin). Admission is immediate and the command runs on its own
 // thread, so a client that leaves never stops it; a bound violation stops only this command.
 async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<Response, ApiError> {
+    let arrived = std::time::Instant::now();
     let id = id(&handle, path)?;
     let request = http::json(input)?;
     if !request.valid() { return Err(http::invalid_input()); }
@@ -148,7 +150,7 @@ async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejec
     let (started, admitted) = tokio::sync::oneshot::channel();
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (stream, wait) = (request.stream, millis(request.timeout_ms + handle.deadlines.margin_ms));
-    sender.try_send(Work::Exec(id.clone(), request, ExecSink { started, events }))
+    sender.try_send(Work::Exec(id.clone(), request, arrived, ExecSink { started, events }))
         .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy", "Lifecycle mailbox is full; nothing was started"))?;
     let exec = match admitted.await {
         Ok(result) => result.map_err(failure)?,
@@ -215,7 +217,7 @@ async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRe
     let id = id(&handle, path)?;
     let request = http::json(input)?;
     if !valid_id(&request.template_id) { return Err(http::invalid_input()); }
-    call(&handle, millis(handle.deadlines.capture_ms), |reply| Work::Capture(id, request, reply)).await
+    call(&handle, millis(handle.deadlines.capture_ms), |reply| Work::Capture(id, request, std::time::Instant::now(), reply)).await
 }
 
 // Initialize preflight and lifecycle ownership away from request handling, then serve protected

@@ -148,9 +148,8 @@ async fn guard(State(limits): State<Limits>, mut request: Request, next: Next) -
     response
 }
 
-// Turn off Nagle's algorithm on each accepted connection. A response is written as a head and then
-// a body; without this, the body of a small reply waits for the client's delayed acknowledgement
-// (about 40 ms per call on loopback).
+// Turn off Nagle's algorithm on accepted connections so a small reply written in multiple pieces
+// does not wait for the client's delayed acknowledgement (about 40 ms on loopback).
 pub fn no_delay(connection: &mut tokio::net::TcpStream) { let _ = connection.set_nodelay(true); }
 
 // Wait for an interrupt or, where supported, a termination signal to begin graceful shutdown.

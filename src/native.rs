@@ -2,7 +2,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::Read, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, sync::{Condvar, Mutex, PoisonError}, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use crate::{config::NativeConfig, model::SandboxSpec, process::{self, Result}, storage::{self, Artifact, Compatibility, FileIdentity, Manifest}};
+use crate::{config::NativeConfig, model::SandboxSpec, phases::Phases, process::{self, Result}, storage::{self, Artifact, Compatibility, FileIdentity, Manifest}};
 
 #[derive(Clone, Serialize)]
 pub struct Check { pub name: String, pub ok: bool }
@@ -20,6 +20,11 @@ pub struct Native {
     tools: BTreeMap<String, String>,
     pub search_path: String,
     pub helpers: process::Helpers,
+    // Whether sandbox overlays are mounted `volatile` (kernel 5.10 or later; see prepare).
+    volatile_overlay: bool,
+    // Layer digests whose shared lower this worker mounted and checked (see mount_lower); a create
+    // whose layers are all here skips the serialized lower-mount thread. Never held across I/O.
+    mounted_lowers: Mutex<BTreeSet<String>>,
     // Layers whose image this worker has fully hashed, by digest: their size and the identity of the
     // image file when hashed. Trusted only while the file keeps that identity; saved in
     // verified-layers.json so a restart does not rehash them.
@@ -33,7 +38,7 @@ pub struct Native {
     // State of each pooled routing slot this worker built (see network.rs); never held across I/O.
     pub(crate) slots: Mutex<BTreeMap<usize, crate::network::SlotState>>,
     // CRIU's answer, by cpuinfo.img digest, to whether this host's CPU can run a warm template's
-    // processes (see cpu_compatible); only clear answers are kept.
+    // processes (see cpu_check); only definitive answers are kept, never a failed check.
     cpu_checks: Mutex<BTreeMap<String, bool>>,
     _lock: File,
 }
@@ -65,8 +70,19 @@ fn load_verified(root: &Path) -> BTreeMap<String, VerifiedLayer> {
 
 // Size limit of a template's cpuinfo.img (CRIU's description of the capturing host's CPU).
 const CPUINFO_MAX_BYTES: u64 = 1 << 20;
-// Deadline of one `criu cpuinfo check`, which runs while a create is being admitted.
+// Deadline of one `criu cpuinfo check` (on the CPU check thread or a create job, never the admission
+// coordinator).
 const CPU_CHECK_SECONDS: u64 = 5;
+
+// Decide whether `criu cpuinfo check` output is CRIU refusing the CPU itself: at least one error line,
+// and every error line comes from CRIU's x86 CPU comparison and says a feature is unsupported or
+// mismatched (for example "CPU xfeatures has unsupported bits"). A missing or unreadable image is
+// not a refusal.
+fn cpu_refusal(stderr: &str) -> bool {
+    let errors: Vec<_> = stderr.lines().filter(|l| l.starts_with("Error (")).collect();
+    !errors.is_empty() && errors.iter().all(|l| l.starts_with("Error (criu/arch/") && l.contains("cpu.c:")
+        && ["unsupported", "not supported", "mismatch", "do not match"].iter().any(|word| l.contains(word)))
+}
 
 // Where the reaping init (the trusted static tini) is bind-mounted read-only in every sandbox.
 const INIT_PATH: &str = "/.sandbox-init";
@@ -77,6 +93,34 @@ const EXEC_GROUP_PREFIX: &str = "exec-";
 // How one exec ended: its exit code (none if it was stopped or never started), why it was stopped or
 // failed, and whether its resource group could not be emptied and removed.
 pub struct ExecEnd { pub exit_code: Option<i32>, pub interrupted: bool, pub error: Option<&'static str>, pub cleanup_failed: bool }
+
+// Decide from the kernel release (for example "6.8.0-1-generic") whether to try the `volatile`
+// option, introduced in Linux 5.10. Mount refusal still falls back to an ordinary overlay.
+fn volatile_overlay_supported(release: &str) -> bool {
+    let mut numbers = release.trim().split(|c: char| !c.is_ascii_digit()).map(|n| n.parse::<u32>().ok());
+    matches!((numbers.next().flatten(), numbers.next().flatten()), (Some(major), Some(minor)) if (major, minor) >= (5, 10))
+}
+
+// Wait up to five seconds, checking every five milliseconds, until a sandbox's resource group holds no
+// process; fail if it stays populated or cannot be read.
+fn wait_unpopulated(cgroup: &Path) -> Result<()> {
+    let start = std::time::Instant::now();
+    while fs::read_to_string(cgroup.join("cgroup.events")).map_err(|_| "cgroup_unavailable")?.lines().any(|l| l == "populated 1") {
+        if start.elapsed() > Duration::from_secs(5) { return Err("cgroup_still_populated"); }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+// Read at most the last `limit` bytes of a log file as text; an unreadable file reads as empty.
+fn tail(path: &Path, limit: u64) -> String {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = File::open(path) else { return String::new() };
+    let length = file.metadata().map_or(0, |m| m.len());
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(length.saturating_sub(limit))).is_ok() { let _ = file.take(limit).read_to_end(&mut bytes); }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 // Kill everything in a child resource group, wait up to five seconds for it to empty, then remove
 // it. A missing group is already clean.
@@ -109,12 +153,13 @@ fn static_executable(path: &str) -> bool {
 }
 
 // Find executable tools in trusted administrator-owned directories. Reject writable or untrusted
-// binaries and disallow symlinks in an explicitly configured tools directory.
+// binaries and disallow symlinks in an explicitly configured tools directory. losetup is optional,
+// used only for read-only diagnostics after a failed lower mount.
 fn tools(config: Option<&NativeConfig>) -> BTreeMap<String, String> {
     use std::os::unix::fs::MetadataExt;
     let mut tools = BTreeMap::new();
     let configured = config.and_then(|c| c.tools_dir.as_deref());
-    for &name in TOOL_NAMES {
+    for &name in TOOL_NAMES.iter().chain([&"losetup"]) {
         for dir in configured.unwrap_or(process::TOOL_PATH).split(':') {
             let path = Path::new(dir).join(name);
             let resolved = if configured.is_some() {
@@ -249,7 +294,8 @@ impl Native {
             }
         }
         let verified = load_verified(root);
-        Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers,
+        let volatile_overlay = volatile_overlay_supported(&fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
+        Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, volatile_overlay, mounted_lowers: Mutex::new(BTreeSet::new()),
             verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock })
     }
     // Return the configured root of this worker's runtime storage.
@@ -259,64 +305,85 @@ impl Native {
     // Return the verified executable path, or fail if that tool was not discovered.
     pub fn tool(&self, name: &str) -> Result<&str> { self.tools.get(name).map(String::as_str).ok_or("tool_missing") }
     // Run a verified host tool with the configured deadline and tracked helper cleanup, requiring success.
-    // A failure is also written to the worker's error output as the tool name and error code only.
+    // A failure is written to the worker log with the tool name, exit code and bounded error output.
     pub(crate) fn command(&self, tool: &str, args: Vec<String>) -> Result<()> {
-        let result = process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers);
-        if let Err(code) = result { eprintln!("sandboxd: host tool {tool} failed: {code}"); }
-        result
+        process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers, None)
     }
-    // Run runc against this worker's private state with the supplied deadline and output limit. Detached
-    // cold runs and restores get /dev/null stdio, which the workload inherits and CRIU can restore (a
-    // pipe would hang a detached run and a file is not restorable), so no workload output is retained.
+    // Run a verified host tool (or, for `self`, this worker's own executable as an internal helper) like
+    // command, but inside the network namespace pinned at `netns`.
+    pub(crate) fn command_in(&self, tool: &str, netns: &Path, args: Vec<String>) -> Result<()> {
+        let program = if tool == "self" { format!("/proc/{}/exe", std::process::id()) } else { self.tool(tool)?.to_owned() };
+        process::checked(&program, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers, Some(netns))
+    }
+    // Run runc with bounded time and output; log every failure with bounded diagnostics. Detached
+    // runs/restores inherit /dev/null (CRIU-restorable); only runc's own messages go to runc.log.
     pub fn runc(&self, args: Vec<String>, timeout: Duration, limit: usize) -> Result<process::Output> {
-        let mut all = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), "/dev/null".into()];
         let detached = args.first().is_some_and(|a| a == "run" || a == "restore");
+        let log = match args.last() { Some(id) if detached => self.private(id).join("runc.log").display().to_string(), _ => "/dev/null".into() };
+        let tool = format!("runc {}", args.first().map_or("", String::as_str));
+        let mut all = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), log.clone()];
         all.extend(args);
-        self.helpers.run(self.tool("runc")?, &all, timeout, limit, detached, &self.search_path)
+        let out = self.helpers.run(self.tool("runc")?, &all, timeout, limit, detached, &self.search_path, None)
+            .inspect_err(|code| process::log_failure(&tool, code, None, ""))?;
+        if out.interrupted || out.exit_code != Some(0) {
+            let stderr = if detached { tail(Path::new(&log), 4096) } else { out.stderr.clone() };
+            let code = if out.interrupted { "runc_deadline_or_output_limit" } else { "runc_failed" };
+            process::log_failure(&tool, code, out.exit_code, &stderr);
+        }
+        Ok(out)
     }
-    // Run runc with standard command bounds and reject interruption or a nonzero exit.
+    // Require an uninterrupted successful runc exit; runc logs the bounded failure diagnostics.
     fn runc_checked(&self, args: Vec<String>) -> Result<()> {
         let out = self.runc(args, Duration::from_secs(self.config.command_timeout_seconds), 65536)?;
         if out.interrupted { Err("runc_deadline_or_output_limit") }
         else if out.exit_code != Some(0) { Err("runc_failed") } else { Ok(()) }
     }
-    // Cheap check before each create or capture: load the manifest (digest sidecar, strict fields, host
-    // compatibility) and require operator-approved networking, the configured process limit and, for a
-    // warm template, CRIU's acceptance of this CPU (checked once per template). Return the manifest
-    // and its digest. Artifact contents are not hashed here; see verify_layers and
-    // checkpoint_images for the once-per-node checks.
+    // Load the bounded manifest and digest, checking host compatibility, approved networking and the
+    // process limit. Layer/archive hashing and CRIU's CPU decision happen separately.
     pub fn template_manifest(&self, id: &str) -> Result<(Manifest, String)> {
         let (m, digest) = storage::load_manifest(self.root(), id, &self.compatibility)?;
         self.template_usable(&m)?;
         Ok((m, digest))
     }
-    // Require the template's network policy to be operator-approved, its process limit to match this
-    // worker's configuration and, for a warm template, CRIU to accept this host's CPU.
+    // Require the template's network policy to be operator-approved and its process limit to match this
+    // worker's configuration.
     fn template_usable(&self, m: &Manifest) -> Result<()> {
         self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
-        if let Some(cpuinfo) = &m.cpuinfo { self.cpu_compatible(&m.template_id, cpuinfo)?; }
         Ok(())
     }
-    // Decide with CRIU's own check (`criu cpuinfo check`, default capabilities) whether this host's CPU
-    // can run the processes of a warm template, from the cpuinfo.img saved at its capture (its digest
-    // is verified first). The answer is remembered per digest; a check that could not finish is not.
-    // CRIU may accept a template from host A on host B but not the reverse.
-    fn cpu_compatible(&self, template: &str, cpuinfo: &Artifact) -> Result<()> {
-        let known = self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).get(&cpuinfo.sha256).copied();
-        let compatible = match known {
-            Some(answer) => answer,
-            None => {
-                let dir = self.root().join("templates").join(template);
-                storage::verify(&dir.join("cpuinfo.img"), cpuinfo, CPUINFO_MAX_BYTES)?;
-                let args = vec!["cpuinfo".into(), "check".into(), "--images-dir".into(), dir.display().to_string()];
-                let out = self.helpers.run(self.tool("criu")?, &args, Duration::from_secs(CPU_CHECK_SECONDS), 65536, false, &self.search_path)?;
-                if out.interrupted || out.exit_code.is_none() { return Err("cpu_check_interrupted"); }
-                let answer = out.exit_code == Some(0);
-                self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).insert(cpuinfo.sha256.clone(), answer);
-                answer
-            }
+    // Return CRIU's remembered answer for a CPU description (by cpuinfo.img digest), if it gave one.
+    pub fn cpu_known(&self, digest: &str) -> Option<bool> {
+        self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).get(digest).copied()
+    }
+    // Verify cpuinfo.img and ask CRIU whether this CPU can restore it, off the admission thread.
+    // Cache only success or a definitive CPU refusal; log other failures and retry on a later create.
+    // Acceptance can be one-directional between two hosts.
+    pub fn cpu_check(&self, template: &str, cpuinfo: &Artifact) -> Result<bool> {
+        let dir = self.root().join("templates").join(template);
+        storage::verify(&dir.join("cpuinfo.img"), cpuinfo, CPUINFO_MAX_BYTES)?;
+        let args = vec!["cpuinfo".into(), "check".into(), "--images-dir".into(), dir.display().to_string()];
+        let out = self.helpers.run(self.tool("criu")?, &args, Duration::from_secs(CPU_CHECK_SECONDS), 65536, false, &self.search_path, None)
+            .inspect_err(|code| process::log_failure("criu", code, None, ""))?;
+        let answer = match (out.interrupted, out.exit_code) {
+            (false, Some(0)) => Ok(true),
+            (false, Some(_)) if cpu_refusal(&out.stderr) => Ok(false),
+            (true, _) | (_, None) => Err("cpu_check_interrupted"),
+            _ => Err("cpu_check_failed"),
         };
+        match answer {
+            Ok(answer) => {
+                if !answer { process::log_failure("criu", "cpu_incompatible", out.exit_code, &out.stderr); }
+                self.cpu_checks.lock().unwrap_or_else(PoisonError::into_inner).insert(cpuinfo.sha256.clone(), answer);
+            }
+            Err(code) => process::log_failure("criu", code, out.exit_code, &out.stderr),
+        }
+        answer
+    }
+    // Require CRIU to accept this host's CPU for a warm template: the remembered answer, or a check now
+    // (see cpu_check). For create jobs, which normally find the answer admission waited for.
+    pub fn cpu_compatible(&self, template: &str, cpuinfo: &Artifact) -> Result<()> {
+        let compatible = match self.cpu_known(&cpuinfo.sha256) { Some(answer) => answer, None => self.cpu_check(template, cpuinfo)? };
         if compatible { Ok(()) } else { Err("cpu_incompatible") }
     }
     // Write CRIU's description of this host's CPU (`criu cpuinfo dump`) as cpuinfo.img into a capture's
@@ -401,7 +468,8 @@ impl Native {
     }
     // Mount one immutable EROFS layer (a template base or a sealed capture layer) if needed. The create
     // job verified it first (see verify_layers); an untrusted layer is refused, never hashed here. Check
-    // the mount flags and backing image on every use, including reuse of an existing mount.
+    // the mount flags and backing image on every use, including reuse of an existing mount, and
+    // remember the layer as mounted.
     pub fn mount_lower(&self, layer: &Artifact) -> Result<()> {
         if !self.layer_trusted(layer)? { return Err("layer_not_verified"); }
         let image = self.layer_image(&layer.sha256);
@@ -409,16 +477,76 @@ impl Native {
         if !lower.exists() { storage::private_dir(&lower)?; }
         storage::trusted_directory(&lower)?;
         if !storage::mounted(&lower)? {
-            self.command("mount", vec!["--internal-only".into(), "-t".into(), "erofs".into(), "-o".into(), "loop,ro,nodev,nosuid".into(), image.display().to_string(), lower.display().to_string()])?;
+            if let Err(error) = self.command("mount", vec!["--internal-only".into(), "-t".into(), "erofs".into(), "-o".into(), "loop,ro,nodev,nosuid".into(), image.display().to_string(), lower.display().to_string()]) {
+                self.lower_mount_diagnostic(&image, &layer.sha256);
+                return Err(error);
+            }
         }
-        storage::verify_lower(&lower, &image)
+        storage::verify_lower(&lower, &image)?;
+        self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner).insert(layer.sha256.clone());
+        Ok(())
     }
-    // Return the node's shared CRIU image directory for a warm template, keyed by its manifest digest.
-    // The first restore of a key hashes checkpoint.tar fully and unpacks it once: into a staging
-    // directory whose files are all made durable before it is renamed into place, so a crash never
-    // leaves a truncated directory under the final name. A failed unpack removes its staging
-    // directory. Concurrent restores of that key wait for it, and later ones reuse the directory
-    // without reading the archive. CRIU only reads these images, so restores share them.
+    // Log bounded, read-only lower-mount diagnostics: actual EROFS feature bits, kernel support,
+    // existing loop devices and optional losetup errors. Never allocate or detach a loop device,
+    // change readiness, or replace the original mount error with a diagnostic failure.
+    fn lower_mount_diagnostic(&self, image: &Path, digest: &str) {
+        use std::io::{Seek, SeekFrom};
+        let mut header = [0u8; 88];
+        let superblock = File::open(image).and_then(|mut f| {
+            f.seek(SeekFrom::Start(1024))?;
+            f.read_exact(&mut header)
+        }).ok().map(|_| {
+            let word = |at| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
+            json!({"magic": format!("{:08x}", word(0)), "feature_compat": format!("{:08x}", word(8)),
+                "feature_incompat": format!("{:08x}", word(80)), "block_size_bits": header[12]})
+        });
+        let mut present = 0usize;
+        let mut backed = 0usize;
+        let mut nodes = 0usize;
+        let mut truncated = false;
+        if let Ok(entries) = fs::read_dir("/sys/block") {
+            for (index, entry) in entries.enumerate() {
+                if index >= 4096 { truncated = true; break; }
+                let Ok(entry) = entry else { continue };
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.strip_prefix("loop").is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())) { continue; }
+                present += 1;
+                backed += usize::from(entry.path().join("loop/backing_file").exists());
+                nodes += usize::from(Path::new("/dev").join(name.as_ref()).exists());
+            }
+        }
+        let features: Vec<_> = fs::read_dir("/sys/fs/erofs/features").into_iter().flatten().take(64)
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().chars().take(64).collect::<String>())).collect();
+        let control_error = File::open("/dev/loop-control").err().and_then(|e| e.raw_os_error());
+        let mut tools = serde_json::Map::new();
+        for (name, args) in [("losetup", vec!["--list".into(), "--noheadings".into(), "--output".into(), "NAME".into()]),
+            ("mkfs.erofs", vec!["--version".into()])] {
+            let Some(tool) = self.tools.get(name) else { tools.insert(name.into(), json!({"available": false})); continue; };
+            let result = self.helpers.run(tool, &args, Duration::from_secs(3), 4096, false, &self.search_path, None);
+            match result {
+                Ok(out) => {
+                    if out.interrupted || out.exit_code != Some(0) { process::log_failure(name, "mount_diagnostic_failed", out.exit_code, &out.stderr); }
+                    tools.insert(name.into(), json!({"exit": out.exit_code, "interrupted": out.interrupted,
+                        "stdout": out.stdout.chars().take(256).collect::<String>(), "stderr": out.stderr.chars().take(256).collect::<String>()}));
+                }
+                Err(error) => { process::log_failure(name, error, None, ""); tools.insert(name.into(), json!({"error": error})); }
+            }
+        }
+        eprintln!("sandboxd: lower_mount_diagnostic {}", json!({"image_sha256": digest, "erofs_superblock": superblock,
+            "kernel": self.compatibility.kernel, "kernel_erofs_features": features, "loop_control_open_errno": control_error,
+            "loop_sysfs_present": present, "loop_backed": backed, "loop_device_nodes": nodes, "loop_scan_truncated": truncated,
+            "tools": tools}));
+    }
+    // Decide whether every one of these layers already has a shared lower this worker mounted and
+    // checked, so a create can skip the lower-mount thread (prepare still checks each mount).
+    pub fn lowers_mounted(&self, layers: &[Artifact]) -> bool {
+        let mounted = self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner);
+        layers.iter().all(|layer| mounted.contains(&layer.sha256))
+    }
+    // Return shared read-only CRIU images keyed by manifest digest. The first restore verifies and
+    // unpacks the archive, syncs its files, then publishes it atomically; failures remove staging.
+    // Concurrent restores wait for this unpack; later restores reuse the durable directory.
     pub fn checkpoint_images(&self, manifest: &Manifest, key: &str) -> Result<PathBuf> {
         let archive = manifest.checkpoint.as_ref().ok_or("checkpoint_missing")?;
         if !storage::hex_digest(key) { return Err("invalid_checkpoint_cache_key"); }
@@ -433,11 +561,10 @@ impl Native {
         let unpacked = (|| {
             storage::verify(&template.join("checkpoint.tar"), archive, self.config.max_artifact_bytes)?;
             storage::extract(self.tool("tar")?, &template.join("checkpoint.tar"), &staging, self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
-            // tar does not sync what it writes. syncfs flushes every extracted file and directory
-            // (one filesystem) before the rename makes the cache entry trusted.
-            let dir = File::open(&staging).map_err(|_| "checkpoint_cache_sync_failed")?;
-            if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 { return Err("checkpoint_cache_sync_failed"); }
-            dir.sync_all().map_err(|_| "checkpoint_cache_sync_failed")
+            // tar does not sync what it writes. Every extracted file and directory is synced before the
+            // rename makes the cache entry trusted; only those, not the whole host filesystem (whose
+            // unrelated write-back could take seconds).
+            storage::sync_tree(&staging).map_err(|_| "checkpoint_cache_sync_failed")
         })();
         if let Err(e) = unpacked {
             // Only after every helper drained (tar may have been killed at its deadline).
@@ -451,8 +578,8 @@ impl Native {
     // Build a sandbox: private directories, an overlay root whose lowers are the template's verified
     // sealed layers above its base, with a fresh empty upper, plus its resource group, network and
     // execution specification. Then start it cold or restore it from the shared checkpoint images and
-    // confirm it runs. Partial state is left for the caller's cleanup.
-    pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, images: Option<&Path>, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+    // confirm it runs, timing each step. Partial state is left for the caller's cleanup.
+    pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, images: Option<&Path>, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool, phases: &mut Phases) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let id = &request.sandbox_id;
         let private = self.private(id);
@@ -462,24 +589,48 @@ impl Native {
         fs::set_permissions(private.join("upper"), fs::Permissions::from_mode(0o755)).map_err(|_| "upper_permissions_failed")?;
         if images.is_some() != manifest.checkpoint.is_some() { return Err("checkpoint_images_missing"); }
         if manifest.checkpoint.is_some() && (manifest.memory_mib != Some(request.memory_mib) || manifest.vcpus != Some(request.vcpus)) { return Err("incompatible_checkpoint_resources"); }
+        phases.mark("rootfs_dirs");
         let mut lowers = Vec::new();
         for layer in manifest.layers.iter().chain(std::iter::once(&manifest.base)) {
             let lower = self.lower(&layer.sha256);
-            storage::verify_lower(&lower, &self.layer_image(&layer.sha256))?;
+            // A lower that is no longer the checked mount is forgotten, so the next create mounts it
+            // again through the lower-mount thread.
+            if let Err(e) = storage::verify_lower(&lower, &self.layer_image(&layer.sha256)) {
+                self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner).remove(&layer.sha256);
+                return Err(e);
+            }
             lowers.push(lower.display().to_string());
         }
-        // Topmost sealed layer first. Work/upper are ordinary private sibling directories.
-        self.command("mount", vec!["--internal-only".into(), "-t".into(), "overlay".into(), "overlay".into(), "-o".into(),
-            format!("nodev,nosuid,lowerdir={},upperdir={},workdir={},index=off,metacopy=off,redirect_dir=off,xino=off", lowers.join(":"), private.join("upper").display(), private.join("work").display()),
-            private.join("rootfs").display().to_string()])?;
+        // Topmost sealed layer first. Work/upper are ordinary private sibling directories. The upper
+        // is disposable (a crash or delete removes it; a capture seals it from the page cache), so a
+        // volatile overlay skips syncing it: otherwise unmounting it syncs the whole host filesystem
+        // that holds it, waiting behind unrelated write-back.
+        let volatile = if self.volatile_overlay { ",volatile" } else { "" };
+        let options = format!("nodev,nosuid,lowerdir={},upperdir={},workdir={},index=off,metacopy=off,redirect_dir=off,xino=off", lowers.join(":"), private.join("upper").display(), private.join("work").display());
+        let mount = |suffix: &str| self.command("mount", vec!["--internal-only".into(), "-t".into(), "overlay".into(), "overlay".into(), "-o".into(),
+            format!("{options}{suffix}"), private.join("rootfs").display().to_string()]);
+        match mount(volatile) {
+            // Vendor kernels/backing filesystems may not support volatile despite the release number.
+            // Retry only an exited mount failure, after all helpers drained and no mount was created.
+            Err("tool_failed") if !volatile.is_empty() && !storage::mounted(&private.join("rootfs"))? => {
+                eprintln!("sandboxd: volatile overlay unavailable; retrying ordinary overlay");
+                mount("")?;
+            }
+            result => result?,
+        }
+        phases.mark("overlay_mount");
         self.cgroup(request)?;
-        self.prepare_network(id, &manifest.network, network_slot)?;
+        phases.mark("cgroup");
+        self.prepare_network(id, &manifest.network, network_slot, phases)?;
         self.write_spec(request, manifest)?;
         if manifest.oci_config_sha256.as_ref().is_some_and(|d| self.spec_digest(id).as_ref() != Ok(d)) { return Err("oci_config_mismatch"); }
+        phases.mark("oci_spec");
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
-        if let Some(images) = images { self.restore(id, images)?; }
-        else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; }
-        self.ensure_running(id)
+        if let Some(images) = images { self.restore(id, images)?; phases.mark("runc_restore"); }
+        else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; phases.mark("runc_run"); }
+        self.ensure_running(id)?;
+        phases.mark("ensure_running");
+        Ok(())
     }
     // Create the sandbox's resource group with its memory (no swap, whole-group OOM kill), process
     // and CPU limits.
@@ -534,7 +685,7 @@ impl Native {
         });
         // Every sandbox joins its worker-created guest namespace, isolated ones too.
         spec["linux"]["namespaces"][2]["path"] = json!(format!("/run/netns/{}", self.guest_name(&request.sandbox_id)));
-        process::atomic_json(&private.join("config.json"), &spec)
+        process::new_private_json(&private.join("config.json"), &spec)
     }
     // Hash the saved execution specification after replacing worker-local reconstruction paths (cgroup,
     // guest netns, CRIU config, init binary) with stable markers.
@@ -580,14 +731,17 @@ impl Native {
         }
         Ok(false)
     }
-    // While the sandbox is frozen, flush its overlay and build a read-only EROFS image of its upper
-    // directory. Whiteouts, opaque-directory markers, ownership, modes and extended attributes are
-    // kept, so the image works as a lower layer for restored children.
-    pub fn seal_upper(&self, id: &str, image: &Path) -> Result<()> {
+    // While frozen, check overlay write-back errors and seal its upper from the page cache into EROFS,
+    // preserving whiteouts, opacity, owners, modes and attributes. On a volatile overlay sync writes
+    // nothing back; the sealed image itself is synced at publication. Time both steps.
+    pub fn seal_upper(&self, id: &str, image: &Path, phases: &mut Phases) -> Result<()> {
         let rootfs = File::open(self.private(id).join("rootfs")).map_err(|_| "rootfs_unavailable")?;
         if unsafe { libc::syncfs(rootfs.as_raw_fd()) } != 0 { return Err("upper_sync_failed"); }
+        phases.mark("upper_sync");
         self.command("mkfs.erofs", vec!["--quiet".into(), image.display().to_string(), self.private(id).join("upper").display().to_string()])
-            .map_err(|_| "upper_seal_failed")
+            .map_err(|_| "upper_seal_failed")?;
+        phases.mark("seal");
+        Ok(())
     }
     // Checkpoint the paused source through runc and leave it running afterwards. Save process images,
     // established TCP connections, external Unix sockets and file locks, with the network locked during
@@ -608,34 +762,42 @@ impl Native {
             .map_err(|e| if e == "runc_deadline_or_output_limit" { "checkpoint_interrupted" } else { "checkpoint_failed" })
     }
     // Restore captured processes, including established TCP connections, external Unix sockets and
-    // file locks, into the prepared sandbox without replacing its resource groups, then confirm it is
-    // running. The image directory is only read.
+    // file locks, into the prepared sandbox without replacing its resource groups; the caller confirms
+    // it is running. The image directory is only read. A failure logs CRIU's error lines.
     pub fn restore(&self, id: &str, images: &Path) -> Result<()> {
         // Same restore-only options as the AgentENV container backend, plus the network lock method.
         fs::write(self.private(id).join("criu.conf"), "allow-uprobes\nmntns-compat-mode\nnetwork-lock nftables\n").map_err(|_| "criu_config_failed")?;
         self.runc_checked(vec!["restore".into(), "--detach".into(), "--bundle".into(), self.private(id).display().to_string(),
             "--image-path".into(), images.display().to_string(), "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
-            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
-        self.ensure_running(id)
+            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()])
+            .map_err(|_| {
+                // CRIU's own reason is in its restore log, which cleanup removes: log its error lines.
+                let log = tail(&self.private(id).join("criu-work").join("restore.log"), 65536);
+                let errors: Vec<_> = log.lines().filter(|l| l.contains("Error")).collect();
+                process::log_failure("criu restore", "restore_failed", None, &errors.join("\n"));
+                "restore_failed"
+            })
     }
-    // Run one command with runc exec in its own child resource group `exec-<exec>` of the sandbox,
-    // passing output chunks to `sink` as they arrive (true marks stderr). Its deadline, combined output
-    // limit and `stop` reason end only this command: its group is killed, never the sandbox. When it
-    // ends, whatever is left in the group (background children) is killed and the group and process
-    // file are removed.
-    pub fn exec(&self, id: &str, exec: u64, argv: Vec<String>, timeout: Duration, limit: usize, sink: &mut dyn FnMut(bool, &[u8]), stop: &dyn Fn() -> Option<&'static str>) -> ExecEnd {
+    // Run and time one runc exec in its own group, streaming chunks to sink (true means stderr).
+    // Deadline, output bound or stop kills only this command's group. On every end, remove its
+    // background children, group and process file; never kill the sandbox for a command's bound.
+    pub fn exec(&self, id: &str, exec: u64, argv: Vec<String>, timeout: Duration, limit: usize, sink: &mut dyn FnMut(bool, &[u8]), stop: &dyn Fn() -> Option<&'static str>, phases: &mut Phases) -> ExecEnd {
         let group = Path::new(&self.config.cgroup_parent).join(id).join(format!("{EXEC_GROUP_PREFIX}{exec}"));
         let file = self.private(id).join(format!("{EXEC_GROUP_PREFIX}{exec}.json"));
         let result = fs::create_dir(&group).map_err(|_| "exec_cgroup_create_failed")
-            .and_then(|_| process::atomic_json(&file, &self.process_spec(argv)))
+            .and_then(|_| process::new_private_json(&file, &self.process_spec(argv)))
             .and_then(|_| {
+                phases.mark("exec_setup");
                 let args = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), "/dev/null".into(), "exec".into(),
                     "--cgroup".into(), format!("{EXEC_GROUP_PREFIX}{exec}"), "--process".into(), file.display().to_string(), id.into()];
                 let kill = || { let _ = fs::write(group.join("cgroup.kill"), "1"); };
-                self.helpers.stream(self.tool("runc")?, &args, timeout, limit, &self.search_path, sink, stop, &kill)
+                let streamed = self.helpers.stream(self.tool("runc")?, &args, timeout, limit, &self.search_path, sink, stop, &kill);
+                phases.mark("runc_exec");
+                streamed
             });
         let _ = fs::remove_file(&file);
         let cleanup = remove_group(&group);
+        phases.mark("exec_cleanup");
         let (exit_code, interrupted, error) = match result {
             Ok(done) => (done.exit_code, done.stopped.is_some(), done.stopped),
             Err(e) => (None, false, Some(e)),
@@ -657,11 +819,11 @@ impl Native {
         }
         Ok(())
     }
-    // Tear down everything a sandbox owns: kill its processes and remove its exec groups, delete runc
-    // state, wait for and remove its resource group, return its network slot to the pool and remove its
-    // guest network, unmount its root and delete private files. Stop at the first failure so the caller
-    // can retry.
-    pub fn cleanup(&self, id: &str, network_slot: Option<usize>) -> Result<()> {
+    // Tear down everything a sandbox owns: kill its processes and remove its exec groups, wait until
+    // its processes are gone, delete runc state, remove its resource group, return its network slot
+    // to the pool and remove its guest network, unmount its root and delete private files, timing
+    // each step. Stop at the first failure so the caller can retry.
+    pub fn cleanup(&self, id: &str, network_slot: Option<usize>, phases: &mut Phases) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
         let cgroup = Path::new(&self.config.cgroup_parent).join(id);
@@ -669,22 +831,36 @@ impl Native {
             fs::write(cgroup.join("cgroup.kill"), "1").map_err(|_| "cgroup_kill_failed")?;
         }
         self.remove_exec_groups(id)?;
+        phases.mark("kill");
+        // Wait for the killed processes to end first, so a plain runc delete finds the container
+        // stopped and removes it at once (`--force` always signals and then sleeps at least 100 ms).
+        // A container runc does not yet see as stopped (or still sees as paused) is force-deleted.
+        if cgroup.exists() { wait_unpopulated(&cgroup)?; }
+        phases.mark("cgroup_drain");
         let state_dir = self.root().join("runc").join(id);
-        if state_dir.exists() { self.runc_checked(vec!["delete".into(), "--force".into(), id.into()])?; }
-        if cgroup.exists() {
-            let start = std::time::Instant::now();
-            while fs::read_to_string(cgroup.join("cgroup.events")).map_err(|_| "cgroup_unavailable")?.lines().any(|l| l == "populated 1") {
-                if start.elapsed() > Duration::from_secs(5) { return Err("cgroup_still_populated"); }
-                std::thread::sleep(Duration::from_millis(20));
+        if state_dir.exists() {
+            let plain = self.runc(vec!["delete".into(), id.into()], Duration::from_secs(self.config.command_timeout_seconds), 65536);
+            if !plain.is_ok_and(|out| out.exit_code == Some(0) && !out.interrupted) {
+                self.helpers.ensure_healthy()?;
+                self.runc_checked(vec!["delete".into(), "--force".into(), id.into()])?;
             }
+        }
+        phases.mark("runc_delete");
+        if cgroup.exists() {
+            wait_unpopulated(&cgroup)?;
             // runc may have removed its cgroup during delete.
             if cgroup.exists() { fs::remove_dir(&cgroup).map_err(|_| "cgroup_remove_failed")?; }
         }
+        phases.mark("cgroup_remove");
         self.cleanup_network(id, network_slot)?;
+        phases.mark("network_release");
         let private = self.private(id);
         let rootfs = private.join("rootfs");
         if storage::mounted(&rootfs)? { self.command("umount", vec!["--internal-only".into(), rootfs.display().to_string()])?; }
-        storage::remove_private(&private)
+        phases.mark("rootfs_umount");
+        storage::remove_private(&private)?;
+        phases.mark("private_remove");
+        Ok(())
     }
     // Drain and remove the worker-owned host-command resource groups.
     pub fn remove_helpers(&self) -> Result<()> { self.helpers.remove() }
@@ -697,6 +873,7 @@ impl Native {
             if !entry.file_name().to_str().is_some_and(storage::hex_digest) { return Err("unknown_lower_state"); }
             if storage::mounted(&entry.path())? {
                 storage::verify_lower(&entry.path(), &self.layer_image(&entry.file_name().to_string_lossy()))?;
+                self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner).remove(&entry.file_name().to_string_lossy().into_owned());
                 self.command("umount", vec!["--internal-only".into(), entry.path().display().to_string()])?;
             }
         }

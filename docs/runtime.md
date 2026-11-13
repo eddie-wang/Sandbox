@@ -220,18 +220,22 @@ integration qualification after this first gate; no unit-test substitute is used
 
 ## Local concurrency stress gate
 
-`scripts/stress_smoke.py` takes the same arguments as the lifecycle smoke and runs
-in the host network namespace with isolated sandboxes only (each still gets its own
-worker-created guest network namespace). Through a real controller and worker with
-the tiny fixture (64 MiB, one vCPU and 64 pids per sandbox), it starts **16 cold
-creates at once, then 16 warm restores of one capture at once, then 16 of each at
-the same moment (32 concurrent creates and guest namespaces)**, and deletes each
-batch concurrently. Every create and delete must succeed on its first attempt (no
-retry, no failover, no error code at all) and the worker must log no host tool
-failure; the usual no-leftover checks follow. It reports per-batch error counts and
-create/delete timings. The recorded run used an owned cgroup of 4 GiB and 4,096
-pids (peak about 190 MiB). It is a local burst check on one host, not a capacity or
-performance result.
+`scripts/stress_smoke.py` uses a disposable outer network/mount namespace, never
+changes default-host networking, and runs a real controller and worker. With the
+tiny fixture (64 MiB, one vCPU, 64 pids), isolated batches are **16 cold, 16 warm,
+then 16 of each together**; approved-port batches are **32 cold and 32 warm**.
+One capture source plus the batch means at most 33 live fixture containers. Each
+batch is deleted concurrently. Optional `--oci-layout` adds a Python image at
+128 MiB: `--image-concurrency` defaults to 2 plus its source (at most three live
+images); larger image batches need separate approval. The approved local bound is
+an owned cgroup with 4 GiB and 4096 pids. Every create/delete must succeed first try,
+with no host-tool failure and no leftovers. The gate checks histogram bounds and
+authentication, profiles per-phase times and measures 16-byte/1-MiB replies directly
+in the routing slot, through the worker and through the controller. These are
+informational release-build measurements on one host, not a capacity qualification.
+A final batch creates 32 sandboxes from distinct tiny EROFS images to exercise
+first-use lower mounts and loop-device allocation; it keeps the same fixture bound.
+This does not exhaust global host loop devices or change their allocation limits.
 
 Host tools are run with their output on nonblocking pipes. Once a tool has exited,
 everything it wrote is already in its pipes, so the worker reads what is there and
@@ -242,7 +246,42 @@ an interruption. Before this, such a pipe made a fast tool look interrupted
 (`tool_deadline_or_output_limit`, and as `guest_namespace_create_failed` or
 `cleanup_failed` through their callers); concurrent creates hit it routinely. The
 output limit and deadline are unchanged. A failing host tool is written to the
-worker's error output as the tool's name and error code only.
+worker's error output with its name, static error, exit code and at most the last
+512 input bytes of stderr, escaped onto one line. This includes storage tar,
+runc's direct/checked paths (detached diagnostics come from its log), and CRIU's
+CPU check. Guest command output is delivered to its caller, not copied to worker
+logs. Logs can contain workload paths or tool diagnostics; protect them.
+
+A failed EROFS lower mount also emits `lower_mount_diagnostic`: image checksum,
+actual superblock compatibility/incompatibility bits and block-size shift, current
+kernel and its advertised EROFS features, loop-control open errno, counts of
+existing loop devices/backing associations/device nodes (scan bounded at 4096),
+and the local `mkfs.erofs --version`. Optional trusted `losetup`, discovered under
+the same tool-directory policy, supplies a bounded read-only device list and its
+stderr/exit status. Missing losetup does not change readiness. Diagnostics never
+allocate/detach a device, infer the image's build tool, or replace the original
+failure. Existing free-device counts are not a proof of available loop capacity.
+
+DELETE cancellation is checked for both buffered and streamed exec results. Their
+end events now pass through the engine after it publishes deletion state, avoiding
+a command-thread/snapshot race that could return `running` for a cancelled exec.
+
+Every admitted lifecycle job or exec emits one `sandboxd: phases {…}` line with
+operation, sandbox ID, result, total milliseconds and completed phase durations.
+Create/restore separates admission wait, manifest, layer verification, lower and
+overlay mounts, cgroup, guest/slot network, OCI spec, runc and running verification.
+`first_ready` is elapsed time to the running result, not application readiness;
+uncompleted steps on a failure have no successful-step duration. Capture and
+delete similarly expose sealing/checkpoint/publication and cleanup steps. Status
+carries the bounded cumulative histograms described in [api.md](api.md).
+
+CPU checks run off the admission coordinator, with bounded queues and definitive
+answers cached; transient failures are retried. Older manifests containing
+`compatibility.cpu_features_sha256` must be republished (strict parsing rejects
+them). Runtime overlays prefer `volatile`, falling back to ordinary overlays if
+unsupported. Capture still freezes and seals matching files/processes and syncs
+the published layer. Lazy pages are not shipped: small-image experiments are not
+proof of reliable page-server ownership and restore under sustained load.
 
 ## Failure and cleanup procedure
 

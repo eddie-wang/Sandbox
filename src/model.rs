@@ -56,17 +56,24 @@ pub struct WorkerStatus {
     pub runtimes: Vec<RuntimeCapability>,
     pub cpu_overcommit: u32,
     pub qualification: String,
+    // Cumulative per-step durations of this worker's operations since it started, keyed
+    // `<operation>.<step>` (see phases.rs).
+    #[serde(default)]
+    pub phases: std::collections::BTreeMap<String, crate::phases::Histogram>,
 }
 
 impl WorkerStatus {
-    // Check status schema, expected node identity and field bounds. Require reported reservations to fit
-    // capacity, including the configured CPU overcommit allowance.
+    // Check status schema, expected node identity and field bounds, including the size of the phase
+    // histograms. Require reported reservations to fit capacity, including the configured CPU
+    // overcommit allowance.
     pub fn valid_for(&self, node_id: &str) -> bool {
         self.schema_version == 1 && self.node_id == node_id
             && self.architecture.len() <= 32 && self.os.len() <= 32
             && self.capacity.valid() && self.runtimes.len() == 1
             && (1..=16).contains(&self.cpu_overcommit) && self.qualification.len() <= 64
             && self.runtimes[0].reason.len() <= 128
+            && self.phases.len() <= crate::phases::MAX_HISTOGRAMS
+            && self.phases.iter().all(|(key, histogram)| key.len() <= 64 && histogram.valid())
             && self.usage.as_ref().is_none_or(|usage| {
                 usage.memory_mib <= self.capacity.memory_mib
                     && usage.vcpus <= self.capacity.vcpus.saturating_mul(self.cpu_overcommit)

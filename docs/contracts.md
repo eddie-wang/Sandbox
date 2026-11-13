@@ -89,8 +89,8 @@ and backing image are checked on every use.
 A warm template's `checkpoint.tar` is fully hashed and unpacked once into
 `checkpoints/<manifest-sha256>/` under a per-key turn: concurrent restores of the
 same manifest wait for that unpack and later ones reuse the directory. GNU tar does
-not sync what it writes, so the worker calls `syncfs` on the staging directory (one
-filesystem) and syncs the directory itself before renaming
+not sync what it writes, so the worker starts write-back of each extracted file,
+then syncs those files and directories (not the unrelated host filesystem) before renaming
 `<key>.unpacking` to `<key>` and syncing `checkpoints/`; a crash cannot leave
 truncated images under the final name. A failed unpack removes its `.unpacking`
 directory (after all helpers drained); start-up removes any left by a crash. The
@@ -151,10 +151,18 @@ admitted, the worker verifies `cpuinfo.img` against its descriptor and runs
 5 s deadline. A failing check is a pre-launch `template_unavailable` (no ID, no
 record), so the controller tries another node. The answer is remembered per
 `cpuinfo.img` digest for the worker's lifetime (a check that could not finish is
-not remembered); a capture remembers its own host as compatible. The check can be
+not remembered); only success or explicit CRIU CPU-comparison refusals are cached,
+not environment, image-read, helper or deadline failures. One bounded CPU-check
+thread serves at most 16 queued descriptions and 64 waiting creates, outside the
+admission coordinator; waiters reserve no sandbox resources. A capture remembers
+its own host as compatible. The check can be
 **one-directional**: CRIU may accept a template captured on host A when restoring
 on host B, but refuse the reverse (for example when only A has `xsaves`). CRIU's
 restore repeats its own check.
+
+Templates published with the removed `compatibility.cpu_features_sha256` field
+must be republished before upgrading; strict manifest parsing rejects them,
+including cold templates. There is no silent migration.
 
 ## Capture, file identity and recovery
 
@@ -168,7 +176,12 @@ run on a bounded operation pool. Capture follows the AgentENV container backend 
 2. While frozen: read each task's `/proc/<pid>/maps` for a `[uprobes]` mapping (left
    by a host tracing/security agent), `syncfs` the overlay and build an EROFS image
    of the upper directory with `mkfs.erofs` (uncompressed; overlay whiteouts,
-   opaque-directory xattrs, ownership, modes and other xattrs kept).
+   opaque-directory xattrs, ownership, modes and other xattrs kept). Disposable
+   uppers use OverlayFS `volatile` on supported kernels: this sync detects prior
+   write-back errors without flushing the upper filesystem. The seal reads frozen
+   files through the page cache; the sealed image is synced before publication.
+   An unsupported volatile mount is retried as an ordinary overlay, preserving
+   correctness but losing the bounded-write-back latency benefit.
 3. `runc checkpoint --leave-running --tcp-established --ext-unix-sk --file-locks`,
    with `network-lock nftables` and `skip-in-flight` (plus `allow-uprobes` when step
    2 found uprobes) in the per-container CRIU config.

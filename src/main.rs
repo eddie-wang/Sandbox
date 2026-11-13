@@ -8,6 +8,7 @@ mod worker;
 mod engine;
 mod native;
 mod network;
+mod phases;
 mod process;
 mod proxy;
 mod storage;
@@ -28,6 +29,7 @@ fn main() {
 // only for serving; preflight prints its checks and fails if prerequisites are missing.
 fn start() -> Result<(), &'static str> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "internal-exec") { return process::exec_helper(&args[1..]); }
     if args.len() == 1 && args[0] == "internal-forward" { return network::forward_helper(true); }
     if args.len() == 1 && args[0] == "internal-guest-network" { return network::forward_helper(false); }
     if args.len() == 1 && args[0] == "internal-slot-reset" { return network::slot_reset_helper(); }

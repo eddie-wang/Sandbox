@@ -57,6 +57,12 @@ impl Controller {
     // request_timeout_ms of slack, so the owner reports its own operation_timeout before this
     // forward gives up.
     fn operation_timeout(&self, wait: Duration) -> Duration { wait + self.server.timeout() }
+    // Decide whether a worker's last poll succeeded within the freshness window, without copying its
+    // cached status (which carries phase histograms); for per-request routing.
+    async fn fresh(&self, owner: &str) -> bool {
+        let nodes = self.nodes.read().await;
+        nodes.iter().any(|node| node.node_id == owner && node.error.is_none() && node.observed.is_some_and(|time| time.elapsed() <= self.freshness))
+    }
     // Return the cached view of every configured worker, marking it fresh only if its last poll
     // succeeded within the freshness window.
     async fn snapshot(&self) -> Vec<NodeView> {
@@ -279,8 +285,7 @@ impl Forward {
 // observation.
 async fn owner_url(c: &Controller, owner: &str, path: &str, query: Option<&str>) -> Result<reqwest::Url, ApiError> {
     let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or_else(http::invalid_input)?;
-    let nodes = c.snapshot().await;
-    if !nodes.iter().any(|n| n.node_id == owner && n.fresh) {
+    if !c.fresh(owner).await {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable", "Owner identity has no fresh validated observation"));
     }
     let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| http::invalid_input())?;

@@ -140,7 +140,7 @@ Capture follows the AgentENV container design and **does not stop the source**:
 
 1. Check that the requested template name is unused and that the sandbox can be captured.
 2. Briefly freeze the source's processes (`runc pause`).
-3. While it is frozen, flush its private file changes to disk and seal them into a new read-only EROFS layer. The layer keeps file permissions, owners, extended attributes and records of deleted base files.
+3. While it is frozen, check filesystem write-back errors and seal its private changes from the file cache into a new read-only EROFS layer. The layer keeps file permissions, owners, extended attributes and records of deleted base files; publication writes that layer safely to disk.
 4. Still frozen, ask runc/CRIU to save the processes and let them keep running afterwards. Open network connections are saved too, including connections inside the sandbox.
 5. Unfreeze the source. It was unavailable only between steps 2 and 5; requests that arrive meanwhile wait and are answered afterwards. (The tests report the time the source's resource group was frozen and the longest gap a client saw; the gap is slightly longer because the checkpoint tool briefly unfreezes the group while it still holds the processes.)
 6. Archive the saved processes, then publish the layer and the complete template: the matching process checkpoint, the sealed layer, the base reference, the required configuration and checksums.
@@ -189,6 +189,16 @@ The app proxy reaches only that sandbox's approved service ports, over a connect
 
 Low-level packet rules and the tested fix for paths with smaller packet-size limits are documented in [network details](../docs/network.md).
 
+### Built latency work and remaining experiments
+
+Every admitted create, restore, capture, delete and command produces a structured step-timing log and bounded cumulative histograms in authenticated worker status. First-ready means the worker confirmed the container runs, not that its application is healthy. A bounded helper checks processor compatibility without stopping admission; only definite CRIU answers are remembered.
+
+Creation and final record writes run with the background job, still before any owned resource is created and before a successful result. Already-mounted layers avoid the single mount queue but their identity is still checked. Host commands start through a fresh helper without copying the large worker memory map. Network commands enter only the target network environment and combine related link operations. The proxy reuses four socket-making threads, never guest connections.
+
+Disposable private overlays use the kernel's volatile option where supported, falling back to an ordinary overlay if refused. This avoids waiting for unrelated dirty host data during unmount. Capture reads the frozen file cache and makes the sealed layer durable before publishing it; it does not depend on making the disposable upper durable. Unpacked checkpoints sync their own files rather than the entire host filesystem. Cleanup waits for killed tasks, then tries ordinary runc delete before force deletion.
+
+Lazy-page restoration remains unimplemented: a small-image experiment is not enough to establish reliability under load, and the additional page-server lifetime would need its own correctness work. No new microVM runtime or comparison service is added. Local fixture measurements are not a two-node capacity claim.
+
 ### Where to look in the code
 
 | File | Plain-English responsibility |
@@ -201,6 +211,7 @@ Low-level packet rules and the tested fix for paths with smaller packet-size lim
 | [`scheduler.rs`](../src/scheduler.rs) | Keeps ready nodes whose last status has room and orders them by how full their promised budgets are (including creates just sent there), taking turns between equally full nodes, for create placement. |
 | [`worker.rs`](../src/worker.rs) | Receives node-local API requests, waits for each result (or streams command output) and returns it; checks proxied traffic against the sandbox's approved ports. |
 | [`model.rs`](../src/model.rs) | Defines request/status fields and checks valid values. |
+| [`phases.rs`](../src/phases.rs) | Records operation step durations and bounded cumulative histograms. |
 | [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work and its results, running commands, expiry and restart cleanup. |
 | [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU; runs each command in its own resource group. |
 | [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time (passing command output on as it arrives), and safely writes saved JSON records. |

@@ -105,7 +105,8 @@ RBAC, built-in TLS or Internet-facing connection defense.
   operator overcommit factor, rather than assuming each idle quota consumes a
   physical CPU.
 - Capture follows the AgentENV container backend and does not stop the source:
-  `runc pause`, `syncfs` and seal the upper into an EROFS layer (ownership, xattrs,
+  `runc pause`, check overlay write-back errors and seal the upper from the page
+  cache into a durable EROFS layer (ownership, xattrs,
   whiteouts kept), `runc checkpoint --leave-running` with `--tcp-established
   --ext-unix-sk --file-locks`, `runc resume`; then archive the images and atomically
   publish the layer, manifest and digests. On failure the source is thawed and kept
@@ -153,6 +154,17 @@ RBAC, built-in TLS or Internet-facing connection defense.
   read without waiting for anything that still holds its pipes (a descendant, or a
   concurrently started tool), so fast tools under concurrent creates are not
   misreported as interrupted.
+- Lifecycle phase logs and authenticated status histograms separate admission,
+  storage, network, runc and cleanup time. CPU checks run on a bounded helper;
+  transient CRIU failures are not cached. Create/final record sync runs on operation
+  workers, already-mounted lowers bypass the mount queue, and helpers use an
+  exec trampoline rather than copying the worker's address space. Network setup
+  batches ip commands without copying the mount namespace. A bounded connector
+  pool makes proxy sockets; guest connections are still never reused.
+- Disposable sandbox overlays use `volatile` where supported, falling back to an
+  ordinary overlay on mount refusal. Capture seals frozen cached files and durably
+  publishes the sealed layer; checkpoint-cache sync touches only extracted files.
+  Lazy-page restore is not enabled or supported.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting

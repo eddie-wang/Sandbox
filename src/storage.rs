@@ -237,7 +237,7 @@ pub fn publish_layer(staged: &Path, layers: &Path, layer: &Artifact, max: u64) -
 pub fn archive(tar: &str, source: &Path, destination: &Path, seconds: u64, search_path: &str, helpers: &process::Helpers) -> Result<()> {
     process::checked(tar, &vec!["--create".into(), "--format=pax".into(), "--file".into(), destination.display().to_string(),
         "--numeric-owner".into(), "--xattrs".into(), "--xattrs-include=*".into(), "--acls".into(), "--sparse".into(),
-        "--one-file-system".into(), "--directory".into(), source.display().to_string(), ".".into()], seconds, search_path, helpers)?;
+        "--one-file-system".into(), "--directory".into(), source.display().to_string(), ".".into()], seconds, search_path, helpers, None)?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).map_err(|_| "artifact_permissions_failed")?;
     File::open(destination).and_then(|f| f.sync_all()).map_err(|_| "artifact_sync_failed")
 }
@@ -249,7 +249,32 @@ pub fn extract(tar: &str, source: &Path, destination: &Path, seconds: u64, searc
     // administrator-owned publications enter this path; there is no upload API.
     process::checked(tar, &vec!["--extract".into(), "--file".into(), source.display().to_string(),
         "--numeric-owner".into(), "--same-owner".into(), "--same-permissions".into(), "--xattrs".into(),
-        "--xattrs-include=*".into(), "--acls".into(), "--directory".into(), destination.display().to_string()], seconds, search_path, helpers)
+        "--xattrs-include=*".into(), "--acls".into(), "--directory".into(), destination.display().to_string()], seconds, search_path, helpers, None)
+}
+
+// Make a freshly written tree durable without syncing the rest of its filesystem (whose unrelated
+// write-back could take seconds): start write-back of every regular file below `root` at once, then
+// sync each file, each directory and the root, so the waits overlap instead of adding up. Symbolic
+// links are not followed.
+pub fn sync_tree(root: &Path) -> Result<()> {
+    let (mut files, mut dirs, mut pending) = (Vec::new(), Vec::new(), vec![root.to_path_buf()]);
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).map_err(|_| "tree_sync_failed")? {
+            let entry = entry.map_err(|_| "tree_sync_failed")?;
+            let kind = entry.file_type().map_err(|_| "tree_sync_failed")?;
+            if kind.is_dir() { pending.push(entry.path()); } else if kind.is_file() { files.push(entry.path()); }
+        }
+        dirs.push(dir);
+    }
+    use std::os::fd::AsRawFd;
+    for file in &files {
+        let file = File::open(file).map_err(|_| "tree_sync_failed")?;
+        if unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) } != 0 { return Err("tree_sync_failed"); }
+    }
+    for path in files.iter().chain(dirs.iter().rev()) {
+        File::open(path).and_then(|f| f.sync_all()).map_err(|_| "tree_sync_failed")?;
+    }
+    Ok(())
 }
 
 // Check mount inventory for a mount at or beneath the supplied path, failing if the inventory cannot
