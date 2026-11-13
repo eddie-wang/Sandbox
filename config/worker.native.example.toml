@@ -9,15 +9,13 @@ listen = "127.0.0.1:8081"
 max_in_flight = 64
 request_timeout_ms = 5000
 max_body_bytes = 16384
-# Optional larger text HTTP ceilings; defaults remain 8 KiB / 64 KiB / 30 s.
-# Configure the same server.application_http ceilings on the controller.
-# For the opt-in body below, also set server.max_body_bytes = 131072.
-# [server.application_http]
-# max_body_bytes = 16384
-# max_response_bytes = 8388608
-# max_timeout_ms = 600000
-# Blocking requests wait for real outcomes. Defaults shown; exec/HTTP wait for
-# their timeout_ms plus margin_ms. Configure the same values on the controller.
+# App proxy bounds (defaults shown): open proxied exchanges and the idle timeout
+# (no byte either way, including the wait for the response head). No total deadline.
+# [server.proxy]
+# max_connections = 256
+# idle_timeout_ms = 600000
+# Blocking requests wait for real outcomes. Defaults shown; a blocking exec waits
+# for its timeout_ms plus margin_ms. Configure the same values on the controller.
 # [server.operation_deadlines]
 # create_ms = 120000
 # capture_ms = 300000
@@ -45,8 +43,10 @@ cpu_overcommit = 3
 pids_max = 64                    # 16..65536, fixed across compatible templates
 max_records = 128               # 1..100000, includes durable tombstones
 max_concurrent_operations = 4  # 1..64 fixed threads; restore slots must fit
-# Results are returned inline and never stored. In-flight result memory is at most
-# max_concurrent_operations * (6 * largest exec/HTTP result bound + 8192) bytes.
+max_concurrent_execs = 64      # 1..1024 running commands per worker, own thread each
+max_execs_per_sandbox = 8      # 1..64 running commands per sandbox, own cgroup each
+# Results are returned inline and never stored. In-flight command output is at most
+# max_concurrent_execs * max_output_bytes (1 MiB at most) bytes, plus JSON escaping.
 max_artifact_bytes = 67108864   # 1 MiB..1 TiB per artifact, NOT a disk quota
 command_timeout_seconds = 30   # 10..300, each host tool invocation
 
@@ -60,4 +60,4 @@ command_timeout_seconds = 30   # 10..300, each host tool invocation
 # prefix = 24
 # addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
 # egress = [{ip = "198.51.100.20", port = 8443}]
-# service_ports = [8080]
+# service_ports = [8080]   # app proxy reaches only template-approved ports of these

@@ -4,7 +4,7 @@
 //! rules; a release resets the slot instead of deleting it. Only the
 //! operator-provisioned bridge exists outside the owned slots.
 use std::{collections::BTreeSet, fs, path::{Path, PathBuf}, sync::PoisonError, time::Duration};
-use crate::{model::{NetworkPolicy, HttpRequest, HttpOutput}, native::Native, process::{self, Result}, storage};
+use crate::{model::NetworkPolicy, native::Native, process::Result, storage};
 
 pub const GUEST: &str = "192.0.2.2";
 const GATEWAY: &str = "192.0.2.1";
@@ -76,6 +76,9 @@ impl Native {
         all.extend(args.iter().map(|s| s.to_string()));
         self.command("ip", all)
     }
+    // Return the pin path of a pooled slot's routing namespace, where the app proxy opens its
+    // connections to the guest.
+    pub fn slot_namespace(&self, index: usize) -> PathBuf { Path::new("/run/netns").join(self.slot_names(index).0) }
     // Run one of this worker's own internal helpers inside a named namespace.
     fn helper_in(&self, namespace: &str, helper: &str) -> Result<()> {
         self.command("ip", vec!["netns".into(), "exec".into(), namespace.into(), format!("/proc/{}/exe", std::process::id()), helper.into()])
@@ -249,25 +252,6 @@ impl Native {
         if Path::new("/run/netns").join(&guest).exists() { self.command("ip", vec!["netns".into(), "delete".into(), guest])?; }
         if self.network_absent(id) { Ok(()) } else { Err("network_cleanup_incomplete") }
     }
-    // Check the template/operator service-port permission and cap the request by the remaining TTL. Run a
-    // bounded HTTP helper inside the sandbox's routing slot, remove its request file and decode the
-    // result.
-    pub fn application_http(&self, id: &str, index: Option<usize>, request: &HttpRequest, policy: &NetworkPolicy, remaining_ms: u64) -> Result<HttpOutput> {
-        self.network_policy(policy)?;
-        if !matches!(policy, NetworkPolicy::TcpAllowlist { service_ports, .. } if service_ports.contains(&request.port)) { return Err("service_port_not_authorized"); }
-        let (slot, _) = self.slot_names(index.ok_or("network_slot_missing")?);
-        let file = self.private(id).join("http.json");
-        let mut request = request.clone();
-        request.timeout_ms = request.timeout_ms.min(remaining_ms.max(1));
-        process::atomic_json(&file, &request)?;
-        let output = self.helpers.run(self.tool("ip")?, &[
-            "netns".into(), "exec".into(), slot, format!("/proc/{}/exe", std::process::id()), "internal-http".into(), file.display().to_string()],
-            Duration::from_millis(request.timeout_ms + 1000), request.max_result_bytes(), false, &self.search_path);
-        let _ = fs::remove_file(file);
-        let out = output?;
-        if out.interrupted || out.exit_code != Some(0) { return Err("application_http_failed_or_bounded"); }
-        serde_json::from_str(&out.stdout).map_err(|_| "application_http_invalid_result")
-    }
 }
 
 // Disable IPv6 in the current namespace and enable IPv4 forwarding only for a routing slot. This runs
@@ -309,42 +293,5 @@ pub fn slot_reset_helper() -> Result<()> {
     let n = unsafe { libc::recv(fd.as_raw_fd(), reply.as_mut_ptr().cast(), reply.len(), 0) };
     let field = |at: usize| u32::from_ne_bytes(reply[at..at + 4].try_into().unwrap());
     if n < 20 || u16::from_ne_bytes([reply[4], reply[5]]) as i32 != libc::NLMSG_ERROR || field(8) != 1 || field(16) != 0 { return Err("conntrack_flush_failed"); }
-    Ok(())
-}
-// Read and validate the request already approved by the caller, then contact the fixed guest address.
-// Disable proxies and redirects, bound time and response size, and print a text HTTP result.
-// Service-port authorization belongs to the caller; this helper does not authenticate management
-// requests.
-pub fn http_helper(path: &Path) -> Result<()> {
-    // Covers the opt-in 16 KiB text body after worst-case JSON escaping,
-    // plus bounded path/headers metadata.
-    let request: HttpRequest = storage::read_json(path, 131072)?;
-    if !request.valid() { return Err("invalid_http_request"); }
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "http_runtime_failed")?;
-    let output = runtime.block_on(async {
-        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).http1_only()
-            .timeout(Duration::from_millis(request.timeout_ms)).pool_max_idle_per_host(0).build().map_err(|_| "http_client_failed")?;
-        // Construct authority, then set path/query: no caller-provided host, URL,
-        // redirect, proxy, bearer or inherited environment can select a destination.
-        let mut url = reqwest::Url::parse(&format!("http://{GUEST}:{}/", request.port)).map_err(|_| "http_url_failed")?;
-        let (path, query) = request.path.split_once('?').map_or((request.path.as_str(), None), |(p,q)| (p, Some(q)));
-        url.set_path(path); url.set_query(query);
-        let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| "invalid_http_method")?;
-        let mut call = client.request(method, url).body(request.body);
-        for (key, value) in request.headers { call = call.header(key, value); }
-        let mut response = call.send().await.map_err(|_| "http_request_failed")?;
-        if response.headers().iter().map(|(k,v)| k.as_str().len() + v.len()).sum::<usize>() > 16384
-            || response.content_length().is_some_and(|n| n > request.max_response_bytes) { return Err("http_response_limit"); }
-        let status = response.status().as_u16();
-        let content_type = response.headers().get("content-type").map(|v| v.to_str().map(str::to_owned)).transpose().map_err(|_| "http_invalid_header")?;
-        if content_type.as_ref().is_some_and(|v| v.len() > 256) { return Err("http_response_header_limit"); }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "http_response_failed")? {
-            if body.len() + chunk.len() > request.max_response_bytes as usize { return Err("http_response_limit"); }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(HttpOutput { status, content_type, body: String::from_utf8(body).map_err(|_| "http_response_not_utf8")? })
-    })?;
-    println!("{}", serde_json::to_string(&output).map_err(|_| "http_encode_failed")?);
     Ok(())
 }

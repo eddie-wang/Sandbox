@@ -1,13 +1,14 @@
 //! Serialized durable admission/state transitions, bounded parallel runtime I/O.
-//! Each sandbox has at most one in-flight job. A management request waits on a
-//! oneshot reply for the job's real outcome, but never owns the job: if the client
-//! disconnects or its wait expires, the job still runs to a terminal state with
-//! normal cleanup and its reply is discarded. An undeliverable create reply instead
-//! deletes the new sandbox (`create_response_lost`); a reply lost after hand-over
-//! is bounded by TTL.
-use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path, sync::{Arc, RwLock, mpsc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+//! Each sandbox has at most one in-flight create, capture or delete job, which
+//! excludes commands; several commands (execs) may run at once, each on its own
+//! thread and in its own resource group. A management request waits on a reply for
+//! the real outcome, but never owns the work: if the client disconnects or its wait
+//! expires, the job or command still runs to a terminal state with normal cleanup
+//! and its reply is discarded. An undeliverable create reply instead deletes the new
+//! sandbox (`create_response_lost`); a reply lost after hand-over is bounded by TTL.
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path, sync::{Arc, RwLock, mpsc, atomic::{AtomicBool, AtomicU8, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
-use crate::{config::WorkerConfig, model::{CaptureRequest, CreateRequest, ExecRequest, HttpOutput, HttpRequest, Runtime, RuntimeCapability, SandboxSpec, Usage, WorkerStatus}, native::{Native, Preflight}, process::{self, Result}, storage};
+use crate::{config::{ProxyLimits, WorkerConfig}, model::{CaptureRequest, CreateRequest, ExecRequest, Runtime, RuntimeCapability, SandboxSpec, Usage, WorkerStatus}, native::{ExecEnd, Native, Preflight}, process::{self, Result}, storage};
 
 const RECORD_SCHEMA: u32 = 2;
 
@@ -35,36 +36,48 @@ impl Record {
 #[derive(Serialize)]
 pub struct SandboxView { pub sandbox_id: String, pub template_id: String, pub state: String, pub error: Option<String>, pub expires_at: u64 }
 #[derive(Serialize)]
-pub struct ExecResult {
-    pub exit_code: Option<i32>, pub stdout: String, pub stderr: String, pub interrupted: bool,
-    pub error: Option<&'static str>, pub sandbox_state: String,
-}
-#[derive(Serialize)]
 pub struct CaptureResult { pub sandbox_id: String, pub template_id: String, pub generation: String, pub state: String }
-pub enum Outcome { Created(SandboxView), Sandbox(SandboxView), Exec(ExecResult), Http(HttpOutput), Captured(CaptureResult) }
+#[derive(Serialize)]
+pub struct KillResult { pub sandbox_id: String, pub exec_id: u64, pub state: &'static str }
+pub enum Outcome { Created(SandboxView), Sandbox(SandboxView), Captured(CaptureResult), Killed(KillResult) }
 pub type Reply = tokio::sync::oneshot::Sender<Result<Outcome>>;
+// One event of a running command, in order: output chunks as they arrive, then how it ended.
+pub enum ExecEvent { Stdout(Vec<u8>), Stderr(Vec<u8>), End(ExecEnd) }
+// Where an exec request hears back: its exec ID (or why it was refused), then its events. Events are
+// unbounded but each command's output is capped by its max_output_bytes.
+pub struct ExecSink { pub started: tokio::sync::oneshot::Sender<Result<u64>>, pub events: tokio::sync::mpsc::UnboundedSender<ExecEvent> }
 
 pub struct Snapshot {
     pub status: WorkerStatus,
     pub records: BTreeMap<String, Arc<Record>>,
     cancels: BTreeMap<String, Arc<AtomicBool>>,
+    // Close signal per sandbox with proxied app traffic: dropping the sender (when deletion starts or
+    // the sandbox stops running) ends its open proxy exchanges.
+    pub proxy_close: BTreeMap<String, tokio::sync::watch::Sender<()>>,
 }
 #[derive(Clone)]
 pub struct Handle {
     pub snapshot: Arc<RwLock<Snapshot>>, pub preflight: Preflight, pub sender: Option<mpsc::SyncSender<Work>>,
-    pub application_http_limits: crate::config::ApplicationHttpLimits, pub deadlines: crate::config::OperationDeadlines,
+    pub deadlines: crate::config::OperationDeadlines, pub native: Option<Arc<Native>>,
+    pub proxy: ProxyLimits, pub proxy_permits: Arc<tokio::sync::Semaphore>,
 }
 pub enum Work {
-    Create(CreateRequest, Reply), Http(String, HttpRequest, Reply), Exec(String, ExecRequest, Reply), Capture(String, CaptureRequest, Reply), Delete(String, Reply),
-    Complete(usize, Box<(Record, Result<Outcome>)>), Exited(String), Stop(mpsc::Sender<Result<()>>),
+    Create(CreateRequest, Reply), Exec(String, ExecRequest, ExecSink), Kill(String, u64, Reply), Capture(String, CaptureRequest, Reply), Delete(String, Reply),
+    Complete(usize, Box<(Record, Result<Outcome>)>), ExecDone(String, u64, bool), Exited(String), Stop(mpsc::Sender<Result<()>>),
 }
-enum Action { Create, Http(HttpRequest), Exec(ExecRequest), Capture(CaptureRequest, String), Delete }
+enum Action { Create, Capture(CaptureRequest, String), Delete }
+// A running command: why it must stop (0 not, 1 killed by request, 2 sandbox deleted or expired) and
+// the kill requests waiting for it to end.
+struct RunningExec { stop: Arc<AtomicU8>, kill_waiters: Vec<Reply> }
 struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool> }
 struct Flight { slot: usize, restore: bool, delete: bool, template: Option<String>, cancelled: Arc<AtomicBool>, reply: Option<Reply> }
 // Mount (and, at first use, verify) these shared layers: a template's sealed layers and its base.
 struct Lower { layers: Vec<storage::Artifact>, done: mpsc::Sender<Result<()>> }
-// Concurrent DELETE requests waiting for one sandbox's cleanup; more are refused as busy.
+// Concurrent DELETE requests waiting for one sandbox's cleanup (and kill requests waiting for one
+// command's end); more are refused as busy.
 const MAX_DELETE_WAITERS: usize = 64;
+const STOP_KILLED: u8 = 1;
+const STOP_SANDBOX: u8 = 2;
 // Return seconds since the Unix epoch, falling back to zero if the clock is earlier.
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 // Hash a value's serialized form; used to stamp the template network policy into the saved
@@ -76,23 +89,28 @@ fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = 
 impl Handle {
     // Return an unavailable handle if the runtime is disabled or preflight fails. Otherwise reconcile
     // durable state (rebuilding the network slot pool), then start the lower-mount thread, operation
-    // workers, admission and expiry/exit monitoring; jobs continue independently of HTTP connections.
-    // Shutdown waits for jobs and one cleanup per sandbox, then removes shared mounts and the slot pool.
+    // workers, admission and expiry/exit monitoring; jobs and commands continue independently of HTTP
+    // connections. Shutdown waits for jobs, commands and one cleanup per sandbox, then removes shared
+    // mounts and the slot pool.
     pub fn start(config: &WorkerConfig, report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
             capacity: config.capacity.clone(), usage: enabled.then_some(Usage { memory_mib: 0, vcpus: 0, sandboxes: 0, restores: 0 }), admission_ready: false,
             runtimes: vec![RuntimeCapability { runtime: Runtime::RuncCriu, ready: false, reason: if enabled { "reconciling" } else if config.native.as_ref().is_some_and(|c| c.enabled) { "preflight_failed" } else { "runtime_disabled" }.into() }],
             cpu_overcommit: config.native.as_ref().map_or(1, |c| c.cpu_overcommit), qualification: "unvalidated".into() };
-        let snapshot = Arc::new(RwLock::new(Snapshot { status, records: BTreeMap::new(), cancels: BTreeMap::new() }));
-        if !enabled { return Ok(Self { snapshot, preflight: report, sender: None, application_http_limits: config.server.application_http.clone(), deadlines: config.server.operation_deadlines.clone() }); }
+        let snapshot = Arc::new(RwLock::new(Snapshot { status, records: BTreeMap::new(), cancels: BTreeMap::new(), proxy_close: BTreeMap::new() }));
+        let proxy_permits = Arc::new(tokio::sync::Semaphore::new(config.server.proxy.max_connections));
+        let handle = |sender, native| Self { snapshot: snapshot.clone(), preflight: report.clone(), sender, deadlines: config.server.operation_deadlines.clone(),
+            native, proxy: config.server.proxy.clone(), proxy_permits: proxy_permits.clone() };
+        if !enabled { return Ok(handle(None, None)); }
         let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
+        let (tx, rx) = mpsc::sync_channel(32);
         let mut engine = Engine { native: native.clone(), snapshot: snapshot.clone(), records: BTreeMap::new(), healthy: true,
-            pool: Vec::new(), flights: BTreeMap::new(), delete_waiters: BTreeMap::new(), retry_after: BTreeMap::new(), stopping: None, stop_attempted: BTreeSet::new() };
+            pool: Vec::new(), flights: BTreeMap::new(), delete_waiters: BTreeMap::new(), retry_after: BTreeMap::new(), stopping: None, stop_attempted: BTreeSet::new(),
+            execs: BTreeMap::new(), next_exec: 0, events: tx.clone() };
         engine.reconcile()?;
         let restored = engine.records.iter().map(|(id, r)| (id.clone(), Arc::new(r.clone()))).collect();
         snapshot.write().expect("snapshot poisoned").records = restored;
-        let (tx, rx) = mpsc::sync_channel(32);
         // Shared lower creation is serialized by its own bounded mailbox, never
         // by holding a lock over mount I/O or blocking the admission authority.
         let (lower_tx, lower_rx) = mpsc::sync_channel::<Lower>(native.config.max_concurrent_operations);
@@ -148,6 +166,7 @@ impl Handle {
             loop {
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(Work::Complete(slot, done)) => { let (record, outcome) = *done; engine.complete(slot, record, outcome) },
+                    Ok(Work::ExecDone(id, exec, cleanup_failed)) => engine.exec_done(&id, exec, cleanup_failed),
                     Ok(Work::Stop(done)) => { engine.healthy = false; engine.stopping = Some(done); engine.publish(); },
                     Ok(Work::Exited(id)) => {
                         if !engine.flights.contains_key(&id) && engine.records.get(&id).is_some_and(|r| r.state == "running") {
@@ -160,7 +179,7 @@ impl Handle {
                     Err(mpsc::RecvTimeoutError::Disconnected) => { engine.healthy = false; },
                 }
                 engine.maintenance();
-                if engine.stopping.is_some() && engine.flights.is_empty()
+                if engine.stopping.is_some() && engine.flights.is_empty() && engine.execs.is_empty()
                     && engine.records.iter().all(|(id, r)| !r.reserved() || engine.stop_attempted.contains(id)) {
                     let cleanup = if !engine.records.values().any(Record::reserved) {
                         engine.native.unmount_lowers().and_then(|_| engine.native.remove_slot_pool()).and_then(|_| engine.native.remove_helpers())
@@ -172,7 +191,7 @@ impl Handle {
             }
             watchdog_stop.store(true, Ordering::Relaxed);
         }).map_err(|_| "admission_thread_failed")?;
-        Ok(Self { snapshot, preflight: report, sender: Some(tx), application_http_limits: config.server.application_http.clone(), deadlines: config.server.operation_deadlines.clone() })
+        Ok(handle(Some(tx), Some(native)))
     }
 }
 
@@ -182,15 +201,23 @@ struct Engine {
     // Waiting DELETE requests per sandbox; all get the result of the one cleanup (AgentENV pattern).
     delete_waiters: BTreeMap<String, Vec<Reply>>, retry_after: BTreeMap<String, Instant>,
     stopping: Option<mpsc::Sender<Result<()>>>, stop_attempted: BTreeSet<String>,
+    // Running commands per sandbox (no empty entries), the last exec ID and this loop's own mailbox,
+    // which exec threads use to report that they ended.
+    execs: BTreeMap<String, BTreeMap<u64, RunningExec>>, next_exec: u64, events: mpsc::SyncSender<Work>,
 }
 impl Engine {
-    // Persist a sandbox record and refresh its public snapshot. A save failure closes admission, even
-    // though the in-memory view is still updated.
+    // Persist a sandbox record and refresh its public snapshot. A sandbox that is no longer running
+    // (or capturing) or whose deletion was requested loses its proxy close signal, which ends its open
+    // proxy exchanges. A save failure closes admission, even though the in-memory view is still updated.
     fn save(&mut self, id: &str) -> Result<()> {
         let result = process::atomic_json(&self.native.root().join("records").join(format!("{id}.json")), &self.records[id]);
         if result.is_err() { self.healthy = false; }
         let record = Arc::new(self.records[id].clone());
-        self.snapshot.write().expect("snapshot poisoned").records.insert(id.into(), record);
+        {
+            let mut snapshot = self.snapshot.write().expect("snapshot poisoned");
+            if record.delete_requested || !matches!(record.state.as_str(), "running" | "capturing") { snapshot.proxy_close.remove(id); }
+            snapshot.records.insert(id.into(), record);
+        }
         self.publish(); result
     }
     // Total reserved memory, CPUs and sandbox slots, plus in-flight create/capture slots; not measured
@@ -251,7 +278,6 @@ impl Engine {
         let outcome = match outcome {
             Ok(Outcome::Created(_)) if record.state != "running" => Err("sandbox_cancelled_or_expired"),
             Ok(Outcome::Created(_)) => Ok(Outcome::Created(record.view())),
-            Ok(Outcome::Exec(mut result)) => { result.sandbox_state = record.state.clone(); Ok(Outcome::Exec(result)) }
             Ok(Outcome::Captured(mut result)) => { result.state = record.state.clone(); Ok(Outcome::Captured(result)) }
             other => other,
         };
@@ -270,15 +296,15 @@ impl Engine {
             self.request_delete(&id, None);
         }
     }
-    // Route submitted work to admission or deletion after checking helper health. Unhealthy workers reject
-    // new work but still accept deletion requests.
+    // Route submitted work to admission, command control or deletion after checking helper health.
+    // Unhealthy workers reject new work but still accept deletion and kill requests.
     fn accept(&mut self, work: Work) {
         if self.native.helpers.ensure_healthy().is_err() { self.healthy = false; self.publish(); }
         match work {
             Work::Delete(id, reply) => self.request_delete(&id, Some(reply)),
+            Work::Kill(id, exec, reply) => self.kill(&id, exec, reply),
             Work::Create(r, reply) => { if self.healthy { self.create(r, reply); } else { let _ = reply.send(Err("worker_unavailable")); } },
-            Work::Http(id, r, reply) => { if self.healthy { self.operation(&id, Action::Http(r), reply); } else { let _ = reply.send(Err("worker_unavailable")); } },
-            Work::Exec(id, r, reply) => { if self.healthy { self.operation(&id, Action::Exec(r), reply); } else { let _ = reply.send(Err("worker_unavailable")); } },
+            Work::Exec(id, r, sink) => { if self.healthy { self.exec(id, r, sink); } else { let _ = sink.started.send(Err("worker_unavailable")); } },
             Work::Capture(id, r, reply) => {
                 if !self.healthy { let _ = reply.send(Err("worker_unavailable")); return; }
                 // Worker-generated, so callers need no operation identifier.
@@ -334,13 +360,14 @@ impl Engine {
             Ok(()) => self.launch(&id, Action::Create, slot, Some(reply)),
         }
     }
-    // Start an exec, HTTP call or capture on a running sandbox, rejecting it at once if the sandbox is
-    // missing, busy, not running or no slot is free. A capture also needs a restore slot and an unused
-    // template name, and is saved as capturing first.
+    // Start a capture on a running sandbox, rejecting it at once if the sandbox is missing, busy (a job
+    // or a command is running), not running or no slot is free. A capture also needs a restore slot
+    // and an unused template name, and is saved as capturing first.
     fn operation(&mut self, id: &str, action: Action, reply: Reply) {
         let Some(record) = self.records.get(id) else { let _ = reply.send(Err("sandbox_not_found")); return; };
-        // Conflicting same-sandbox work is rejected immediately, never queued.
-        if self.flights.contains_key(id) || self.delete_waiters.get(id).is_some_and(|w| !w.is_empty()) { let _ = reply.send(Err("sandbox_busy")); return; }
+        // Conflicting same-sandbox work is rejected immediately, never queued. Commands hold pipes to the
+        // host, which a checkpoint cannot capture.
+        if self.flights.contains_key(id) || self.execs.contains_key(id) || self.delete_waiters.get(id).is_some_and(|w| !w.is_empty()) { let _ = reply.send(Err("sandbox_busy")); return; }
         if record.state != "running" || record.expires_at <= now() || record.delete_requested { let _ = reply.send(Err("sandbox_not_running")); return; }
         let Some(slot) = self.idle_slot() else { let _ = reply.send(Err("busy")); return; };
         if let Action::Capture(r, _) = &action {
@@ -352,9 +379,77 @@ impl Engine {
         }
         self.launch(id, action, slot, Some(reply));
     }
-    // Mark a sandbox for deletion and cancel its in-flight job; maintenance launches the cleanup. An
-    // already gone sandbox is answered at once. Every concurrent DELETE waits for the same cleanup and
-    // gets its result (up to MAX_DELETE_WAITERS; abandoned waits are dropped first).
+    // Admit a command into a running sandbox and start it on its own thread, outside the operation
+    // pool. Refuse it at once if the sandbox is missing, not running, or has a create, capture or delete
+    // in flight, or if the per-sandbox or worker command limit is reached. The thread streams events to
+    // the requester and reports its end here.
+    fn exec(&mut self, id: String, request: ExecRequest, sink: ExecSink) {
+        let ExecSink { started, events } = sink;
+        let _ = started.send(self.start_exec(id, request, events));
+    }
+    // Check exec admission and spawn the command's thread (see exec); return its exec ID or the refusal.
+    fn start_exec(&mut self, id: String, request: ExecRequest, events: tokio::sync::mpsc::UnboundedSender<ExecEvent>) -> Result<u64> {
+        let record = self.records.get(&id).ok_or("sandbox_not_found")?;
+        if self.flights.contains_key(&id) || self.delete_waiters.get(&id).is_some_and(|w| !w.is_empty()) { return Err("sandbox_busy"); }
+        if record.state != "running" || record.expires_at <= now() || record.delete_requested { return Err("sandbox_not_running"); }
+        if self.execs.get(&id).map_or(0, BTreeMap::len) >= self.native.config.max_execs_per_sandbox { return Err("exec_limit"); }
+        if self.execs.values().map(BTreeMap::len).sum::<usize>() >= self.native.config.max_concurrent_execs { return Err("busy"); }
+        let exec = self.next_exec + 1;
+        let stop = Arc::new(AtomicU8::new(0));
+        let (native, done, flag, sandbox, expires_at) = (self.native.clone(), self.events.clone(), stop.clone(), id.clone(), record.expires_at);
+        let spawned = std::thread::Builder::new().name(format!("sandbox-exec-{exec}")).spawn(move || {
+            // The deadline is the command's timeout, capped by the remaining TTL.
+            let remaining = expires_at.saturating_sub(now()).saturating_mul(1000);
+            let timeout = Duration::from_millis(request.timeout_ms.min(remaining.max(1)));
+            let reason = || match flag.load(Ordering::Relaxed) {
+                STOP_KILLED => Some("exec_killed"),
+                STOP_SANDBOX => Some("sandbox_cancelled_or_expired"),
+                _ => (expires_at <= now()).then_some("sandbox_cancelled_or_expired"),
+            };
+            let mut sink = |stderr: bool, bytes: &[u8]| { let _ = events.send(if stderr { ExecEvent::Stderr(bytes.to_vec()) } else { ExecEvent::Stdout(bytes.to_vec()) }); };
+            let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native.exec(&sandbox, exec, request.argv, timeout, request.max_output_bytes as usize, &mut sink, &reason)))
+                .unwrap_or(ExecEnd { exit_code: None, interrupted: false, error: Some("exec_worker_panicked"), cleanup_failed: true });
+            let cleanup_failed = end.cleanup_failed;
+            let _ = events.send(ExecEvent::End(end));
+            let _ = done.send(Work::ExecDone(sandbox, exec, cleanup_failed));
+        });
+        spawned.map_err(|_| "busy")?;
+        self.next_exec = exec;
+        self.execs.entry(id).or_default().insert(exec, RunningExec { stop, kill_waiters: Vec::new() });
+        Ok(exec)
+    }
+    // Ask one running command to stop; the reply waits until it has ended and its group is gone (up to
+    // MAX_DELETE_WAITERS waiting requests). An unknown or finished command is exec_not_found.
+    fn kill(&mut self, id: &str, exec: u64, reply: Reply) {
+        let Some(running) = self.execs.get_mut(id).and_then(|commands| commands.get_mut(&exec)) else {
+            let _ = reply.send(Err(if self.records.contains_key(id) { "exec_not_found" } else { "sandbox_not_found" }));
+            return;
+        };
+        let _ = running.stop.compare_exchange(0, STOP_KILLED, Ordering::Relaxed, Ordering::Relaxed);
+        running.kill_waiters.retain(|waiter| !waiter.is_closed());
+        if running.kill_waiters.len() >= MAX_DELETE_WAITERS { let _ = reply.send(Err("busy")); return; }
+        running.kill_waiters.push(reply);
+    }
+    // Forget a finished command and answer the kill requests waiting for it. A command whose resource
+    // group could not be emptied may have left processes behind, so its sandbox is deleted.
+    fn exec_done(&mut self, id: &str, exec: u64, cleanup_failed: bool) {
+        if let Some(commands) = self.execs.get_mut(id) {
+            if let Some(running) = commands.remove(&exec) {
+                for waiter in running.kill_waiters {
+                    answer(Some(waiter), Ok(Outcome::Killed(KillResult { sandbox_id: id.into(), exec_id: exec, state: "exited" })));
+                }
+            }
+            if commands.is_empty() { self.execs.remove(id); }
+        }
+        if cleanup_failed && self.records.get(id).is_some_and(Record::reserved) {
+            self.records.get_mut(id).unwrap().error = Some("exec_cleanup_failed".into());
+            self.request_delete(id, None);
+        }
+    }
+    // Mark a sandbox for deletion and cancel its in-flight job and running commands; maintenance
+    // launches the cleanup once they have ended. An already gone sandbox is answered at once. Every
+    // concurrent DELETE waits for the same cleanup and gets its result (up to MAX_DELETE_WAITERS;
+    // abandoned waits are dropped first).
     fn request_delete(&mut self, id: &str, reply: Option<Reply>) {
         let Some(record) = self.records.get_mut(id) else { answer(reply, Err("sandbox_not_found")); return; };
         if !record.reserved() { let view = record.view(); answer(reply, Ok(Outcome::Sandbox(view))); return; }
@@ -366,6 +461,9 @@ impl Engine {
             self.retry_after.remove(id);
         }
         if let Some(f) = self.flights.get(id) { f.cancelled.store(true, Ordering::Relaxed); }
+        for running in self.execs.get(id).into_iter().flat_map(BTreeMap::values) {
+            let _ = running.stop.compare_exchange(0, STOP_SANDBOX, Ordering::Relaxed, Ordering::Relaxed);
+        }
         let record = self.records.get_mut(id).unwrap();
         if !record.delete_requested {
             record.delete_requested = true; record.state = "deleting".into();
@@ -373,13 +471,13 @@ impl Engine {
         }
     }
     // Arrange deletion for expired, cancelled or unhealthy sandboxes and retry failed cleanup. Wait for
-    // active jobs and available slots; shutdown attempts each remaining cleanup once.
+    // active jobs, running commands and available slots; shutdown attempts each remaining cleanup once.
     fn maintenance(&mut self) {
         let ids: Vec<_> = self.records.iter().filter(|(_, r)| r.reserved() && (!self.healthy || r.expires_at <= now() || r.delete_requested || r.state == "cleanup_failed"))
             .map(|(id, _)| id.clone()).collect();
         for id in ids {
             if !self.records[&id].delete_requested { self.request_delete(&id, None); }
-            if self.flights.contains_key(&id) { continue; }
+            if self.flights.contains_key(&id) || self.execs.contains_key(&id) { continue; }
             if self.stopping.is_some() && self.stop_attempted.contains(&id) { continue; }
             if self.stopping.is_none() && self.retry_after.get(&id).is_some_and(|t| *t > Instant::now()) { continue; }
             let Some(slot) = self.idle_slot() else { break; };
@@ -449,8 +547,7 @@ impl Runner<'_> {
     // finished.
     fn perform(&mut self, action: Action) -> Result<Outcome> {
         match action {
-            Action::Create => self.create(), Action::Http(r) => self.http(r), Action::Exec(r) => self.exec(r),
-            Action::Capture(r, generation) => self.capture(r, generation),
+            Action::Create => self.create(), Action::Capture(r, generation) => self.capture(r, generation),
             Action::Delete => { self.delete(); if self.record.state == "deleted" { Ok(Outcome::Sandbox(self.record.view())) } else { Err("cleanup_failed") } }
         }
     }
@@ -486,36 +583,6 @@ impl Runner<'_> {
                 Err(e)
             }
         }
-    }
-    // Run one command with runc exec in the sandbox's exec cgroup, bounded by its timeout (capped by
-    // the remaining TTL) and output limit, then kill and remove that cgroup. A bound violation or any
-    // error deletes the whole sandbox.
-    fn exec(&mut self, request: ExecRequest) -> Result<Outcome> {
-        let id = self.record.request.sandbox_id.clone();
-        let file = self.native.private(&id).join("exec.json");
-        let result = self.active().and_then(|_| self.native.create_exec_cgroup(&id))
-            .and_then(|_| process::atomic_json(&file, &self.native.process_spec(request.argv))).and_then(|_| {
-            let remaining = self.record.expires_at.saturating_sub(now()).saturating_mul(1000);
-            self.native.runc(vec!["exec".into(), "--cgroup".into(), crate::native::EXEC_CGROUP.into(), "--process".into(), file.display().to_string(), id.clone()], Duration::from_millis(request.timeout_ms.min(remaining.max(1))), request.max_output_bytes as usize)
-        });
-        let _ = fs::remove_file(&file);
-        let cleanup = self.native.cleanup_exec_cgroup(&id);
-        match result.and_then(|output| cleanup.map(|_| output)) {
-            Ok(output) => {
-                // A bound violation terminates the whole sandbox, never only the runc client.
-                let error = output.interrupted.then_some("exec_deadline_or_output_limit");
-                if output.interrupted { self.delete(); }
-                Ok(Outcome::Exec(ExecResult { exit_code: output.exit_code, stdout: output.stdout, stderr: output.stderr,
-                    interrupted: output.interrupted, error, sandbox_state: self.record.state.clone() }))
-            }
-            Err(e) => { self.delete(); Err(e) }
-        }
-    }
-    // Make one application HTTP call to the sandbox under its template network policy, capped by the
-    // remaining TTL. A failure fails only this call, not the sandbox.
-    fn http(&mut self, request: HttpRequest) -> Result<Outcome> {
-        let policy = self.active().and_then(|_| self.record.network_policy.as_ref().ok_or("network_policy_unavailable"))?;
-        self.native.application_http(&self.record.request.sandbox_id, self.record.network_slot, &request, policy, self.record.expires_at.saturating_sub(now()).saturating_mul(1000)).map(Outcome::Http)
     }
     // Capture a running sandbox as a new warm template without stopping it (AgentENV order): freeze it,
     // flush and seal its upper directory into an EROFS layer, checkpoint it with CRIU leaving it running,

@@ -21,10 +21,11 @@ headers, response writes, rates and drain. The application semaphore begins afte
 header parsing, not on TCP accept. Direct Internet deployment is unsupported.
 
 Worker origins are strict administrator-configured HTTP(S) origins without
-credentials, path, query or fragment. The pooled client ignores proxy environment
-variables, validates HTTPS certificates and never follows redirects. There is no
-registration, download URL or arbitrary-upstream proxy API. DNS and configuration
-are trusted infrastructure.
+credentials, path, query or fragment. The pooled clients ignore proxy environment
+variables, validate HTTPS certificates and never follow redirects. There is no
+registration, download URL or arbitrary-upstream proxy API: the app proxy reaches
+only a sandbox's own approved service ports. DNS and configuration are trusted
+infrastructure.
 
 ## Placement, IDs and blocking operations
 
@@ -40,22 +41,29 @@ remains behind the worker credential only (controller and operator use).
 
 **Every management request is blocking** and returns its real outcome, like an
 ordinary RPC: create returns `201` after the container is running or restored (or
-an error after failure cleanup); exec returns exit code and bounded output; HTTP
-returns the application's status/content-type/body; capture returns after template
-publication with the source running; delete returns after cleanup. There is no
-operation ID, operation endpoint or stored result. Different sandboxes run
-concurrently on the worker's fixed operation pool (`max_concurrent_operations`,
-default 16, range 1–64); `max_concurrent_restores` bounds create/restore/capture.
+an error after failure cleanup); exec returns exit code and bounded output (or, in
+streaming mode, sends the output as it arrives and ends with the exit); kill returns
+after the command has ended; capture returns after template publication with the
+source running; delete returns after cleanup. There is no operation ID, operation
+endpoint or stored result. App traffic is not a management operation: it goes
+through the [app proxy](#app-proxy). Create, capture and delete of different
+sandboxes run concurrently on the worker's fixed operation pool
+(`max_concurrent_operations`, default 16, range 1–64); `max_concurrent_restores`
+bounds create/restore/capture.
 
-At most one create/exec/HTTP/capture runs per sandbox. A conflicting request for a
-sandbox with work in flight gets an immediate `409 sandbox_busy`; it is never queued.
-Concurrent exec/HTTP in one sandbox is deliberately not supported: a bound-violating
-exec terminates the whole sandbox, which would race a parallel command's cleanup.
-`DELETE` is the exception: it cancels in-flight work of that sandbox (whose request
-then returns its failed or interrupted outcome) and returns after cleanup. A second
-concurrent DELETE of the same sandbox waits for the same cleanup and returns its
-result (up to 64 waiting DELETEs per sandbox; more get `503 busy`). A full operation pool
-or restore budget returns `503 busy` before anything starts.
+At most one create, capture or delete runs per sandbox, and commands may not
+overlap a create or capture of the same sandbox: such a conflicting request gets an
+immediate `409 sandbox_busy`; it is never queued. Several commands may run at once
+in one sandbox (`max_execs_per_sandbox`, default 8, range 1–64; `409 exec_limit`
+beyond it; `max_concurrent_execs`, default 64, range 1–1024, per worker; `503 busy`
+beyond it). Each runs on its own thread and in its own resource group, so a bound
+violation stops only that command. A capture is refused while any command runs (a
+checkpoint cannot include their host pipes). `DELETE` is the exception: it cancels
+in-flight work and running commands of that sandbox (whose requests then return
+their failed or interrupted outcome) and returns after cleanup. A second concurrent
+DELETE of the same sandbox waits for the same cleanup and returns its result (up to
+64 waiting DELETEs per sandbox; more get `503 busy`). A full operation pool or
+restore budget returns `503 busy` before anything starts.
 
 **Deadlines cover the operation.** Each route's worker waits for at most:
 
@@ -64,23 +72,26 @@ or restore budget returns `503 busy` before anything starts.
 | create | `[server.operation_deadlines] create_ms` (default 120,000) |
 | capture | `capture_ms` (default 300,000) |
 | delete | `delete_ms` (default 120,000) |
-| exec / HTTP | the request's `timeout_ms` + `margin_ms` (default 30,000; covers teardown and bound-kill cleanup) |
+| exec (blocking mode) | the request's `timeout_ms` + `margin_ms` (default 30,000; covers teardown and bound-kill cleanup) |
+| exec kill | `margin_ms` |
 | status, GET, preflight | `request_timeout_ms` (default 5,000) |
+| exec (streaming mode), app proxy | none: headers come at once; then only `[server.proxy] idle_timeout_ms` applies (see [app proxy](#app-proxy)) |
 
 The request body is always read within `request_timeout_ms`. A service's route
 deadline is the route's longest valid wait plus one `request_timeout_ms` per
 forwarding hop, and the controller's per-request forward timeout is the owner's
 wait plus one `request_timeout_ms`, so the innermost layer reports first. Configure
-`[server.operation_deadlines]` (and `[server.application_http]`) identically on the
-controller and workers. Ranges: create/delete 1,000–1,800,000 ms, capture
+`[server.operation_deadlines]` identically on the controller and workers, and give
+the controller a larger `[server.proxy] idle_timeout_ms` than its workers. Ranges: create/delete 1,000–1,800,000 ms, capture
 1,000–3,600,000 ms, margin 1,000–300,000 ms. If a wait expires the worker returns
 `504 operation_timeout`; the controller returns `504 owner_response_timeout`, or
 `503 owner_response_unavailable` when the owner's answer is lost.
 
 **Client disconnect or timeout never orphans work.** The worker's admission thread,
-not the HTTP handler, owns every job. An exec, HTTP, capture or delete job runs to a
-terminal state with normal cleanup, TTL and bound enforcement; only its result is
-discarded, so read the sandbox with GET afterward. A create is different: the client
+not the HTTP handler, owns every job and command. A command, capture or delete runs
+to a terminal state with normal cleanup, TTL and bound enforcement (a disconnected
+streaming client does not stop its command either); only its result is discarded,
+so read the sandbox with GET afterward. A create is different: the client
 cannot learn a controller-generated ID whose reply was lost, so when the worker
 finds the create reply undeliverable (client disconnect, any layer's expired wait)
 it deletes the new sandbox, recording `error:"create_response_lost"`. Only in the
@@ -92,8 +103,8 @@ may create a second sandbox, as with other gateway-assigned sandbox APIs. The fi
 is normally deleted as above (otherwise TTL bounds it), and an ambiguous create error
 names its generated `sandbox_id` so the caller can GET or DELETE it. A direct worker create with an existing ID is idempotent
 (`200` with current state; `409 sandbox_busy` while that create is in flight;
-`409 idempotency_conflict` for different input). An exec or HTTP request runs at most
-once, but a client retry runs it again: a lost response may hide a command or
+`409 idempotency_conflict` for different input). An exec or proxied request runs at
+most once, but a client retry runs it again: a lost response may hide a command or
 application side effect that already happened. A capture retry for a published
 template ID returns `409 template_already_exists`. Delete is safe to repeat, also
 concurrently (a second DELETE waits for the first and gets its result).
@@ -121,8 +132,10 @@ Records are retained as tombstones; IDs are never reused.
 | `POST /v1/sandboxes` | Blocking create/restore; `201` with the sandbox view once running. No caller ID, rootfs/config/path fields |
 | `GET /v1/sandboxes/{id}` | `200` view: `sandbox_id`, `template_id`, `state`, static `error`, absolute Unix `expires_at` |
 | `DELETE /v1/sandboxes/{id}` | Blocking; `200` view after cleanup (`deleted`, or `failed` for a never-launched ID); `500 cleanup_failed` otherwise |
-| `POST /v1/sandboxes/{id}/exec` | Blocking bounded command; `200` result |
-| `POST /v1/sandboxes/{id}/http` | Blocking bounded application HTTP (not a management proxy); `200` result |
+| `POST /v1/sandboxes/{id}/exec` | Bounded command: blocking `200` JSON result, or `stream:true` for `200` server-sent events |
+| `POST /v1/sandboxes/{id}/exec/{exec_id}/kill` | Blocking; stops one running command, `200 {"sandbox_id","exec_id","state":"exited"}` after it ended; `404 exec_not_found` if it is not running |
+| any method `/v1/sandboxes/{id}/proxy/{port}/{path}` | [App proxy](#app-proxy), path form: streams the request to the sandbox's approved service port and returns the application's answer |
+| any method, any path, Host `{port}-{id}.{proxy_domain}` | App proxy, host form (controller only, when `proxy_domain` is configured) |
 | `POST /v1/sandboxes/{id}/capture` | Blocking warmed-template capture; `200` after publication, with the source running (it is only briefly frozen) |
 
 Create example: `201 {"sandbox_id":"node-a.3f0c…","template_id":"example-template",
@@ -169,23 +182,58 @@ Timer/scheduling granularity is not a hard real-time guarantee.
 {"argv":["/fixture","counter"],"timeout_ms":1000,"max_output_bytes":4096}
 ```
 
-Argv is executed **inside the container by runc**, with no shell interpolation or
-host executable selection. No inherited management environment; UID/GID 65534,
-fixed PATH/HOME/LANG and cwd `/workspace`. Argv: 1–64 arguments, each at most 4096
-bytes, no NUL and a nonempty first argument. Timeout: 1–60,000 ms, additionally
-clamped to remaining TTL. Combined raw stdout/stderr limit: 1–1,048,576 bytes;
-invalid UTF-8 is replaced for JSON, so JSON encoding may be larger. The `200` result
-contains `exit_code`, `stdout`, `stderr`, `interrupted`, `error` and `sandbox_state`.
-A nonzero program exit is a normal result. Timeout, output overflow or surviving
-output-pipe descendants terminate the whole sandbox: the result then has
-`interrupted:true`, `error:"exec_deadline_or_output_limit"`, the bounded output and
-`sandbox_state:"deleted"` (or `cleanup_failed`). Other exec failures return a static
-error and also terminate the sandbox. This
-conservative behavior prevents killing only a detached runc client and leaking its
-workload. Every exec joins its own worker-created child cgroup; successful completion
-also kills remaining descendants and removes that group. Closing inherited output
-pipes does not permit a background child to escape command cleanup. Background jobs
-are not a supported exec contract.
+Argv is executed **inside the container by runc** (`runc exec`), with no shell
+interpolation or host executable selection. No inherited management environment;
+UID/GID 65534, fixed PATH/HOME/LANG and cwd `/workspace`. Argv: 1–64 arguments, each
+at most 4096 bytes, no NUL and a nonempty first argument. Timeout: 1–60,000 ms,
+additionally clamped to remaining TTL. Combined raw stdout/stderr limit:
+1–1,048,576 bytes. Optional `"stream": true` selects streaming mode.
+
+Every command gets a worker-generated `exec_id`, its own thread and its own child
+resource group `exec-<exec_id>` of the sandbox, and several may run at once (see
+above). **A timeout, output overflow, kill request or the sandbox's deletion/expiry
+stops only that command:** the worker kills its resource group (the command and
+everything it started) and the result reports `interrupted:true`, `exit_code:null`
+and `error` `exec_timeout`, `exec_output_limit`, `exec_killed` or
+`sandbox_cancelled_or_expired`, with the output delivered up to the limit. The
+sandbox keeps running. A normal end also kills what the command left behind (for
+example background children that kept its output open) and removes its group, so
+background jobs are not a supported exec contract. A nonzero program exit is a
+normal result. A start failure (for example runc refusing the command) is a result
+with a static `error` and no exit code; only a command whose group cannot be emptied
+within five seconds also deletes the sandbox (`exec_cleanup_failed`), because it
+may have left unknown processes.
+
+**Blocking mode** returns `200 {"exec_id":7,"exit_code":0,"stdout":"…","stderr":"…",
+"interrupted":false,"error":null,"sandbox_state":"running"}` after the command ended;
+invalid UTF-8 is replaced for JSON, so the JSON may be larger than the raw output.
+
+**Streaming mode** returns `200` with `Content-Type: text/event-stream` at once and
+sends server-sent events as the command produces output:
+
+```text
+event: start
+data: {"exec_id":7}
+
+event: stdout
+data: {"data":"<base64 bytes>"}
+
+event: stderr
+data: {"data":"<base64 bytes>"}
+
+event: exit
+data: {"exit_code":0,"interrupted":false,"error":null,"sandbox_state":"running"}
+```
+
+Output events carry raw bytes in base64 (any binary output survives) in arrival
+order; exactly one `exit` event ends the stream. A refused command (busy, not
+running, limit) is an ordinary JSON error instead of a stream. The controller passes
+the events through as they arrive, under its `[server.proxy]` bounds.
+
+`POST /v1/sandboxes/{id}/exec/{exec_id}/kill` stops one running command (the ID from
+the `start` event or a previous result) and returns `200` once it has ended and its
+group is gone; that command's own result then reports `exec_killed`. Kill also works
+on an unhealthy worker.
 
 Results are returned once and never stored. Commands are not logged; the
 worker-authored process JSON is temporarily stored under the protected private
@@ -248,63 +296,65 @@ separate approved template for a different tool-service destination. Selection
 cannot broaden the operator ceiling. See [network architecture](network.md) for
 operator bridge/pool prerequisites and the fixed-address restore boundary.
 
-### Application HTTP
+### App proxy
 
-```json
-{"port":8080,"method":"POST","path":"/tool?mode=small","headers":{"content-type":"application/json"},"body":"{\"input\":\"example\"}","timeout_ms":2000,"max_response_bytes":4096}
-```
+App traffic to a sandbox's own service (HTTP, streaming, WebSocket) uses a reverse
+proxy after AgentENV's gateway and node proxy, instead of a management operation.
+Two request forms reach the same place:
 
-`POST /v1/sandboxes/{id}/http` has the same authentication, blocking outcome and
-per-sandbox exclusion as exec/capture. It runs on the worker's bounded operation pool. Only the selected sandbox's
-fixed guest IP and an explicitly template/operator-approved service port are
-reachable. GET/POST/PUT/DELETE/HEAD, relative absolute-path-form paths up to 2048
-ASCII bytes (optional query), no URL/authority, `//`, backslash or fragment. The
-only request headers are lowercase `accept` and `content-type`, each at most 256
-printable ASCII bytes. No caller/management Authorization, Host or hop-by-hop header
-is forwarded. The client ignores proxy environment and does not follow redirects.
+- **Host form** (controller, when the controller config sets
+  `proxy_domain = "sandbox.example"`): any method and path with
+  `Host: <port>-<sandbox-id>.sandbox.example`, for example
+  `8000-node-a.3f0c….sandbox.example`. The sandbox ID is used verbatim, so it spans
+  two DNS labels; host routing needs DNS-safe (lowercase) node IDs and a wildcard DNS
+  name covering them. A host that is the domain itself, is not below it or has no
+  hyphen in its first label is ordinary management traffic; a malformed port or ID
+  below the domain is `400 invalid_input`.
+- **Path form** (controller and worker), for clients without wildcard DNS:
+  `/v1/sandboxes/<id>/proxy/<port>/<path>?<query>`; `/proxy/<port>` alone means `/`.
 
-By default, body is a UTF-8 JSON string up to 8192 bytes (text/JSON, **not a binary
-contract**), deadline is 1–30,000 ms, and response body limit is 1–65,536 bytes.
-The controller and worker can each explicitly configure `[server.application_http]`
-with `max_body_bytes` up to 16,384, `max_response_bytes` up to 8,388,608, and
-`max_timeout_ms` up to 600,000. Both services enforce their configured ceilings;
-configure them consistently. These are opt-in ceilings, not new defaults.
+Both require the same single `Authorization: Bearer <token>` as management calls; the
+controller checks it first, then routes by the ID's owner prefix to a fresh owner,
+which checks that the sandbox is running (or capturing) and that the port is one of
+its template's `service_ports` (`403 service_port_not_authorized` otherwise,
+including isolated templates; `404`/`409 sandbox_not_running` for missing or
+stopping sandboxes). The worker then opens a new connection to the sandbox's fixed
+guest address from inside its router namespace (see the
+[network architecture](network.md#app-proxy-boundary)).
 
-Every operation deadline remains clamped to remaining TTL; an owned helper is
-killed/drained within a further one-second startup/exit allowance. The route
-deadline follows `max_timeout_ms` plus `margin_ms` (see above), so a long
-application deadline is waited for in full. Responses remain UTF-8 only; headers are checked against
-16 KiB and only content-type (at most 256 bytes) is returned. Client parsing has its
-own bounded HTTP/1 buffers.
-The normal management body limit still applies. A 16 KiB text body
-can expand toward 96 KiB inside its JSON request envelope; opt-in body configuration
-requires sufficient `server.max_body_bytes` (128 KiB covers all supported fields).
-The helper's private request file is bounded at 128 KiB. Results are carried inline
-and never stored: a result's worst-case JSON size is `6 * max_response_bytes + 8192`
-(an 8 MiB raw response can be about 48 MiB when JSON-escaped). Helper output,
-controller forwarding and memory are bounded by that per-request size; in-flight
-result memory is bounded by the operation pool size times the configured ceiling.
+The exchange is forwarded as HTTP/1.1: the method, raw path and query, the
+application's status, headers and body, in both directions and streaming (large,
+binary and chunked bodies, server-sent events), with hop-by-hop headers removed.
+The **management Authorization header never reaches the sandbox** (so an
+application cannot receive an `Authorization` header through the proxy), Host
+becomes `192.0.2.2:<port>`, and `X-Forwarded-Host` (the client's host) and
+`X-Forwarded-Proto: http` replace any client-supplied forwarding headers. A request
+asking to upgrade (`Connection: upgrade`, `Upgrade: websocket`) gets the
+application's `101` and then a byte tunnel both ways. Redirects are returned, not
+followed. CONNECT is refused. A request without an `Accept` header reaches the
+application with `Accept: */*`, added by the controller's HTTP client.
 
-Non-UTF-8, oversized, invalid or timed-out responses fail with a static error, never
-an upstream error body. No response is truncated into a successful result. Unlike exec bounds, an HTTP bound failure does not terminate the sandbox.
-
-Success is `200 {"status":200,"content_type":"text/plain","body":"..."}`; non-2xx
-and redirects are returned as application statuses, not followed. A port outside
-the template's approved service ports is `403 service_port_not_authorized`; an
-application failure, timeout or bound is `502 application_http_failed_or_bounded`.
-A client retry sends the application request again. On a lost response or worker
-crash, application side effects may already have occurred: there are no
-exactly-once remote application semantics.
+Bounds (`[server.proxy]` on each service): `max_connections` open exchanges
+(default 256; `503 busy` beyond it, held until the response or tunnel ends) and
+`idle_timeout_ms` (default 600,000): the response head, each body and a tunnel must
+move a byte within it. There is no total deadline: the client decides how long to
+wait. Errors are JSON envelopes: `502 upstream_unavailable` (the service refused,
+reset or answered nothing valid), `504 upstream_timeout` (worker idle timeout),
+`504 owner_response_timeout` and `503 owner_response_unavailable` (controller to
+worker). Deleting or expiring the sandbox ends its open exchanges at once. A retry
+sends the request again; there are no exactly-once application semantics.
 
 ## Status and bounds
 
 Worker status schema is `1`. `usage` counts reservations, not measured utilization;
 null means disabled/failed preflight, not zero. `vcpus` in usage sums quotas, compared
 with configured physical/admission `capacity.vcpus * cpu_overcommit` (factor 1–16).
-The fixed operation pool bounds total parallel mutations. `max_concurrent_restores`
-bounds create/restore/capture jobs independently and cannot exceed that pool. Deletes
-cancel active work, then perform per-sandbox serialized cleanup; another sandbox's
-long command/restore does not block admission or an available operation slot.
+The fixed operation pool bounds parallel create/capture/delete jobs.
+`max_concurrent_restores` bounds create/restore/capture jobs independently and
+cannot exceed that pool. Commands run outside the pool, bounded per sandbox and per
+worker. Deletes cancel active work and commands, then perform per-sandbox serialized
+cleanup; another sandbox's long command/restore does not block admission or an
+available operation slot.
 `ready:true` means explicit experimental enablement, read-only preflight and
 reconciliation passed. The API's **qualification remains unvalidated** because it
 does not attest an installation from a separately run smoke.
@@ -315,26 +365,33 @@ and not fresh; aged successful observations are also excluded. No state lock spa
 network/filesystem/subprocess I/O. Routing requires a fresh validated owner;
 worker rejection is authoritative even if controller usage is stale.
 
-Default HTTP bounds: 64 active requests, 16 KiB body, 5-second body deadline,
+Default management bounds: 64 active requests, 16 KiB body, 5-second body deadline,
 route-specific handler deadlines (above), no waiting HTTP admission queue. Blocked
 requests hold their permit while they wait, so size the controller's `max_in_flight`
-above the sum of its workers' operation pools. Full request or lifecycle queues
-return `503 busy`. Controller forwarding accepts at most the request's largest valid
-result (64 KiB for sandbox views; `6 * max_*_bytes + 8192` for exec/HTTP).
+above the sum of its workers' operation pools and blocking commands. Full request or
+lifecycle queues return `503 busy`. Controller forwarding accepts at most the
+request's largest valid result (64 KiB for sandbox views; `6 * max_output_bytes +
+8192` for a blocking exec). App-proxy exchanges and streaming exec forwards are not
+management requests: they bypass the management permit, body limit and route
+deadline and are bounded by `[server.proxy]` instead.
 Subprocess output/deadlines and artifact sizes are independently bounded. Configuration files are capped at 64 KiB.
 Startup fields are strict; credentials/error bodies are not parser diagnostics.
 
 Static errors use `{"error":{"code":"invalid_input","message":"..."}}`.
 Common statuses: 200 result, 201 created, 400 invalid fields/IDs, 401 unauthorized,
 403 unapproved service port, 404 missing route/sandbox, 408 request/body deadline,
-409 `sandbox_busy`/`sandbox_not_running`/template conflicts, 413 body limit, 422
-template unavailable or resource rules, 500 failed operation or `cleanup_failed`,
-502 application HTTP failure, 503 disabled/preflight, owner unavailability, busy or
-capacity, 504 outcome wait expired. Failed operations name a static code; read the
-sandbox state afterward, because a failed exec, or a capture that leaves the source
-frozen, can terminate the sandbox.
+409 `sandbox_busy`/`exec_limit`/`sandbox_not_running`/template conflicts, 413 body
+limit, 422 template unavailable or resource rules, 500 failed operation or
+`cleanup_failed`, 502 proxied service unavailable, 503 disabled/preflight, owner
+unavailability, busy or capacity, 504 outcome wait or proxy idle timeout expired.
+Proxied applications return their own statuses, which pass through unchanged.
+Failed operations name a static code; read the sandbox state afterward, because a
+capture that leaves the source frozen, or a command whose resource group cannot be
+emptied, terminates the sandbox.
 
-Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–131,072 bytes.
+Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–131,072 bytes,
+`[server.proxy]` `max_connections` 1–65,536 and `idle_timeout_ms` 1,000–3,600,000.
+The removed `[server.application_http]` table is rejected at startup.
 Durable records hold lifecycle metadata only (bounded at 64 KiB each, `max_records`
 including tombstones); there are no output-retention budgets. Records written by
 the earlier polling API (schema 1) fail startup closed; reconcile such a root with

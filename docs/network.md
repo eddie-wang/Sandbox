@@ -1,4 +1,4 @@
-# Native network and application HTTP architecture
+# Native network and app proxy architecture
 
 The implementation is intentionally small: runc/CRIU, existing Linux namespaces,
 veth, nftables and the existing worker operation/helper ownership model. No VM
@@ -7,7 +7,8 @@ storage, network daemon, outbound HTTP relay, domain-policy engine or S3 client.
 ## Authority and topology
 
 ```text
-controller: authenticated blocking requests, routed by sandbox ID
+controller: authenticated requests, routed by sandbox ID (app proxy: path form or
+    |       <port>-<sandbox-id>.<proxy_domain> hosts, streamed to the owner)
     |
 worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |
@@ -18,8 +19,8 @@ worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |   seccomp: io_uring/MPTCP guards only     |
     |                                         uplink -- veth -- operator bridge
     |                                                          stable MAC/gateway
-    +-- bounded HTTP helper enters router slot only
-        reqwest -> http://192.0.2.2:<approved service port>/<validated path>
+    +-- app proxy: a fresh TCP connection opened inside the router slot only
+        (short-lived thread setns) -> 192.0.2.2:<approved service port>
 ```
 
 Every guest has the same address, isolated by its own guest **and router** netns.
@@ -112,9 +113,11 @@ and mounts; no_new_privs and cgroups remain in force.
    Shutdown, once every sandbox is gone, deletes the whole pool.
 
 The worker's short coordinator and bounded I/O pool are unchanged. Different
-sandboxes overlap; one sandbox's exec/capture/HTTP/delete do not race. HTTP caller
-cancellation does not orphan an accepted task. Each mutating host process and its
-descendants joins an exclusive restart-discoverable helper cgroup before exec.
+sandboxes overlap; one sandbox's create/capture/delete do not race, and capture
+waits for no command (it is refused while one runs). Caller cancellation does not
+orphan an accepted job or command. Each mutating host process and its descendants
+joins an exclusive restart-discoverable helper cgroup before exec. Proxied app
+traffic needs no host process: the worker itself holds the connection.
 
 ## Capture and established connections
 
@@ -136,22 +139,43 @@ Manifest v1/v2 and older layout fingerprints are deliberately incompatible.
 The new schema/layout also applies to newly provisioned isolated templates; there
 is no silent interpretation of old deny-all artifacts as network-enabled images.
 
-## Application HTTP boundary
+## App proxy boundary
 
-`POST /v1/sandboxes/{id}/http` is a blocking bounded request, not a URL proxy. The
-worker validates fixed-target service authorization and launches its own executable
-via the verified `ip` into **only the selected router namespace**. Namespace entry
-never touches a pooled worker/Tokio thread. The request is a protected private JSON
-file, not command-line secrets; the helper inherits no management environment.
+App traffic follows AgentENV's gateway and node proxy (`services/gateway`
+`host_route.go`/`server.go`, `src/api/proxy.rs`). The controller accepts a request
+whose Host is `<port>-<sandbox-id>.<proxy_domain>` (configured `proxy_domain`; the
+sandbox ID is used verbatim, so the host has one more label than AgentENV's) or the
+path form `/v1/sandboxes/<id>/proxy/<port>/<path>`. It requires the management bearer
+token, routes by the ID's owner prefix to a fresh owner and streams the exchange to
+the worker with the worker token. The worker accepts only a running (or capturing)
+sandbox and a port in its template's approved `service_ports` (which the operator
+ceiling already bounds), then opens a **new TCP connection from inside the sandbox's
+router slot**: a short-lived thread enters the pinned slot namespace with `setns`,
+creates the socket and exits, so no shared worker or Tokio thread ever changes
+namespace and nothing listens on or routes from the host network. The slot's
+existing nftables rules allow exactly the slot-to-guest service-port flow
+(`output oifname inside ... tcp dport <port>` and established replies). One request
+per connection; nothing is pooled across exchanges (guest addresses are reused).
 
-The maintained reqwest client has no proxy or redirects, one HTTP/1 request,
-bounded deadline/body/result, and no connection pooling across operations. Inputs
-are a small method set, relative path/query, optional accept/content-type and UTF-8
-text. Management bearer, Host and arbitrary headers are not forwarded. Results
-contain status, content-type and UTF-8 body only and are returned inline, never stored. Invalid UTF-8 is rejected, not
-silently corrupted. Whole helper-cgroup drainage bounds descendants, output and
-restart lifetime. Application failures do not kill an otherwise healthy sandbox.
-See [API bounds](api.md#application-http) and the
+The request and response are forwarded as HTTP/1.1 messages, not reinterpreted:
+the method, raw path and query, headers and status are the application's; bodies
+stream in both directions with their framing (Content-Length kept, chunked
+re-chunked as it arrives), so large, binary and long-lived bodies work. Hop-by-hop
+headers (and those Connection names), `Proxy-Authorization` and the management
+`Authorization` header are removed; Host becomes `192.0.2.2:<port>`, with
+`X-Forwarded-Host` (the client's original host) and `X-Forwarded-Proto` set by the
+controller, which drops client-supplied `X-Forwarded-*`/`Forwarded`. A request that
+asks to upgrade (WebSocket) keeps its Upgrade headers, and a 101 answer turns both
+hops into byte tunnels. Redirects are returned, not followed.
+
+Bounds: `[server.proxy] max_connections` open exchanges per service (default 256;
+503 `busy` beyond it) and `idle_timeout_ms` (default 600,000, AgentENV's response-head
+wait): the response head, every body and a tunnel must move a byte within that
+period (504 `upstream_timeout` from the worker, `owner_response_timeout` from the
+controller). There is no total deadline: the client decides. A guest that refuses
+or drops the connection is 502 `upstream_unavailable`. Deleting the sandbox, its
+TTL expiry or the end of its running state ends its open exchanges at once.
+See the [API](api.md#app-proxy) and the
 [disposable qualification recipe](runtime.md#disposable-network-qualification).
 
 Remaining work: per-create bounded policy selection, broader workload compatibility,

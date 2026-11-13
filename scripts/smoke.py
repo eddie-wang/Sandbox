@@ -2,11 +2,15 @@
 """Nonprivileged process smoke: real HTTP services, no containers or runtime substitute.
 
 Controller placement is exercised against small worker-protocol routing doubles
-(RoutingDouble). They answer only status/create/get/exec/delete routing calls and
-never claim to run a container; real lifecycle checks are in runtime_smoke.py.
+(RoutingDouble). They answer only status/create/get/exec/delete routing calls, plus
+app-proxy and streaming-exec forwards that check the controller hop (streaming,
+headers, binary bodies, upgrades, bounds), and never claim to run a container; real
+lifecycle checks are in runtime_smoke.py.
 """
+import hashlib
 
 import argparse
+import base64
 import concurrent.futures
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,6 +53,45 @@ def request(port_number, path, token=None, body=None, method="GET", chunked=Fals
         connection.close()
 
 
+# Send one raw HTTP request (any method, headers and bytes body; an iterable body is sent chunked) and
+# return the status, the response headers (lowercase names) and the whole body.
+def exchange(port_number, method, path, headers=None, body=None, timeout=10):
+    connection = http.client.HTTPConnection("127.0.0.1", port_number, timeout=timeout)
+    try:
+        chunked = body is not None and not isinstance(body, (bytes, str))
+        connection.request(method, path, body=body, headers=headers or {}, encode_chunked=chunked)
+        response = connection.getresponse()
+        return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+# Run a streaming exec (server-sent events) and return the HTTP status with either the error body or
+# the events as (seconds since the request, event name, decoded JSON data) in arrival order.
+def exec_events(port_number, path, token, body, timeout=60):
+    connection = http.client.HTTPConnection("127.0.0.1", port_number, timeout=timeout)
+    try:
+        started = time.monotonic()
+        connection.request("POST", path, body=json.dumps(dict(body, stream=True)).encode(),
+                           headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        if response.status != 200:
+            return response.status, json.loads(response.read())
+        assert response.getheader("Content-Type") == "text/event-stream"
+        events, name = [], None
+        while True:
+            line = response.readline()
+            if not line:
+                return response.status, events
+            line = line.decode().rstrip("\n")
+            if line.startswith("event: "):
+                name = line[len("event: "):]
+            elif line.startswith("data: "):
+                events.append((time.monotonic() - started, name, json.loads(line[len("data: "):])))
+    finally:
+        connection.close()
+
+
 # Assert the expected HTTP status and optional error code, then return the response data.
 def expect(result, status, code=None):
     actual, payload = result
@@ -76,8 +119,9 @@ def eventually(check, timeout=5):
 class RoutingDouble:
     """Worker-protocol double for controller placement/routing only. Not a runtime."""
 
-    # Start a loopback HTTP server that answers worker status, create, get, exec and delete calls for
-    # one node ID. The mode selects accept, busy, drop, template, fail or hang behavior for creates.
+    # Start a loopback HTTP server that answers worker status, create, get, exec (blocking and
+    # streaming), delete and app-proxy calls for one node ID. The mode selects accept, busy, drop,
+    # template, fail or hang behavior for creates.
     def __init__(self, node_id, token):
         self.node_id, self.token = node_id, token
         self.mode, self.ready, self.peer_closed = "accept", True, False
@@ -99,11 +143,101 @@ class RoutingDouble:
                 self.end_headers()
                 self.wfile.write(data)
 
-            # Check the worker token and answer one routing call from the double's records and mode. In
-            # hang mode, hold a create open until the controller closes its connection.
+            # Read the request body: Content-Length bytes, or chunked transfer coding.
+            def body_bytes(self):
+                if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                    data = bytearray()
+                    while True:
+                        size = int(self.rfile.readline().split(b";")[0], 16)
+                        if size == 0:
+                            self.rfile.readline()
+                            return bytes(data)
+                        data += self.rfile.read(size)
+                        self.rfile.readline()
+                return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+            # Answer a proxied app request forwarded by the controller (no runtime): echo the request,
+            # return a chosen status with hop-by-hop headers, stream chunks or a trickle, send a
+            # binary pattern, wait before answering, or switch to a raw echo tunnel on upgrade.
+            def proxy(self):
+                app = self.path.split("/proxy/", 1)[1].split("/", 1)[1] if "/" in self.path.split("/proxy/", 1)[1] else ""
+                route = "/" + app
+                if route.startswith("/echo"):
+                    data = self.body_bytes()
+                    auth = self.headers.get("Authorization")
+                    self.send_response(200)
+                    for name, value in (("Content-Type", "application/octet-stream"), ("X-Echo-Path", route),
+                                        ("X-Echo-Auth", "worker" if auth == "Bearer " + double.token else ("none" if auth is None else "other")),
+                                        ("X-Echo-Forwarded-Host", self.headers.get("X-Forwarded-Host") or ""), ("X-Echo-Chunked", "yes" if self.headers.get("Transfer-Encoding") else "no"),
+                                        ("X-Echo-Sha256", hashlib.sha256(data).hexdigest()), ("Content-Length", str(len(data)))):
+                        self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(data)
+                elif route.startswith("/status/"):
+                    self.send_response(int(route.split("/")[2]))
+                    for name, value in (("X-Custom", "kept"), ("Connection", "X-Hop"), ("X-Hop", "dropped"), ("Content-Length", "6")):
+                        self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(b"teapot")
+                elif route in ("/chunks", "/trickle"):
+                    self.protocol_version = "HTTP/1.1"
+                    self.send_response(200)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    count, gap = (3, 0.4) if route == "/chunks" else (6, 0.5)
+                    for index in range(count):
+                        part = f"part-{index}\n".encode()
+                        self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+                        self.wfile.flush()
+                        time.sleep(gap)
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.close_connection = True
+                elif route.startswith("/binary/"):
+                    size = int(route.split("/")[2])
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(size))
+                    self.end_headers()
+                    pattern = bytes(range(256)) * 4096
+                    for offset in range(0, size, len(pattern)):
+                        self.wfile.write(pattern[:min(len(pattern), size - offset)])
+                elif route == "/slow":
+                    time.sleep(1.5)
+                    self.reply(200, {"slow": True})
+                elif route == "/upgrade" and (self.headers.get("Upgrade") or "").lower() == "echo":
+                    self.protocol_version = "HTTP/1.1"
+                    self.send_response(101)
+                    self.send_header("Upgrade", "echo")
+                    self.send_header("Connection", "Upgrade")
+                    self.end_headers()
+                    self.wfile.flush()
+                    while data := self.connection.recv(65536):
+                        self.connection.sendall(data)
+                    self.close_connection = True
+                else:
+                    self.reply(404, {"error": {"code": "not_found", "message": "test double"}})
+
+            # Stream a fake command's output as server-sent events with gaps between them.
+            def exec_stream(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                frames = [("start", {"exec_id": 1})] + [("stdout", {"data": base64.b64encode(f"tick {i}\n".encode()).decode()}) for i in range(3)] \
+                    + [("exit", {"exit_code": 0, "interrupted": False, "error": None, "sandbox_state": "running"})]
+                for name, data in frames:
+                    self.wfile.write(f"event: {name}\ndata: {json.dumps(data)}\n\n".encode())
+                    self.wfile.flush()
+                    time.sleep(0.3)
+                self.close_connection = True
+
+            # Check the worker token and answer one routing or proxied call from the double's records and
+            # mode. In hang mode, hold a create open until the controller closes its connection.
             def handle_any(self, method):
                 if self.headers.get("Authorization") != "Bearer " + double.token:
                     return self.reply(401, {"error": {"code": "unauthorized", "message": "test double"}})
+                if "/proxy/" in self.path:
+                    with double.lock:
+                        double.calls.append((method, self.path))
+                    return self.proxy()
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length)) if length else None
                 if method == "POST" and self.path == "/v1/sandboxes" and double.mode == "hang":
@@ -152,9 +286,13 @@ class RoutingDouble:
                     if method == "DELETE" and len(parts) == 4:
                         record["state"] = "deleted"
                         return self.reply(200, record)
-                    if method == "POST" and parts[4:] == ["exec"]:
-                        return self.reply(200, dict(exit_code=0, stdout=double.node_id, stderr="", interrupted=False, error=None, sandbox_state="running"))
-                    return self.reply(404, {"error": {"code": "not_found", "message": "test double"}})
+                    streamed = method == "POST" and parts[4:] == ["exec"] and body.get("stream")
+                    if method == "POST" and parts[4:] == ["exec"] and not streamed:
+                        return self.reply(200, dict(exec_id=1, exit_code=0, stdout=double.node_id, stderr="", interrupted=False, error=None, sandbox_state="running"))
+                    if not streamed:
+                        return self.reply(404, {"error": {"code": "not_found", "message": "test double"}})
+                # Outside the lock: the stream takes a while.
+                return self.exec_stream()
 
             # Handle a GET request.
             def do_GET(self):
@@ -167,6 +305,10 @@ class RoutingDouble:
             # Handle a DELETE request.
             def do_DELETE(self):
                 self.handle_any("DELETE")
+
+            # Handle a PUT request (proxied app traffic only).
+            def do_PUT(self):
+                self.handle_any("PUT")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
@@ -199,9 +341,10 @@ max_concurrent_restores = 2
 '''
 
 
-# Launch local services and check authentication, input bounds, fail-closed readiness and stale-owner
-# routing. Check controller placement, ID routing and failover against routing doubles, and overload
-# and shutdown, all without containers; clean up processes and check logs for leaked tokens.
+# Launch local services and check authentication, input bounds, proxy host/path routing, fail-closed
+# readiness and stale-owner routing. Check controller placement, ID routing, failover and the
+# controller's proxy and streaming-exec hop against routing doubles, and overload and shutdown, all
+# without containers; clean up processes and check logs for leaked tokens.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/sandboxd")
@@ -222,7 +365,8 @@ def main():
         secret.chmod(0o600)
         worker_port, second_port, controller_port = port(), port(), port()
         assert len({worker_port, second_port, controller_port}) == 3, "ephemeral port collision; retry"
-        controller_text = f'''[server]
+        controller_text = f'''proxy_domain = "sandbox.test"
+[server]
 listen = "127.0.0.1:{controller_port}"
 max_in_flight = 32
 request_timeout_ms = 800
@@ -305,10 +449,13 @@ url = "http://127.0.0.1:{second_port}"
             invalid_config("controller", controller_text.replace(f"http://127.0.0.1:{worker_port}", "http://user:password@127.0.0.1/"))
             invalid_config("controller", controller_text.replace("fanout = 2", "fanout = 0"))
             invalid_config("controller", controller_text.replace("[worker_auth]", 'env = "SANDBOX_WORKER_TOKEN"\n[worker_auth]'))
-            for setting in ("max_body_bytes = 16385", "max_response_bytes = 8388609", "max_timeout_ms = 600001", "max_body_bytes = 16384"):
-                # The final case has a valid opt-in body ceiling but insufficient
-                # outer JSON envelope capacity and must also fail at startup.
-                invalid_config("worker", worker_config(worker_port).replace("[auth]", "[server.application_http]\n" + setting + "\n[auth]"))
+            # The removed JSON application HTTP operation's limits are rejected, not silently ignored.
+            invalid_config("worker", worker_config(worker_port).replace("[auth]", "[server.application_http]\nmax_body_bytes = 8192\n[auth]"))
+            invalid_config("controller", controller_text.replace("[auth]", "[server.application_http]\nmax_body_bytes = 8192\n[auth]"))
+            for setting in ("max_connections = 0", "max_connections = 65537", "idle_timeout_ms = 999", "idle_timeout_ms = 3600001", "unknown = 1"):
+                invalid_config("worker", worker_config(worker_port).replace("[auth]", "[server.proxy]\n" + setting + "\n[auth]"))
+            for domain in ("Sandbox.Test", "sandbox_test", "-sandbox.test", "sandbox..test", ""):
+                invalid_config("controller", controller_text.replace('proxy_domain = "sandbox.test"', f'proxy_domain = "{domain}"'))
             for setting in ("create_ms = 999", "capture_ms = 3600001", "delete_ms = 0", "margin_ms = 300001", "unknown_ms = 1000"):
                 invalid_config("worker", worker_config(worker_port).replace("[auth]", "[server.operation_deadlines]\n" + setting + "\n[auth]"))
                 invalid_config("controller", controller_text.replace("[auth]", "[server.operation_deadlines]\n" + setting + "\n[auth]"))
@@ -356,11 +503,18 @@ url = "http://127.0.0.1:{second_port}"
                 expect(request(number, "/v1/sandboxes/node-a.example/exec", token, dict(execution, timeout_ms=60001), "POST"), 400, "invalid_input")
                 # The polling-era operation identifier is no longer an accepted field.
                 expect(request(number, "/v1/sandboxes/node-a.example/exec", token, dict(execution, operation_id="exec-1"), "POST"), 400, "invalid_input")
-                app_http = {"port":8080, "method":"GET", "path":"/", "timeout_ms":1000, "max_response_bytes":4096}
-                expect(request(number, "/v1/sandboxes/node-a.example/http", token, app_http, "POST"), 503, "runtime_unavailable")
-                for changes in [dict(path="http://example.invalid/"), dict(path="//example.invalid/"), dict(headers={"authorization":"not-forwarded"}), dict(port=0), dict(method="CONNECT")]:
-                    expect(request(number, "/v1/sandboxes/node-a.example/http", token, dict(app_http, **changes), "POST"), 400, "invalid_input")
-                expect(request(number, "/v1/sandboxes/node-a.example/http", token, dict(app_http, body="x"*8193), "POST"), 413, "body_too_large")
+                # The JSON application HTTP operation is removed; app traffic uses the proxy.
+                expect(request(number, "/v1/sandboxes/node-a.example/http", token, {"port": 8080}, "POST"), 404, "not_found")
+                expect(request(number, "/v1/sandboxes/node-a.example/exec", token, dict(execution, stream=True), "POST"), 503, "runtime_unavailable")
+                expect(request(number, "/v1/sandboxes/node-a.example/exec", token, dict(execution, stream="yes"), "POST"), 400, "invalid_input")
+                expect(request(number, "/v1/sandboxes/node-a.example/exec/1/kill", token, method="POST"), 503, "runtime_unavailable")
+                expect(request(number, "/v1/sandboxes/node-a.example/exec/one/kill", token, method="POST"), 400, "invalid_input")
+                for method in ("GET", "POST", "PUT", "DELETE"):
+                    expect(request(number, "/v1/sandboxes/node-a.example/proxy/8080/app?x=1", method=method), 401, "unauthorized")
+                    expect(request(number, "/v1/sandboxes/node-a.example/proxy/8080/app?x=1", token, method=method), 503, "runtime_unavailable")
+                expect(request(number, "/v1/sandboxes/node-a.example/proxy/8080", token), 503, "runtime_unavailable")
+                for invalid in ("/v1/sandboxes/node-a.example/proxy/0/", "/v1/sandboxes/node-a.example/proxy/080/", "/v1/sandboxes/node-a.example/proxy/65536/", "/v1/sandboxes/node-a.example/proxy/web/", "/v1/sandboxes/bad%2Fid/proxy/8080/"):
+                    expect(request(number, invalid, token), 400, "invalid_input")
                 capture = {"template_id": "example", "runtime": "runc_criu"}
                 expect(request(number, "/v1/sandboxes/node-a.example/capture", token, capture, "POST"), 503, "runtime_unavailable")
                 expect(request(number, "/v1/sandboxes/node-a.example/capture", token, dict(capture, runtime="other"), "POST"), 400, "invalid_input")
@@ -368,7 +522,26 @@ url = "http://127.0.0.1:{second_port}"
                 for identifier in ("%FF", "bad%2Fid"):
                     expect(request(number, f"/v1/sandboxes/{identifier}/exec", token, execution, "POST"), 400, "invalid_input")
                     expect(request(number, f"/v1/sandboxes/{identifier}/capture", token, capture, "POST"), 400, "invalid_input")
-            print("PASS strict inputs/identifiers, no caller sandbox_id/operation_id, body bounds and fail-closed create/exec/capture/HTTP")
+            # Host routing (AgentENV `<port>-<sandbox-id>.<domain>`) is a controller feature; the
+            # controller authenticates first, then routes by the ID's owner prefix.
+            routed = {"Host": "8080-node-a.example.sandbox.test:443"}
+            assert exchange(controller_port, "GET", "/healthz", routed)[0] == 401, "host-routed /healthz is app traffic and needs authentication"
+            authorized = dict(routed, Authorization="Bearer " + controller_token)
+            for path in ("/", "/healthz", "/v1/status", "/any/app/path?q=1"):
+                status, _, body = exchange(controller_port, "GET", path, authorized)
+                assert status == 503 and json.loads(body)["error"]["code"] == "runtime_unavailable", (path, status, body)
+            for host in ("x-node-a.example.sandbox.test", "0-node-a.example.sandbox.test", "8080-bad id.sandbox.test", "8080-noprefix.sandbox.test"):
+                status, _, body = exchange(controller_port, "GET", "/", {"Host": host, "Authorization": "Bearer " + controller_token})
+                assert status == 400 and json.loads(body)["error"]["code"] == "invalid_input", (host, status)
+            status, _, body = exchange(controller_port, "GET", "/", {"Host": "8080-unknown-node.example.sandbox.test", "Authorization": "Bearer " + controller_token})
+            assert status == 400, (status, body)
+            for host in ("sandbox.test", "nohyphen.sandbox.test", "8080-node-a.example.other.test"):
+                answer = exchange(controller_port, "GET", "/v1/status", {"Host": host, "Authorization": "Bearer " + controller_token})
+                assert answer[0] == 200, (host, answer)
+            # Workers have no proxy domain: the Host header never routes there.
+            assert exchange(worker_port, "GET", "/v1/status", dict(routed, Authorization="Bearer " + worker_token))[0] == 200
+            print("PASS strict inputs/identifiers, no caller sandbox_id/operation_id, body bounds and fail-closed create/exec/kill/capture/proxy")
+            print("PASS proxy path form, host routing below the configured domain only, authentication before routing")
 
             # Send one mixed health, status or fail-closed create check to the selected service.
             def concurrent_check(index):
@@ -461,6 +634,7 @@ command_timeout_seconds = 10
                 placing_text = controller_text.replace(f"127.0.0.1:{controller_port}", f"127.0.0.1:{placing_port}")
                 placing_text = placing_text.replace('node_id = "node-a"', 'node_id = "stub-a"').replace(f"http://127.0.0.1:{worker_port}", f"http://127.0.0.1:{doubles[0].port}")
                 placing_text = placing_text.replace('node_id = "node-b"', 'node_id = "stub-b"').replace(f"http://127.0.0.1:{second_port}", f"http://127.0.0.1:{doubles[1].port}")
+                placing_text = placing_text.replace("[auth]", "[server.proxy]\nmax_connections = 4\nidle_timeout_ms = 1000\n[auth]")
                 placing = start("controller", placing_text)
                 eventually(lambda: request(placing_port, "/healthz")[0] == 200)
 
@@ -495,6 +669,71 @@ command_timeout_seconds = 10
                     assert expect(request(placing_port, f"/v1/sandboxes/{sandbox_id}", controller_token), 200)["sandbox_id"] == sandbox_id
                     assert ("POST", f"/v1/sandboxes/{sandbox_id}/exec") in double.calls
                 print("PASS later exec/GET routed to the owner by the returned ID")
+
+                # The controller hop of the app proxy, against the routing double standing in for the
+                # owner (the worker hop and real sandboxes are covered by the privileged gates).
+                bearer = {"Authorization": "Bearer " + controller_token}
+                prefix = f"/v1/sandboxes/{first}/proxy/9000"
+                status, headers, body = exchange(placing_port, "GET", prefix + "/echo/a%2Fb?x=1&y=%20", dict(bearer, **{"X-Forwarded-Host": "spoofed.example"}))
+                assert status == 200 and headers["x-echo-path"] == "/echo/a%2Fb?x=1&y=%20", headers
+                assert headers["x-echo-auth"] == "worker" and headers["x-echo-forwarded-host"] == f"127.0.0.1:{placing_port}", headers
+                assert ("GET", prefix + "/echo/a%2Fb?x=1&y=%20") in doubles[0].calls and not any("/proxy/" in path for _, path in doubles[1].calls)
+                upload = os.urandom(4 << 20)
+                status, headers, body = exchange(placing_port, "POST", prefix + "/echo", dict(bearer, **{"Content-Type": "application/x-test"}), upload, timeout=30)
+                assert status == 200 and body == upload and headers["x-echo-sha256"] == hashlib.sha256(upload).hexdigest() and headers["x-echo-chunked"] == "no"
+                status, headers, body = exchange(placing_port, "PUT", prefix + "/echo", bearer, iter([upload[:1 << 20], upload[1 << 20:]]), timeout=30)
+                assert status == 200 and body == upload and headers["x-echo-chunked"] == "yes"
+                status, headers, body = exchange(placing_port, "GET", prefix + "/status/418", bearer)
+                assert status == 418 and body == b"teapot" and headers["x-custom"] == "kept" and "x-hop" not in headers, headers
+                status, headers, body = exchange(placing_port, "GET", prefix + "/binary/8388608", bearer, timeout=30)
+                assert status == 200 and headers["content-length"] == "8388608" and body == (bytes(range(256)) * 32768)
+                # Chunked parts arrive as they are sent, not after the whole response.
+                connection = http.client.HTTPConnection("127.0.0.1", placing_port, timeout=10)
+                started = time.monotonic()
+                connection.request("GET", prefix + "/chunks", headers=bearer)
+                response = connection.getresponse()
+                arrivals = []
+                for _ in range(3):
+                    line = response.readline()
+                    arrivals.append((time.monotonic() - started, line))
+                assert response.read() == b"" and [line for _, line in arrivals] == [b"part-0\n", b"part-1\n", b"part-2\n"]
+                assert arrivals[2][0] - arrivals[0][0] >= 0.6 and response.getheader("Transfer-Encoding") == "chunked", arrivals
+                connection.close()
+                # Host form reaches the same owner and application path.
+                status, headers, _ = exchange(placing_port, "GET", "/echo?h=1", dict(bearer, Host=f"9000-{first}.sandbox.test"))
+                assert status == 200 and headers["x-echo-path"] == "/echo?h=1" and headers["x-echo-forwarded-host"] == f"9000-{first}.sandbox.test"
+                # An upgrade answered with 101 becomes a byte tunnel through the controller.
+                with socket.create_connection(("127.0.0.1", placing_port), timeout=5) as tunnel:
+                    tunnel.sendall((f"GET {prefix}/upgrade HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {controller_token}\r\n"
+                                    "Connection: Upgrade\r\nUpgrade: echo\r\n\r\n").encode())
+                    head = b""
+                    while b"\r\n\r\n" not in head:
+                        head += tunnel.recv(4096)
+                    assert head.startswith(b"HTTP/1.1 101") and b"upgrade: echo" in head.lower(), head
+                    for message in (b"ping", os.urandom(100000)):
+                        tunnel.sendall(message)
+                        echoed = b""
+                        while len(echoed) < len(message):
+                            echoed += tunnel.recv(65536)
+                        assert echoed == message
+                # A streaming exec's events pass through as the owner sends them.
+                status, events = exec_events(placing_port, f"/v1/sandboxes/{first}/exec", controller_token, execution)
+                assert status == 200 and [name for _, name, _ in events] == ["start", "stdout", "stdout", "stdout", "exit"], events
+                assert events[-1][0] - events[0][0] >= 1.0 and base64.b64decode(events[1][2]["data"]) == b"tick 0\n"
+                # Bounds: the owner must send something within the idle timeout, and open exchanges are
+                # limited (four here); a released permit is reusable.
+                status, _, body = exchange(placing_port, "GET", prefix + "/slow", bearer)
+                assert status == 504 and json.loads(body)["error"]["code"] == "owner_response_timeout"
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    held = [pool.submit(exchange, placing_port, "GET", prefix + "/trickle", bearer) for _ in range(4)]
+                    eventually(lambda: sum(path == prefix + "/trickle" for _, path in doubles[0].calls) == 4)
+                    status, _, body = exchange(placing_port, "GET", prefix + "/echo", bearer)
+                    assert status == 503 and json.loads(body)["error"]["code"] == "busy"
+                    assert all(f.result(timeout=10)[2] == b"".join(f"part-{i}\n".encode() for i in range(6)) for f in held)
+                assert exchange(placing_port, "GET", prefix + "/echo", bearer)[0] == 200
+                expect(request(placing_port, prefix + "/echo"), 401, "unauthorized")
+                print("PASS controller proxy hop: owner routing, worker credential, forwarded host, raw paths, 4 MiB uploads (length and chunked), "
+                      "real status/headers, 8 MiB binary, streamed chunks, host form, upgrade tunnel, streaming exec, idle and connection bounds")
 
                 settle({"stub-a": 1, "stub-b": 1})
                 doubles[0].mode = "busy"

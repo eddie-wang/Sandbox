@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::{Duration, Instant}};
 
-use axum::{Json, Router, extract::{Path, State, rejection::{JsonRejection, PathRejection}}, http::StatusCode, response::{IntoResponse, Response}, routing::{get, post}};
+use axum::{Json, Router, body::Body, extract::{Path, Request, State, rejection::{JsonRejection, PathRejection}}, http::{StatusCode, header}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde_json::Value;
 use serde::Serialize;
 use tokio::{sync::RwLock, task::JoinSet};
@@ -9,7 +9,7 @@ use crate::{
     config::{ControllerConfig, ServerConfig, WorkerEndpoint},
     http::{self, ApiError},
     lifecycle,
-    model::{CaptureRequest, CreateSpec, ExecRequest, HttpRequest, WorkerStatus, sandbox_owner, valid_id},
+    model::{CaptureRequest, CreateSpec, ExecRequest, WorkerStatus, sandbox_owner, valid_id},
     scheduler,
 };
 
@@ -38,6 +38,9 @@ struct Controller {
     freshness: Duration,
     endpoints: Arc<Vec<WorkerEndpoint>>,
     client: reqwest::Client,
+    // Streams app traffic and streaming exec output to owners: no total deadline (see ProxyLimits).
+    proxy_client: reqwest::Client,
+    proxy_permits: Arc<tokio::sync::Semaphore>,
     worker_token: Arc<String>,
     server: ServerConfig,
     short_wait: Duration,
@@ -171,25 +174,52 @@ async fn delete(State(c): State<Controller>, path: Result<Path<String>, PathReje
     let wait = Duration::from_millis(c.server.operation_deadlines.delete_ms);
     reply(forward(&c, &owner, reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"), None, c.operation_timeout(wait), MAX_SANDBOX_VIEW_BYTES).await)
 }
-// Validate a command and forward it to the owner, waiting for its own timeout plus the margin and
-// accepting a reply up to the largest possible exec result.
+// Take a proxy connection permit for a streamed exchange, or refuse with 503 busy.
+fn proxy_permit(c: &Controller) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    c.proxy_permits.clone().try_acquire_owned().map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy", "Proxy connection limit reached"))
+}
+// Validate a command and forward it to the owner. A blocking command waits for its own timeout plus
+// the margin and accepts a reply up to the largest possible exec result; a streaming command's events
+// are passed through as they arrive, under the proxy connection and idle bounds.
 async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
     if !request.valid() { return Err(http::invalid_input()); }
+    let route = format!("/v1/sandboxes/{id}/exec");
+    let body = serde_json::to_vec(&request).map_err(|_| http::invalid_input())?;
+    if request.stream {
+        let url = owner_url(&c, &owner, &route, None).await?;
+        let permit = proxy_permit(&c)?;
+        let upstream = Request::builder().method("POST").uri(&route).header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body)).map_err(|_| http::invalid_input())?;
+        return Ok(crate::proxy::to_owner(&c.proxy_client, url, &c.worker_token, upstream, c.server.proxy.idle(), permit).await);
+    }
     let wait = Duration::from_millis(request.timeout_ms + c.server.operation_deadlines.margin_ms);
     let limit = request.max_result_bytes();
-    reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
+    reply(forward(&c, &owner, reqwest::Method::POST, &route, Some(serde_json::from_slice(&body).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
 }
-// Check an application HTTP request against the configured limits and forward it to the owner,
-// waiting for its own timeout plus the margin and accepting a reply up to the largest valid result.
-async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<Response, ApiError> {
-    let (id, owner) = path_id(path)?;
-    let request = http::json(input)?;
-    if !request.valid_for(&c.server.application_http) { return Err(http::invalid_input()); }
-    let wait = Duration::from_millis(request.timeout_ms + c.server.operation_deadlines.margin_ms);
-    let limit = request.max_result_bytes();
-    reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
+// Forward a kill of one running command to the owner and wait (margin plus one request timeout) until
+// the command has ended there.
+async fn kill(State(c): State<Controller>, path: Result<Path<(String, u64)>, PathRejection>) -> Result<Response, ApiError> {
+    let Path((id, exec)) = path.map_err(|_| http::invalid_input())?;
+    let owner = sandbox_owner(&id).ok_or_else(http::invalid_input)?.to_owned();
+    let wait = Duration::from_millis(c.server.operation_deadlines.margin_ms);
+    reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec/{exec}/kill"), None, c.operation_timeout(wait), MAX_SANDBOX_VIEW_BYTES).await)
+}
+// Route one authenticated app-proxy request (path form, or host form rewritten to it by the guard) to
+// the sandbox's owner by its ID prefix and stream the exchange, under the proxy connection and idle
+// bounds.
+async fn app_proxy(c: Controller, request: Request) -> Response {
+    let Some((id, _, _)) = crate::proxy::parse(request.uri().path()) else { return http::invalid_input().into_response() };
+    let owner = sandbox_owner(&id).unwrap_or_default().to_owned();
+    let url = match owner_url(&c, &owner, request.uri().path(), request.uri().query()).await {
+        Ok(url) => url,
+        Err(error) => return error.into_response(),
+    };
+    match proxy_permit(&c) {
+        Ok(permit) => crate::proxy::to_owner(&c.proxy_client, url, &c.worker_token, request, c.server.proxy.idle(), permit).await,
+        Err(error) => error.into_response(),
+    }
 }
 // Check the new template ID and forward the capture to the owner within the capture deadline.
 async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<Response, ApiError> {
@@ -203,7 +233,7 @@ async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRej
 enum Forward {
     // Nothing reached the owner; the caller may choose another node for a create.
     NotSent(ApiError),
-    // The owner may have acted; exec/HTTP are not exactly-once, so read state.
+    // The owner may have acted; exec is not exactly-once, so read state.
     Lost(ApiError),
 }
 impl Forward {
@@ -211,17 +241,25 @@ impl Forward {
     fn error(self) -> ApiError { match self { Self::NotSent(e) | Self::Lost(e) => e } }
 }
 
+// Build the owner's URL for a path (and query), only for a configured owner with a fresh validated
+// observation.
+async fn owner_url(c: &Controller, owner: &str, path: &str, query: Option<&str>) -> Result<reqwest::Url, ApiError> {
+    let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or_else(http::invalid_input)?;
+    let nodes = c.snapshot().await;
+    if !nodes.iter().any(|n| n.node_id == owner && n.fresh) {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable", "Owner identity has no fresh validated observation"));
+    }
+    let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| http::invalid_input())?;
+    url.set_path(path);
+    url.set_query(query);
+    Ok(url)
+}
+
 // Send an authenticated request to the owner only if it has a fresh observation, and read its JSON
 // reply up to `limit` bytes. `timeout` covers the whole exchange. Fail as NotSent when nothing left
 // this controller, or as Lost when the owner may have acted (timeout, dropped or oversized reply).
 async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &str, body: Option<Value>, timeout: Duration, limit: usize) -> Result<(StatusCode, Value), Forward> {
-    let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or(Forward::NotSent(http::invalid_input()))?;
-    let nodes = c.snapshot().await;
-    if !nodes.iter().any(|n| n.node_id == owner && n.fresh) {
-        return Err(Forward::NotSent(ApiError(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable", "Owner identity has no fresh validated observation")));
-    }
-    let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| Forward::NotSent(http::invalid_input()))?;
-    url.set_path(path);
+    let url = owner_url(c, owner, path, None).await.map_err(Forward::NotSent)?;
     let mut request = c.client.request(method, url).bearer_auth(c.worker_token.as_str()).timeout(timeout);
     if let Some(body) = body { request = request.header("content-type", "application/json").body(serde_json::to_vec(&body).map_err(|_| Forward::NotSent(http::invalid_input()))?); }
     let lost = |timeout: bool| Forward::Lost(if timeout {
@@ -241,7 +279,8 @@ async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &st
     Ok((status, value))
 }
 
-// Start protected management routes and bounded worker polling with redirects and proxies disabled. On
+// Start protected management routes, the app proxy (path form, plus host routing below the configured
+// proxy domain) and bounded worker polling, with redirects and environment proxies disabled. On
 // shutdown, stop serving and cancel the poller.
 pub async fn run(config: ControllerConfig, token: String, worker_token: String) -> Result<(), &'static str> {
     let client = reqwest::Client::builder()
@@ -252,12 +291,19 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(30))
         .build().map_err(|_| "cannot initialize worker HTTP client")?;
+    let proxy_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_millis(config.poll.timeout_ms.min(1_000)))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build().map_err(|_| "cannot initialize worker proxy client")?;
     let controller = Controller {
         nodes: Arc::new(RwLock::new(config.workers.iter().map(|worker| CachedNode {
             node_id: worker.node_id.clone(), status: None, observed: None, error: Some("not_polled"),
         }).collect())),
         freshness: Duration::from_millis(config.poll.freshness_ms),
-        endpoints: Arc::new(config.workers.clone()), client: client.clone(), worker_token: Arc::new(worker_token),
+        endpoints: Arc::new(config.workers.clone()), client: client.clone(), proxy_client,
+        proxy_permits: Arc::new(tokio::sync::Semaphore::new(config.server.proxy.max_connections)), worker_token: Arc::new(worker_token),
         server: config.server.clone(),
         // Plain reads stay within the short route deadline.
         short_wait: Duration::from_millis(config.poll.timeout_ms.min(config.server.request_timeout_ms / 2)),
@@ -268,10 +314,12 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         .route("/v1/sandboxes", post(create))
         .route("/v1/sandboxes/{id}", get(get_sandbox).delete(delete))
         .route("/v1/sandboxes/{id}/exec", post(exec))
-        .route("/v1/sandboxes/{id}/http", post(application_http))
+        .route("/v1/sandboxes/{id}/exec/{exec_id}/kill", post(kill))
         .route("/v1/sandboxes/{id}/capture", post(capture))
         .with_state(controller.clone());
-    let app = http::protect(router, &config.server, token, 2);
+    let proxy_controller = controller.clone();
+    let proxy: http::Proxy = Arc::new(move |request| Box::pin(app_proxy(proxy_controller.clone(), request)));
+    let app = http::protect(router, &config.server, token, 2, proxy, config.proxy_domain.clone());
     let listener = tokio::net::TcpListener::bind(config.server.address(8080)).await
         .map_err(|_| "cannot bind controller listener")?;
     let worker_token = controller.worker_token.clone();

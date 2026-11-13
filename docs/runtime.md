@@ -4,11 +4,13 @@
 with runc 1.3.6 and CRIU 4.3.** The real script exercised shared EROFS/private OverlayFS,
 capture without stopping the source (pause, sealed EROFS layer, `--leave-running`),
 established loopback TCP and independent restored memory/file state, the node
-checkpoint cache, the reaping PID 1, overlapping exec, waiting concurrent DELETEs,
-admission, bounded commands, TTL/delete and crash/restart cleanup. Compilation and
-the nonprivileged HTTP smoke also passed, but are not substitutes for this gate.
-The network variant also passed inside a disposable outer network/mount namespace,
-including policy, application HTTP, listening-socket restore and helper cleanup.
+checkpoint cache, the reaping PID 1, concurrent, streamed and killed commands,
+waiting concurrent DELETEs, admission, per-command bounds that keep the sandbox,
+TTL/delete and crash/restart cleanup. Compilation and the nonprivileged HTTP smoke
+also passed, but are not substitutes for this gate. The network variant also passed
+inside a disposable outer network/mount namespace, including policy, the app proxy
+(path and host forms, streaming, binary, chunked, bounds), listening-socket restore
+and helper cleanup.
 General hostile-workload isolation, host trust, other kernels/applications,
 cross-node portability and capacity remain unqualified.
 
@@ -123,17 +125,25 @@ The script fails rather than substituting a fake runtime/result. It exercises:
 1. Actual EROFS/shared-lower and private OverlayFS blocking cold creates through the
    controller, which assigns the returned ID (template-default and explicit resources);
    direct worker same-ID replay/conflict handling and inline argv exec results.
-   Independent commands must have overlapping in-container monotonic execution
-   intervals; a conflicting same-sandbox exec/capture gets an immediate
-   `409 sandbox_busy`. A fourth reservation is rejected by the worker without writing
+   Two commands in one sandbox and one in another must have overlapping
+   in-container monotonic execution intervals, each in its own `exec-<n>` group; a
+   capture during them gets an immediate `409 sandbox_busy`; a fourth concurrent
+   command (limit 3 in the gate) gets `409 exec_limit`. Kill stops each of three
+   running commands (`exec_killed`, sandbox still running) and an unknown ID is
+   `404 exec_not_found`. Streaming mode delivers `start`, output events spread over
+   the command's run (base64, stdout and stderr), then `exit`; a streamed timeout ends
+   with `exec_timeout`. A fourth reservation is rejected by the worker without writing
    a record, and the controller reports `no_capacity`. Incompatible, symlinked,
    unknown-field, schema-2 (old per-create upper archive) and (network) unauthorized
    templates are rejected before any record; a digest-mismatched artifact is a failed
    create naming its ID. PID 1 is `/.sandbox-init` (tini), and an orphaned exec child
    leaves no zombie. A client that disconnects mid-exec leaves the command to finish
-   (or, on a bound violation, the sandbox to be terminated) with full cleanup; a
+   (or, on a bound violation, to be stopped at its deadline while the sandbox keeps
+   running) with full cleanup; a
    client that disconnects mid-create (host helpers frozen) gets its unlearnable
-   sandbox deleted with `create_response_lost`; DELETE cancels an in-flight exec;
+   sandbox deleted with `create_response_lost`; DELETE cancels an in-flight exec
+   (`sandbox_cancelled_or_expired`) and, with networking, ends an open proxied
+   stream;
    with cleanup frozen, a second DELETE waits and both return `deleted`; and a DELETE
    whose root unmount is blocked by a test-owned open file reports `cleanup_failed`,
    keeps the reservation and ownership marker, and is retried to `deleted` once the
@@ -165,8 +175,9 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    preexisting unacquired leaf must remain untouched by a failed capture, and a warm
    create with mismatching explicit resources is rejected.
 5. TTL cleanup, explicit deletion, successful exec descendant cleanup (including a
-   child that closes its stdio), deadline-triggered whole-sandbox termination and
-   output-overflow termination with bounded output, reported inline.
+   child that closes its stdio), and a deadline or output overflow (stdout only and
+   both streams) that stops only that command, with bounded output reported inline,
+   while the sandbox keeps running.
 6. One worker SIGKILL with a live owned source and an actually running blocking exec,
    then restart using the same root: records, exec child cgroup, processes and private
    mounts must reconcile. Retained warm artifacts
@@ -224,7 +235,7 @@ no automatic eviction at all).
 
 ## Explicit remaining boundaries
 
-- Literal IPv4 TCP allowlists and bounded text application HTTP are implemented;
+- Literal IPv4 TCP allowlists and the app proxy to approved service ports are implemented;
   DNS, UDP, IPv6, domain/CIDR policy, per-create endpoint overrides and arbitrary
   established external TCP connection cloning remain unsupported.
 - Seccomp follows the AgentENV container pattern: default-allow, with only io_uring
@@ -277,16 +288,21 @@ needed; the existing verified `ip` enters namespaces for same-binary helpers.
 
 The network variant retains relevant previous lifecycle cases and adds positive
 exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
-socket creation, HTTP authentication/header stripping/path validation, text body,
-redirect refusal, timeout/output bounds, capture of a sandbox holding an established
-external TCP connection and restore of a child from it, source and child restored
-listening sockets/fresh egress, the pre-created slot pool (built at start,
-reset rather than deleted on release even while a test-owned FD holds the guest
-namespace, rebuilt on restart, removed at shutdown), cleanup retry after a held root
-mount is released and HTTP-helper crash/restart cleanup. Adding `--http-limits`
-also exercises the opt-in large ceilings: an 8 MiB inline response, two concurrent
-worst-case JSON-escaped 8 MiB results, a 16 KiB escaped body, a 31-second application
-deadline beyond `request_timeout_ms`, and TTL clamping. Namespace rules, addresses,
+socket creation, capture of a sandbox holding an established external TCP
+connection and restore of a child from it, source and child restored listening
+sockets/fresh egress, the pre-created slot pool (built at start, reset rather than
+deleted on release even while a test-owned FD holds the guest namespace, rebuilt on
+restart, removed at shutdown), cleanup retry after a held root mount is released,
+and the app proxy through the controller and worker: path and host forms, the
+management token absent from the forwarded request, Host and X-Forwarded-Host,
+authentication, an unapproved port (`403`), a returned redirect, a 20,000-byte
+response header, chunked parts arriving as sent, two concurrent 32 MiB binary
+downloads, an 8 MiB binary upload counted by the guest, the worker idle timeout
+(`504 upstream_timeout`, gate value 3 s), the worker connection limit (`503 busy`
+with four connections ESTABLISHED inside the slot and none in the worker's
+namespace), a stream ended by DELETE, and a worker crash during an open stream.
+The gate configures small proxy bounds (worker four connections, 3 s idle;
+controller 6 s idle) and `proxy_domain = "sandbox.test"`. Namespace rules, addresses,
 identities and observations are retained under the test-owned root. Fixtures
 are original local code, not downloaded images. Test harness helpers are drained
 before pins/staging are discarded. Functional qualification on a development host
@@ -309,9 +325,9 @@ or performance result.
 
 `scripts/image_e2e.py` runs the owner workflow with a real OCI image instead of
 the static fixture: build a cold template from the image, create a container,
-call the HTTP server inside it, capture a warm CRIU template, restore an
-independent child from it and call the child. Everything goes through the
-controller's blocking API. It needs the same explicit approval, root, trusted
+call the HTTP server inside it through the app proxy, run streamed, concurrent,
+killed and bounded commands, capture a warm CRIU template, restore an independent
+child from it and call the child. Everything goes through the controller's API. It needs the same explicit approval, root, trusted
 root directory, delegated cgroup parent and tools as the network gate, and it
 runs in its own disposable outer network/mount namespace in the same way.
 
@@ -354,16 +370,26 @@ What the script does:
     applied: the worker always uses UID/GID 65534 and `/workspace`.
 - **Default workload.** `python3 -m http.server 8000 --bind 0.0.0.0`. Change it with
   `--init-argv` (a JSON list), `--port`, `--http-path` and `--expect-body`. The
-  template network is `tcp_allowlist` with only that service port and no egress.
+  template network is `tcp_allowlist` with that service port and the next one (for
+  the WebSocket check) and no egress. The controller uses
+  `proxy_domain = "sandbox.test"`.
 - **Lifecycle.** The script runs these steps in order:
   0. Before any create, the worker has pre-created three clean routing slots
      (loopback and uplink only, no rules in the filter chains).
-  1. Cold create, then retry the application HTTP operation until the server
-     answers 200 with the expected body. Check the init process's UID,
+  1. Cold create, then retry a GET through the app proxy (path form) until the
+     server answers 200 with the expected body. Check the init process's UID,
      capabilities and no_new_privs.
   2. Check that PID 1 is the reaping init and that a killed background exec child
      leaves no zombie. Run an exec (`--exec-argv`/`--exec-expect`) and write a random
-     marker file with the image's shell (`--shell`).
+     marker file with the image's shell (`--shell`). Then: the host form reaches the
+     same server; a streamed Python command's output arrives over 2.5 s before its
+     `exit` event; two commands overlap in one sandbox, each in its own exec group;
+     a WebSocket echo server run by a streaming command on the second port echoes a
+     text and a 70,000-byte binary message through the proxy in both forms, and the
+     kill endpoint stops it (`exec_killed`) while the HTTP server keeps answering; a
+     timeout (`sleep 30`, 500 ms) and an output overflow (`yes`, 4,096 bytes) stop
+     only their commands. Per-call overhead is measured (informational): 30 proxied
+     GETs, 30 GETs made inside the sandbox by one command, and 10 `true` commands.
   3. Capture a warm template while a probe in the sandbox's routing namespace
      requests the service port every 20 ms. The source must answer during the
      capture outside the frozen window, which a host-side watch of its cgroup
@@ -382,8 +408,9 @@ What the script does:
      and service logs must not contain the tokens.
 - **Defaults.** 256 MiB, one vCPU and 128 pids per container, at most three
   containers. PASS lines print informational timings (cold create, first HTTP
-  ready, capture and its frozen window, first and cached warm restore, first call
-  after restore). These are not
+  ready, streamed output, WebSocket handshakes, per-call overhead, capture and its
+  frozen window, first and cached warm restore, first call after restore). These
+  are not
   benchmarks. The session root keeps `prepared.json`, `image-e2e.json` and the
   service logs for inspection.
 

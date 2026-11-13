@@ -1,10 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{Request, State, rejection::JsonRejection},
-    http::{Method, StatusCode, header},
+    http::{Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -14,6 +14,10 @@ use tokio::sync::Semaphore;
 
 use crate::config::ServerConfig;
 
+// The service's app-proxy entry point: takes an authenticated path-form proxy request and streams the
+// exchange (see proxy.rs).
+pub type Proxy = Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
+
 #[derive(Clone)]
 struct Limits {
     token: Arc<String>,
@@ -22,6 +26,8 @@ struct Limits {
     timeout: Duration,
     server: ServerConfig,
     hops: u32,
+    proxy: Proxy,
+    proxy_domain: Option<Arc<String>>,
 }
 
 pub struct ApiError(pub StatusCode, pub &'static str, pub &'static str);
@@ -59,10 +65,11 @@ pub fn json<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     input.map(|Json(value)| value).map_err(|_| invalid_input())
 }
 
-// Wrap routes with authentication, request limits and deadlines, and a JSON 404 for unknown routes.
+// Wrap routes with authentication, request limits and deadlines, and a JSON 404 for unknown routes,
+// and send app-proxy requests (path form, or hosts below `proxy_domain`) to `proxy`.
 // `hops` is 1 on a worker and 2 on the controller: each forwarding layer gets one
 // extra request_timeout_ms so the inner layer reports its own timeout first.
-pub fn protect(router: Router, config: &ServerConfig, token: String, hops: u32) -> Router {
+pub fn protect(router: Router, config: &ServerConfig, token: String, hops: u32, proxy: Proxy, proxy_domain: Option<String>) -> Router {
     router
         .fallback(|| async {
             ApiError(StatusCode::NOT_FOUND, "not_found", "Unknown API route")
@@ -74,14 +81,24 @@ pub fn protect(router: Router, config: &ServerConfig, token: String, hops: u32) 
             timeout: config.timeout(),
             server: config.clone(),
             hops,
+            proxy,
+            proxy_domain: proxy_domain.map(Arc::new),
         }, guard))
 }
 
-// Require a single matching bearer token except for public health reads. Limit concurrent requests,
-// body size and body-read time; blocking routes may run for their outcome wait plus one
-// request_timeout_ms per hop, others for request_timeout_ms. Then disable response caching.
-async fn guard(State(limits): State<Limits>, request: Request, next: Next) -> Response {
-    let public_health = request.method() == Method::GET && request.uri().path() == "/healthz";
+// Rewrite a host-routed app request (`<port>-<sandbox-id>.<proxy_domain>`, any path) to the path form,
+// rejecting a malformed host below the domain. Require a single matching bearer token except for
+// public health reads. Hand app-proxy requests to the proxy unbuffered, with no route deadline and
+// their response headers untouched (the proxy bounds its own connections). For management routes,
+// limit concurrent requests, body size and body-read time; blocking routes may run for their outcome
+// wait plus one request_timeout_ms per hop, others for request_timeout_ms. Then disable response
+// caching.
+async fn guard(State(limits): State<Limits>, mut request: Request, next: Next) -> Response {
+    let routed = match limits.proxy_domain.as_deref() {
+        Some(domain) => crate::proxy::host_route(request.headers(), domain),
+        None => Ok(None),
+    };
+    let public_health = matches!(routed, Ok(None)) && request.method() == Method::GET && request.uri().path() == "/healthz";
     if !public_health {
         let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
         let provided = values.next().and_then(|value| value.to_str().ok())
@@ -92,6 +109,17 @@ async fn guard(State(limits): State<Limits>, request: Request, next: Next) -> Re
         if !authorized {
             return ApiError(StatusCode::UNAUTHORIZED, "unauthorized", "Bearer authentication required").into_response();
         }
+    }
+    match routed {
+        Err(()) => return ApiError(StatusCode::BAD_REQUEST, "invalid_input", "Invalid sandbox proxy host").into_response(),
+        Ok(Some((id, port))) => {
+            let target = request.uri().path_and_query().map(|p| p.as_str()).filter(|p| p.starts_with('/')).unwrap_or("/");
+            let Ok(uri) = format!("/v1/sandboxes/{id}/proxy/{port}{target}").parse::<Uri>() else { return invalid_input().into_response() };
+            *request.uri_mut() = uri;
+            return (limits.proxy)(request).await;
+        }
+        Ok(None) if crate::proxy::is_proxy_path(request.uri().path()) => return (limits.proxy)(request).await,
+        Ok(None) => {}
     }
     let Ok(_permit) = limits.permits.clone().try_acquire_owned() else {
         return ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy", "Request concurrency limit reached").into_response();

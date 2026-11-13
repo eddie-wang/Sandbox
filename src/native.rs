@@ -33,8 +33,28 @@ pub struct Native {
 // Where the reaping init (the trusted static tini) is bind-mounted read-only in every sandbox.
 const INIT_PATH: &str = "/.sandbox-init";
 
-// Each sandbox runs at most one exec at a time, in this fixed child cgroup.
-pub const EXEC_CGROUP: &str = "exec";
+// Each running exec gets its own child resource group `exec-<exec id>` of its sandbox.
+const EXEC_GROUP_PREFIX: &str = "exec-";
+
+// How one exec ended: its exit code (none if it was stopped or never started), why it was stopped or
+// failed, and whether its resource group could not be emptied and removed.
+pub struct ExecEnd { pub exit_code: Option<i32>, pub interrupted: bool, pub error: Option<&'static str>, pub cleanup_failed: bool }
+
+// Kill everything in a child resource group, wait up to five seconds for it to empty, then remove
+// it. A missing group is already clean.
+fn remove_group(path: &Path) -> Result<()> {
+    if !path.exists() { return Ok(()); }
+    fs::write(path.join("cgroup.kill"), "1").map_err(|_| "exec_cgroup_kill_failed")?;
+    let start = std::time::Instant::now();
+    while fs::read_to_string(path.join("cgroup.events")).map_err(|_| "exec_cgroup_unavailable")?.lines().any(|l| l == "populated 1") {
+        if start.elapsed() > Duration::from_secs(5) { return Err("exec_cgroup_still_populated"); }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match fs::remove_dir(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err("exec_cgroup_remove_failed"),
+        _ => Ok(()),
+    }
+}
 
 const TOOL_NAMES: &[&str] = &["runc", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini"];
 
@@ -462,27 +482,49 @@ impl Native {
             "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
         self.ensure_running(id)
     }
-    // Create the fixed child resource group for the sandbox's one running exec.
-    pub fn create_exec_cgroup(&self, id: &str) -> Result<()> {
-        fs::create_dir(Path::new(&self.config.cgroup_parent).join(id).join(EXEC_CGROUP)).map_err(|_| "exec_cgroup_create_failed")
+    // Run one command with runc exec in its own child resource group `exec-<exec>` of the sandbox,
+    // passing output chunks to `sink` as they arrive (true marks stderr). Its deadline, combined output
+    // limit and `stop` reason end only this command: its group is killed, never the sandbox. When it
+    // ends, whatever is left in the group (background children) is killed and the group and process
+    // file are removed.
+    pub fn exec(&self, id: &str, exec: u64, argv: Vec<String>, timeout: Duration, limit: usize, sink: &mut dyn FnMut(bool, &[u8]), stop: &dyn Fn() -> Option<&'static str>) -> ExecEnd {
+        let group = Path::new(&self.config.cgroup_parent).join(id).join(format!("{EXEC_GROUP_PREFIX}{exec}"));
+        let file = self.private(id).join(format!("{EXEC_GROUP_PREFIX}{exec}.json"));
+        let result = fs::create_dir(&group).map_err(|_| "exec_cgroup_create_failed")
+            .and_then(|_| process::atomic_json(&file, &self.process_spec(argv)))
+            .and_then(|_| {
+                let args = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), "/dev/null".into(), "exec".into(),
+                    "--cgroup".into(), format!("{EXEC_GROUP_PREFIX}{exec}"), "--process".into(), file.display().to_string(), id.into()];
+                let kill = || { let _ = fs::write(group.join("cgroup.kill"), "1"); };
+                self.helpers.stream(self.tool("runc")?, &args, timeout, limit, &self.search_path, sink, stop, &kill)
+            });
+        let _ = fs::remove_file(&file);
+        let cleanup = remove_group(&group);
+        let (exit_code, interrupted, error) = match result {
+            Ok(done) => (done.exit_code, done.stopped.is_some(), done.stopped),
+            Err(e) => (None, false, Some(e)),
+        };
+        ExecEnd { exit_code, interrupted, error: error.or(cleanup.err()), cleanup_failed: cleanup.is_err() }
     }
-    // Kill everything in the exec resource group, wait up to five seconds for it to empty, then remove
-    // it. A missing group is already clean.
-    pub fn cleanup_exec_cgroup(&self, id: &str) -> Result<()> {
-        let path = Path::new(&self.config.cgroup_parent).join(id).join(EXEC_CGROUP);
-        if !path.exists() { return Ok(()); }
-        fs::write(path.join("cgroup.kill"), "1").map_err(|_| "exec_cgroup_kill_failed")?;
-        let start = std::time::Instant::now();
-        while fs::read_to_string(path.join("cgroup.events")).map_err(|_| "exec_cgroup_unavailable")?.lines().any(|l| l == "populated 1") {
-            if start.elapsed() > Duration::from_secs(5) { return Err("exec_cgroup_still_populated"); }
-            std::thread::sleep(Duration::from_millis(20));
+    // Remove every leftover exec resource group of a sandbox after killing its processes. Any other
+    // child group is unknown state and fails closed.
+    fn remove_exec_groups(&self, id: &str) -> Result<()> {
+        let cgroup = Path::new(&self.config.cgroup_parent).join(id);
+        if !cgroup.exists() { return Ok(()); }
+        for entry in fs::read_dir(&cgroup).map_err(|_| "cgroup_scan_failed")? {
+            let entry = entry.map_err(|_| "cgroup_scan_failed")?;
+            if !entry.file_type().map_err(|_| "cgroup_scan_failed")?.is_dir() { continue; }
+            let name = entry.file_name();
+            let known = name.to_str().and_then(|n| n.strip_prefix(EXEC_GROUP_PREFIX)).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if !known { return Err("untracked_cgroup_state"); }
+            remove_group(&entry.path())?;
         }
-        fs::remove_dir(path).map_err(|_| "exec_cgroup_remove_failed")
+        Ok(())
     }
-    // Tear down everything a sandbox owns: kill its processes and exec group, delete runc state, wait
-    // for and remove its resource group, return its network slot to the pool and remove its guest
-    // network, unmount its root and delete private files. Stop at the first failure so the caller can
-    // retry.
+    // Tear down everything a sandbox owns: kill its processes and remove its exec groups, delete runc
+    // state, wait for and remove its resource group, return its network slot to the pool and remove its
+    // guest network, unmount its root and delete private files. Stop at the first failure so the caller
+    // can retry.
     pub fn cleanup(&self, id: &str, network_slot: Option<usize>) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
@@ -490,7 +532,7 @@ impl Native {
         if cgroup.exists() {
             fs::write(cgroup.join("cgroup.kill"), "1").map_err(|_| "cgroup_kill_failed")?;
         }
-        self.cleanup_exec_cgroup(id)?;
+        self.remove_exec_groups(id)?;
         let state_dir = self.root().join("runc").join(id);
         if state_dir.exists() { self.runc_checked(vec!["delete".into(), "--force".into(), id.into()])?; }
         if cgroup.exists() {

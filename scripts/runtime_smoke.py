@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Explicitly privileged, real lifecycle gate. Never runs from the foundation smoke.
 
-Every management call is blocking: create/exec/HTTP/capture/delete responses carry
-the real outcome. The controller chooses the owner and returns the sandbox ID.
+Every management call is blocking: create/exec/kill/capture/delete responses carry
+the real outcome (streaming exec sends its output as it arrives). App traffic goes
+through the controller's reverse proxy. The controller chooses the owner and returns
+the sandbox ID.
 """
 import argparse
+import base64
 import concurrent.futures
 import hashlib
 import http.client
@@ -20,7 +23,7 @@ import socket
 import stat
 import threading
 
-from smoke import eventually, expect, port, request as smoke_request
+from smoke import eventually, exchange, exec_events, expect, port, request as smoke_request
 
 
 # Runs the worker's read-only preflight for this config and returns the host
@@ -115,15 +118,15 @@ def write_template(root, manifest):
 
 
 # Run the privileged lifecycle gate: build the fixture template, start a real worker and controller,
-# and drive cold create, reaping PID 1, exec, rejections, disconnects, waiting DELETEs, non-stopping
-# capture with sealed layers and established loopback TCP, cached warm restore, bounds, TTL and restart
-# cleanup through the blocking API. --network adds policy networking and application HTTP. Retain the
-# root and observations, then require no owned state to remain.
+# and drive cold create, reaping PID 1, concurrent, streamed and killed execs, per-command bounds,
+# rejections, disconnects, waiting DELETEs, non-stopping capture with sealed layers and established
+# loopback TCP, cached warm restore, TTL and restart cleanup through the blocking API. --network adds
+# policy networking and the app proxy. Retain the root and observations, then require no owned state
+# to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
     parser.add_argument("--network", action="store_true", help="Only inside network_smoke.py disposable outer namespace")
-    parser.add_argument("--http-limits", action="store_true", help="Also exercise opt-in large inline text HTTP results")
     parser.add_argument("--binary", default="target/debug/sandboxd")
     parser.add_argument("--root", required=True, help="Existing trusted directory on ext4/XFS/Btrfs; retained for inspection")
     parser.add_argument("--cgroup-parent", required=True, help="Existing empty delegated domain; cpu memory pids already enabled")
@@ -138,14 +141,6 @@ def main():
         parser.error("requires explicit opt-in and administrator execution on an approved host")
     if args.network and os.environ.get("SANDBOX_TEST_OUTER_NETNS") != os.readlink("/proc/self/ns/net"):
         parser.error("network tests require the disposable outer namespace harness")
-    if args.http_limits and not args.network:
-        parser.error("large HTTP qualification requires the disposable network harness")
-    server_limits = ('''request_timeout_ms = 5000
-max_body_bytes = 131072
-[server.application_http]
-max_body_bytes = 16384
-max_response_bytes = 8388608
-max_timeout_ms = 600000''' if args.http_limits else 'request_timeout_ms = 5000')
     binary = str(Path(args.binary).resolve())
     parent = Path(args.root).resolve(strict=True)
     cgroup = Path(args.cgroup_parent).resolve(strict=True)
@@ -168,7 +163,10 @@ max_timeout_ms = 600000''' if args.http_limits else 'request_timeout_ms = 5000')
 runtimes = ["runc_criu"]
 [server]
 listen = "127.0.0.1:{worker_port}"
-{server_limits}
+request_timeout_ms = 5000
+[server.proxy]
+max_connections = 4
+idle_timeout_ms = 3000
 [auth]
 env = "SANDBOX_WORKER_TOKEN"
 [capacity]
@@ -185,6 +183,7 @@ cpu_overcommit = 3
 pids_max = 64
 max_records = 48
 max_concurrent_operations = 4
+max_execs_per_sandbox = 3
 max_artifact_bytes = 67108864
 command_timeout_seconds = 30
 ''')
@@ -200,9 +199,13 @@ egress = [{ip="198.18.0.1", port=18080}, {ip="198.19.0.2", port=18080}, {ip="198
 service_ports = [8080]
 ''')
     controller_config = root / "controller.toml"
-    controller_config.write_text(f'''[server]
+    controller_config.write_text(f'''proxy_domain = "sandbox.test"
+[server]
 listen = "127.0.0.1:{controller_port}"
-{server_limits}
+request_timeout_ms = 5000
+[server.proxy]
+max_connections = 16
+idle_timeout_ms = 6000
 [auth]
 env = "SANDBOX_CONTROLLER_TOKEN"
 [worker_auth]
@@ -329,9 +332,24 @@ url = "http://127.0.0.1:{worker_port}"
         assert result["exit_code"] == 0 and not result["interrupted"] and result["error"] is None and result["sandbox_state"] == "running", result
         return result["stdout"]
 
-    # Make an application HTTP call through the controller and return the raw status and result.
-    def http_call(sandbox, body):
-        return request(controller_port, f"/v1/sandboxes/{sandbox}/http", token, body, "POST")
+    # Send one app request to a sandbox port through the controller's proxy (path form, or the host form
+    # `<port>-<id>.sandbox.test`) and return the status, headers and body bytes.
+    def proxy_call(sandbox, method, path, body=None, headers=None, port_number=8080, host_form=False, authorized=True, timeout=60):
+        headers = dict(headers or {})
+        if authorized:
+            headers["Authorization"] = "Bearer " + token
+        if host_form:
+            headers["Host"] = f"{port_number}-{sandbox}.sandbox.test"
+        target = path if host_form else f"/v1/sandboxes/{sandbox}/proxy/{port_number}{path}"
+        return exchange(controller_port, method, target, headers, body, timeout)
+
+    # Require a proxied call to fail with the given status and error code.
+    def proxy_error(result, status, code):
+        assert result[0] == status and json.loads(result[2])["error"]["code"] == code, result
+
+    # Kill a running command through the controller and return the raw status and result.
+    def kill_call(sandbox, exec_id):
+        return request(controller_port, f"/v1/sandboxes/{sandbox}/exec/{exec_id}/kill", token, method="POST")
 
     # Ask the controller to capture a sandbox as a template and return the raw status and result.
     def capture(sandbox, template_id):
@@ -374,10 +392,13 @@ url = "http://127.0.0.1:{worker_port}"
         thread.start()
         return thread, box
 
-    # Report whether a command is currently running in the sandbox's exec cgroup.
+    # Return the per-command resource groups (`exec-<id>`) that currently exist in a sandbox.
+    def exec_groups(sandbox):
+        return sorted(p.name for p in (cgroup / sandbox).glob("exec-*") if p.is_dir()) if (cgroup / sandbox).exists() else []
+
+    # Report whether a command is currently running in one of the sandbox's exec groups.
     def exec_cgroup_populated(sandbox):
-        events = cgroup / sandbox / "exec" / "cgroup.events"
-        return events.exists() and "populated 1" in events.read_text()
+        return any("populated 1" in (cgroup / sandbox / name / "cgroup.events").read_text() for name in exec_groups(sandbox))
 
     # Send a raw exec request to the controller and close the connection once the command is running.
     def disconnect_mid_exec(sandbox, body):
@@ -443,23 +464,53 @@ url = "http://127.0.0.1:{worker_port}"
         observations["pid1_reaping_init"] = True
         isolated = create(memory_mib=64, vcpus=1)
         observations["create_explicit_and_template_default_resources"] = True
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(execute, source, "delay")
-            second = pool.submit(execute, isolated, "delay")
-            eventually(lambda: exec_cgroup_populated(source), timeout=10)
+        # Several commands run at once in one sandbox (and in another), each in its own exec group.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            commands = [pool.submit(execute, source, "delay"), pool.submit(execute, source, "delay"), pool.submit(execute, isolated, "delay")]
+            eventually(lambda: len(exec_groups(source)) == 2, timeout=10)
+            groups_seen = exec_groups(source)
             started = time.monotonic()
-            expect(exec_call(source, ["/fixture", "counter"]), 409, "sandbox_busy")
+            # A third command in the same sandbox still runs (limit 3); capture is refused while commands run.
+            assert execute(source, "counter")
             expect(capture(source, "busy-capture"), 409, "sandbox_busy")
-            assert time.monotonic() - started < 2, "conflicting same-sandbox request waited instead of failing fast"
-            begin_a, end_a = map(int, first.result(timeout=15).split())
-            begin_b, end_b = map(int, second.result(timeout=15).split())
-        assert max(begin_a, begin_b) < min(end_a, end_b), "independent workloads were serialized"
-        assert not (root / "templates" / "busy-capture").exists()
-        observations["overlapping_exec_monotonic_ns"] = [[begin_a, end_a], [begin_b, end_b]]
-        observations["same_sandbox_conflict_rejected_immediately"] = True
+            assert time.monotonic() - started < 2, "a conflicting capture waited instead of failing fast"
+            spans = [tuple(map(int, command.result(timeout=15).split())) for command in commands]
+        assert max(begin for begin, _ in spans) < min(end for _, end in spans), "concurrent commands were serialized"
+        assert not (root / "templates" / "busy-capture").exists() and exec_groups(source) == []
+        observations["concurrent_exec_monotonic_ns"] = spans
+        observations["concurrent_exec_groups"] = groups_seen
+        # The per-sandbox command limit (3 here) refuses a fourth running command at once.
+        hangs = [in_background(lambda: exec_call(source, ["/fixture", "hang"], timeout_ms=20000)) for _ in range(3)]
+        eventually(lambda: len(exec_groups(source)) == 3 and exec_cgroup_populated(source), timeout=10)
+        expect(exec_call(source, ["/fixture", "counter"]), 409, "exec_limit")
+        # Kill stops one command by its ID and answers after it ended; the command reports exec_killed and
+        # the sandbox keeps running.
+        for name in exec_groups(source):
+            killed = expect(kill_call(source, int(name.split("-")[1])), 200)
+            assert killed["state"] == "exited" and killed["exec_id"] == int(name.split("-")[1]), killed
+            assert name not in exec_groups(source)
+        for thread, box in hangs:
+            thread.join(timeout=15)
+            code, result = box["result"]
+            assert code == 200 and result["interrupted"] and result["error"] == "exec_killed" and result["exit_code"] is None and result["sandbox_state"] == "running", result
+        expect(kill_call(source, 999999), 404, "exec_not_found")
+        observations["exec_limit_and_kill"] = True
+        # Streaming mode: output events arrive while the command runs, then the exit event.
+        status, events = exec_events(controller_port, f"/v1/sandboxes/{source}/exec", token, dict(argv=["/fixture", "ticks"], timeout_ms=5000, max_output_bytes=4096))
+        assert status == 200 and events[0][1] == "start" and events[-1][1] == "exit", events
+        assert b"".join(base64.b64decode(data["data"]) for _, name, data in events if name == "stdout") == b"".join(f"tick {i}\n".encode() for i in range(5))
+        arrivals = [at for at, name, _ in events if name == "stdout"]
+        assert arrivals[-1] - arrivals[0] >= 0.6, "streamed output arrived only at the end"
+        assert events[-1][2] == {"exit_code": 0, "interrupted": False, "error": None, "sandbox_state": "running"}, events[-1]
+        status, events = exec_events(controller_port, f"/v1/sandboxes/{source}/exec", token, dict(argv=["/fixture", "dual-output"], timeout_ms=5000, max_output_bytes=262144))
+        streams = {name: b"".join(base64.b64decode(data["data"]) for _, kind, data in events if kind == name) for name in ("stdout", "stderr")}
+        assert status == 200 and streams == {"stdout": b"o" * 131072, "stderr": b"e" * 131072} and events[-1][2]["exit_code"] == 0
+        status, events = exec_events(controller_port, f"/v1/sandboxes/{source}/exec", token, dict(argv=["/fixture", "hang"], timeout_ms=300, max_output_bytes=1024))
+        assert status == 200 and events[-1][2] == {"exit_code": None, "interrupted": True, "error": "exec_timeout", "sandbox_state": "running"}, events
+        observations["streaming_exec_spread_s"] = round(arrivals[-1] - arrivals[0], 3)
         execute(source, "orphan")
-        assert not any(path.is_dir() for path in (cgroup / source).iterdir()), "exec descendants/cgroup survived successful command"
-        print("PASS blocking cold create, inline exec results, overlapping independent commands and immediate same-sandbox 409")
+        assert exec_groups(source) == [], "exec descendants/cgroup survived successful command"
+        print("PASS blocking cold create, concurrent commands in one sandbox (own groups), command limit, kill, streamed output and immediate capture 409")
 
         before_dirs = {name: sorted(p.name for p in (root / name).iterdir()) for name in ("private", "runc")}
         rejected_templates = ["incompatible", "symlinked", "unknown-metadata", "old-schema"] + (["policy-not-authorized", "unsupported-policy"] if args.network else [])
@@ -511,14 +562,14 @@ url = "http://127.0.0.1:{worker_port}"
         # A client that disconnects mid-exec leaves no orphan: the command still runs
         # to completion with normal exec-cgroup cleanup, then the sandbox is free again.
         disconnect_mid_exec(source, dict(argv=["/fixture", "delay"], timeout_ms=5000, max_output_bytes=1024))
-        eventually(lambda: not (cgroup / source / "exec").exists(), timeout=15)
-        # The finished job releases the sandbox shortly after its exec cgroup is gone.
-        eventually(lambda: exec_call(source, ["/fixture", "counter"])[0] == 200, timeout=10)
-        # A disconnected bound-violating exec still terminates and cleans its sandbox.
+        eventually(lambda: exec_groups(source) == [], timeout=15)
+        expect(exec_call(source, ["/fixture", "counter"]), 200)
+        # A disconnected bound-violating command is still stopped at its deadline; only its group goes.
         doomed = create()
         disconnect_mid_exec(doomed, dict(argv=["/fixture", "hang"], timeout_ms=1500, max_output_bytes=1024))
-        eventually(lambda: get(doomed)["state"] == "deleted", timeout=30)
-        gone(doomed)
+        eventually(lambda: exec_groups(doomed) == [], timeout=15)
+        assert get(doomed)["state"] == "running" and execute(doomed, "counter")
+        remove(doomed)
         observations["client_disconnect_mid_exec_no_orphan"] = True
         # A client that disconnects mid-create can never learn the generated ID, so
         # the worker deletes the sandbox when its create reply is undeliverable.
@@ -547,17 +598,32 @@ url = "http://127.0.0.1:{worker_port}"
         assert get(lost)["error"] == "create_response_lost"
         gone(lost)
         observations["client_disconnect_mid_create_deleted"] = lost
-        # DELETE cancels an in-flight exec of the same sandbox and returns after cleanup.
+        # DELETE cancels an in-flight exec (and, with networking, an open proxied stream) of the same
+        # sandbox and returns after cleanup.
         cancelled = create()
         thread, box = in_background(lambda: exec_call(cancelled, ["/fixture", "hang"], timeout_ms=30000))
         eventually(lambda: exec_cgroup_populated(cancelled), timeout=10)
+        if args.network:
+            stream = http.client.HTTPConnection("127.0.0.1", controller_port, timeout=30)
+            stream.request("GET", f"/v1/sandboxes/{cancelled}/proxy/8080/chunked/60/200", headers={"Authorization": "Bearer " + token})
+            streamed = stream.getresponse()
+            assert streamed.status == 200 and streamed.readline() == b"part-0\n"
         started = time.monotonic()
         remove(cancelled)
         assert time.monotonic() - started < 20
         thread.join(timeout=30)
         code, result = box["result"]
-        assert code != 200 or result["sandbox_state"] != "running", result
+        assert code == 200 and result["interrupted"] and result["error"] == "sandbox_cancelled_or_expired" and result["sandbox_state"] != "running", result
         observations["delete_cancels_inflight_exec"] = {"delete_seconds": round(time.monotonic() - started, 3), "exec_status": code}
+        if args.network:
+            try:
+                rest = streamed.read()
+                ended = "complete" if rest.endswith(b"part-59\n") else "truncated"
+            except (http.client.HTTPException, OSError):
+                ended = "reset"
+            stream.close()
+            assert ended != "complete" and time.monotonic() - started < 12, ended
+            observations["delete_ends_open_proxy_stream"] = ended
         # A second concurrent DELETE waits for the first cleanup and gets its result.
         waited = create()
         delete_call = lambda: request(controller_port, f"/v1/sandboxes/{waited}", token, method="DELETE")
@@ -611,13 +677,17 @@ url = "http://127.0.0.1:{worker_port}"
         links = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "link", "show"], check=True, capture_output=True, timeout=5)
         assert sorted(link["ifname"] for link in json.loads(links.stdout)) == (["eth0", "lo"] if args.network else ["lo"])
         if not args.network:
+            # An isolated template approves no service port, so the proxy refuses it.
+            proxy_error(proxy_call(source, "GET", "/"), 403, "service_port_not_authorized")
             # The worker-created isolated guest namespace has loopback only: no routes either.
             routes = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "route", "show", "table", "main"], check=True, capture_output=True, timeout=5)
             assert json.loads(routes.stdout or b"[]") == []
             assert Path(json.loads((root / "private" / source / "config.json").read_text())["linux"]["namespaces"][2]["path"]).exists()
-        # Record owned network state and exercise allowed/denied TCP, path-MTU discovery and application
-        # HTTP. With full, also check authentication, invalid and unapproved requests and bounded HTTP
-        # failures while requiring the sandbox to remain running. Return True.
+        # Record owned network state and exercise allowed/denied TCP, path-MTU discovery and the app proxy
+        # (path and host forms). With full, also check authentication, an unapproved port, real
+        # statuses and headers, binary and chunked streaming in both directions, the idle timeout and
+        # the connection limit, with the connections opened inside the routing slot only, while
+        # requiring the sandbox to remain running. Return True.
         def network_gate(sandbox, full=False):
             config_json = json.loads((root / "private" / sandbox / "config.json").read_text())
             guest = Path(config_json["linux"]["namespaces"][2]["path"]).name
@@ -652,22 +722,71 @@ url = "http://127.0.0.1:{worker_port}"
                     result=transfer, counter_before=before_packets, counter_after=after_packets, blackhole_probing=0))
             for destination, port_number in [("198.19.0.2", "18081"), ("198.19.0.4", "18080")]:
                 assert "connected=0" in execute(sandbox, "connect", destination, port_number, "0")
-            body = dict(port=8080, method="POST", path="/headers?test=1", headers={"content-type":"text/plain"}, body="request-text", timeout_ms=2000, max_response_bytes=4096)
-            result = expect(http_call(sandbox, body), 200)
-            assert result["status"] == 200 and "request-text" in result["body"]
-            assert "authorization:" not in result["body"].lower() and token not in result["body"] and worker_token not in result["body"]
+            # The app proxy reaches the approved service port through the controller and the worker.
+            status, headers, body = proxy_call(sandbox, "POST", "/headers?test=1", b"request-text", {"Content-Type": "text/plain"})
+            assert status == 200 and body.startswith(b"POST /headers?test=1 HTTP/1.1\r\n") and body.endswith(b"request-text"), body[:300]
+            lowered = body.lower()
+            assert b"\r\nauthorization:" not in lowered and token.encode() not in body and worker_token.encode() not in body
+            assert b"\r\nhost: 192.0.2.2:8080\r\n" in lowered and f"\r\nx-forwarded-host: 127.0.0.1:{controller_port}\r\n".encode() in lowered, body[:600]
+            status, _, body = proxy_call(sandbox, "GET", "/via-host?x=1", host_form=True)
+            assert status == 200 and body.startswith(b"GET /via-host?x=1 HTTP/1.1\r\n") and f"\r\nx-forwarded-host: 8080-{sandbox}.sandbox.test\r\n".encode() in body.lower()
             if full:
-                expect(request(controller_port, f"/v1/sandboxes/{sandbox}/http", body=body, method="POST"), 401, "unauthorized")
-                for changes in [dict(path="http://198.18.0.1/"), dict(path="//198.18.0.1/"), dict(headers={"authorization":"secret"}), dict(body="x"*(16385 if args.http_limits else 8193)), dict(max_response_bytes=8388609 if args.http_limits else 65537), dict(operation_id="removed")]:
-                    expect(http_call(sandbox, dict(body, **changes)), 400, "invalid_input")
-                expect(http_call(sandbox, dict(body, port=8081)), 403, "service_port_not_authorized")
-                assert expect(http_call(sandbox, dict(body, path="/redirect")), 200)["status"] == 302
-                for changes in [dict(path="/slow", timeout_ms=50), dict(path="/large", max_response_bytes=128), dict(path="/binary"), dict(path="/headers-large")]:
-                    expect(http_call(sandbox, dict(body, **changes)), 502, "application_http_failed_or_bounded")
+                proxy_error(proxy_call(sandbox, "GET", "/", authorized=False), 401, "unauthorized")
+                proxy_error(proxy_call(sandbox, "GET", "/", port_number=8081), 403, "service_port_not_authorized")
+                status, headers, _ = proxy_call(sandbox, "GET", "/redirect")
+                assert status == 302 and headers["location"] == "http://198.18.0.2:18080/", "redirects are returned, not followed"
+                status, headers, _ = proxy_call(sandbox, "GET", "/headers-large")
+                assert status == 200 and headers["x-large"] == "a" * 20000
+                assert proxy_call(sandbox, "GET", "/binary")[2] == b"\xff"
+                # Chunked parts reach the client as the guest sends them.
+                connection = http.client.HTTPConnection("127.0.0.1", controller_port, timeout=10)
+                started = time.monotonic()
+                connection.request("GET", f"/v1/sandboxes/{sandbox}/proxy/8080/chunked/5/300", headers={"Authorization": "Bearer " + token})
+                response = connection.getresponse()
+                arrivals = []
+                for _ in range(5):
+                    line = response.readline()
+                    arrivals.append((round(time.monotonic() - started, 3), line))
+                assert response.read() == b"" and [line for _, line in arrivals] == [f"part-{i}\n".encode() for i in range(5)]
+                assert arrivals[-1][0] - arrivals[0][0] >= 1.0 and response.getheader("Transfer-Encoding") == "chunked", arrivals
+                connection.close()
+                # Two concurrent 32 MiB binary downloads and an 8 MiB binary upload stream through unchanged.
+                size = 32 << 20
+                expected = (bytes(range(251)) * (size // 251 + 1))[:size]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    downloads = list(pool.map(lambda _: proxy_call(sandbox, "GET", f"/pattern/{size}"), range(2)))
+                assert all(d[0] == 200 and d[1]["content-length"] == str(size) and d[2] == expected for d in downloads)
+                upload = os.urandom(8 << 20)
+                fnv = 1469598103934665603
+                for byte in upload:
+                    fnv = ((fnv ^ byte) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+                status, _, body = proxy_call(sandbox, "POST", "/count", upload, {"Content-Type": "application/octet-stream"})
+                assert status == 200 and body == f"bytes={len(upload)} fnv={fnv:016x}".encode(), body
+                # Every proxied connection was opened inside the routing slot: none in this namespace.
+                assert not any(row.split()[2] == "020200C0:1F90" for row in Path("/proc/net/tcp").read_text().splitlines()[1:]), "guest connection in the worker namespace"
+                # Nothing for longer than the worker idle timeout (3 s) is a 504; the sandbox keeps running.
+                proxy_error(proxy_call(sandbox, "GET", "/delay/4000"), 504, "upstream_timeout")
+                eventually(lambda: proxy_call(sandbox, "GET", "/")[0] == 200, timeout=30)
+                # The worker allows four open exchanges; a fifth is refused at once.
+                held = [in_background(lambda: proxy_call(sandbox, "GET", "/delay/2500")) for _ in range(4)]
+                # The open exchanges are ESTABLISHED connections to the guest port inside the slot.
+                def guest_connections():
+                    rows = subprocess.check_output(["ip", "netns", "exec", slot, "cat", "/proc/net/tcp"], text=True, timeout=5).splitlines()[1:]
+                    return sum(1 for row in rows if row.split()[2] == "020200C0:1F90" and row.split()[3] == "01")
+                eventually(lambda: guest_connections() >= 4, timeout=10)
+                started = time.monotonic()
+                proxy_error(proxy_call(sandbox, "GET", "/"), 503, "busy")
+                assert time.monotonic() - started < 2
+                for thread, _ in held:
+                    thread.join(timeout=30)
+                assert {box["result"][0] for _, box in held} <= {200, 504}
+                eventually(lambda: proxy_call(sandbox, "GET", "/")[0] == 200, timeout=40)
+                observations.setdefault("proxy_full", {})[sandbox] = dict(chunk_arrivals_s=[at for at, _ in arrivals], download_bytes=size, upload_bytes=len(upload),
+                    held_results=sorted(box["result"][0] for _, box in held))
                 assert get(sandbox)["state"] == "running"
             return True
         if args.network:
-            observations["network_and_http_before_capture"] = network_gate(source, True)
+            observations["network_and_proxy_before_capture"] = network_gate(source, True)
             # An ESTABLISHED external connection no longer blocks capture
             # (--tcp-established). The source keeps it; a child restores its socket
             # with the same fixed guest IP (the remote peer is not cloned).
@@ -817,17 +936,17 @@ url = "http://127.0.0.1:{worker_port}"
         dual = expect(exec_call(bounded, ["/fixture", "dual-output"], timeout_ms=2000, max_output_bytes=262144), 200)
         assert dual["stdout"] == "o"*131072 and dual["stderr"] == "e"*131072
         observations["exec_both_streams_drained"] = True
+        # A timeout or output overflow stops only that command group; the sandbox keeps running.
         result = expect(exec_call(bounded, ["/fixture", "hang"], timeout_ms=100, max_output_bytes=1024), 200)
-        assert result["interrupted"] and result["error"] == "exec_deadline_or_output_limit" and result["sandbox_state"] == "deleted"
-        assert get(bounded)["state"] == "deleted"
-        gone(bounded)
+        assert result["interrupted"] and result["error"] == "exec_timeout" and result["exit_code"] is None and result["sandbox_state"] == "running", result
         for command in ("flood", "flood-both"):
-            flooding = create()
-            result = expect(exec_call(flooding, ["/fixture", command], timeout_ms=1000, max_output_bytes=128), 200)
-            assert result["interrupted"] and result["error"] == "exec_deadline_or_output_limit" and result["sandbox_state"] == "deleted"
+            result = expect(exec_call(bounded, ["/fixture", command], timeout_ms=1000, max_output_bytes=128), 200)
+            assert result["interrupted"] and result["error"] == "exec_output_limit" and result["sandbox_state"] == "running", result
             assert len(result["stdout"].encode()) + len(result["stderr"].encode()) <= 128
-            gone(flooding)
-        print("PASS configured cgroup limits, namespace separation, seccomp checkpoint guards, TTL and inline bounded exec teardown")
+        assert get(bounded)["state"] == "running" and exec_groups(bounded) == [] and execute(bounded, "counter")
+        remove(bounded)
+        observations["exec_bound_violation_keeps_sandbox"] = True
+        print("PASS configured cgroup limits, namespace separation, seccomp checkpoint guards, TTL and per-command bounds that keep the sandbox")
 
         pending_thread, _ = in_background(lambda: exec_call(source, ["/fixture", "hang"], timeout_ms=60000, max_output_bytes=1024))
         eventually(lambda: exec_cgroup_populated(source), timeout=10)
@@ -880,42 +999,26 @@ url = "http://127.0.0.1:{worker_port}"
         assert not any(helpers.glob("command-*"))
         observations["restart_host_helper"]["drained_before_ready"] = True
         if args.network:
-            http_restart = create("warm")
-            (helpers / "cgroup.freeze").write_text("1")
-            http_thread, _ = in_background(lambda: http_call(http_restart, dict(port=8080, method="GET", path="/", timeout_ms=30000, max_response_bytes=4096)))
-            eventually(lambda: any("populated 1" in p.read_text() for p in helpers.glob("command-*/cgroup.events")), timeout=10)
+            # A worker crash during an open proxied exchange: the client gets an error, and the restarted
+            # worker deletes the sandbox before it is ready.
+            proxy_restart = create("warm")
+            # Return the streamed answer, or the transport error that ends it when the worker dies.
+            def interrupted_stream():
+                try:
+                    return proxy_call(proxy_restart, "GET", "/chunked/40/200", timeout=30)
+                except (http.client.HTTPException, OSError) as error:
+                    return (None, {}, type(error).__name__.encode())
+            proxy_thread, proxy_box = in_background(interrupted_stream)
+            eventually(lambda: tracked_connections(slot_of(proxy_restart)) > 0, timeout=10)
+            time.sleep(0.5)
             kill_and_restart_worker()
-            http_thread.join(timeout=10)
-            assert get(http_restart)["state"] == "deleted" and not any(helpers.glob("command-*"))
-            gone(http_restart)
-            observations["restart_http_helper_reconciled"] = True
-        print("PASS worker crash during exec/capture/HTTP: host-helper drain and cleanup before ready; retained-template restore")
-        if args.http_limits:
-            plain = create(ttl=180)
-            escaped = create(ttl=180)
-            large = dict(port=8080, method="GET", path="/sized/8388608/120", timeout_ms=10000, max_response_bytes=8388608)
-            assert expect(http_call(plain, large), 200)["body"] == "x"*8388608
-            result = expect(http_call(plain, dict(large, method="POST", path="/body-size", body="\u0000"*16384, max_response_bytes=128)), 200)
-            assert result["body"] == "body_bytes=16384", "escaped request envelope or body was truncated"
-            expect(http_call(plain, dict(large, path="/sized/8388609/120")), 502, "application_http_failed_or_bounded")
-            expect(http_call(plain, dict(large, timeout_ms=600001)), 400, "invalid_input")
-            # Two worst-case escaped results in different sandboxes are carried inline concurrently.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(lambda sandbox: expect(http_call(sandbox, dict(large, path="/sized/8388608/0")), 200), (plain, escaped)))
-            assert all(r["body"] == "\u0000"*8388608 for r in results)
-            # A deadline beyond request_timeout_ms (5 s) is covered by the route deadline.
-            started = time.monotonic()
-            long_call = expect(http_call(plain, dict(large, path="/delay/31000", timeout_ms=35000, max_response_bytes=4096)), 200)
-            assert long_call["status"] == 200 and time.monotonic() - started >= 31
-            remove(plain)
-            remove(escaped)
-            expiring_http = create(ttl=3)
-            started = time.monotonic()
-            code, _ = http_call(expiring_http, dict(large, path="/delay/31000", timeout_ms=600000, max_response_bytes=128))
-            assert code in (500, 502) and time.monotonic() - started < 10, "HTTP deadline was not clamped to TTL"
-            observations["opt_in_http_limits"] = {"raw_response_bytes": 8388608, "escaped_inline_concurrent": True,
-                                                   "request_body_bytes": 16384, "long_deadline_seconds": 31, "ttl_clamped": True}
-            print("PASS opt-in inline HTTP raw/escaped bounds, concurrent worst-case results, long deadline and TTL clamp")
+            proxy_thread.join(timeout=15)
+            assert proxy_box["result"][0] != 200 or not proxy_box["result"][2].endswith(b"part-39\n"), proxy_box
+            observations["restart_inflight_proxy_client_saw"] = proxy_box["result"][0] or proxy_box["result"][2].decode()
+            assert get(proxy_restart)["state"] == "deleted" and not any(helpers.glob("command-*"))
+            gone(proxy_restart)
+            observations["restart_inflight_proxy_reconciled"] = True
+        print("PASS worker crash during exec/capture/proxy: host-helper drain and cleanup before ready; retained-template restore")
     finally:
         if helpers.exists():
             (helpers / "cgroup.freeze").write_text("0")

@@ -52,9 +52,10 @@ static void loopback_pair(int *client, int *server) {
         || setsockopt(*server, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) fail("loopback timeout");
 }
 /* Dispatch the smoke workload modes: persistent counter/mappings, a loopback TCP round trip and */
-/* optional HTTP service, file operations, process-group, PID 1, zombie, isolation and syscall-guard */
-/* checks, TCP connect and path-MTU transfer, or deliberate delay/output/descendant cases. Return */
-/* each check's result; init and stress modes keep running until stopped. */
+/* optional HTTP service (echo, sized, binary pattern, chunked, counted upload and delay routes), */
+/* file operations, process-group, PID 1, zombie, isolation and syscall-guard checks, TCP connect and */
+/* path-MTU transfer, or deliberate delay/tick/output/descendant cases. Return each check's result; */
+/* init and stress modes keep running until stopped. */
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     if (!strcmp(argv[1], "process-group")) {
@@ -182,6 +183,7 @@ int main(int argc, char **argv) {
                         if (headers_end) {
                             char *length = strcasestr(request, "\r\ncontent-length:");
                             body_length = length ? strtoul(length+17, NULL, 10) : 0;
+                            /* Larger bodies (/count) are read by their handler. */
                             if (body_length > 16384 || received >= (size_t)(headers_end+4-request)+body_length) break;
                         }
                     }
@@ -190,7 +192,50 @@ int main(int argc, char **argv) {
                         unsigned long bytes = 0, value = 0, delay = 0;
                         char *route = strchr(request, ' ');
                         if (route && sscanf(route, " /delay/%lu", &delay) == 1 && delay <= 31000) usleep((useconds_t)(delay*1000));
-                        if (route && sscanf(route, " /sized/%lu/%lu", &bytes, &value) == 2 && bytes <= 8388609 && value <= 127) {
+                        unsigned long chunks = 0, gap = 0;
+                        if (route && sscanf(route, " /pattern/%lu", &bytes) == 1 && bytes <= 67108864) {
+                            /* Binary body: byte i is i % 251, sent with Content-Length. */
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", bytes);
+                            unsigned char chunk[4096];
+                            for (size_t sent = 0; sent < bytes;) {
+                                size_t left = bytes-sent, size = left < sizeof(chunk) ? left : sizeof(chunk);
+                                for (size_t i = 0; i < size; i++) chunk[i] = (unsigned char)((sent+i) % 251);
+                                for (size_t done = 0; done < size;) {
+                                    struct pollfd writable = {.fd=client, .events=POLLOUT};
+                                    ssize_t count = send(client, chunk+done, size-done, MSG_NOSIGNAL);
+                                    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) && poll(&writable, 1, 2000) > 0) continue;
+                                    if (count <= 0) { sent = bytes; break; }
+                                    done += (size_t)count;
+                                }
+                                sent += size;
+                            }
+                        } else if (route && sscanf(route, " /chunked/%lu/%lu", &chunks, &gap) == 2 && chunks <= 100 && gap <= 1000) {
+                            /* Chunked transfer coding: "part-i" chunks with a gap between them. */
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                            for (unsigned long i = 0; i < chunks; i++) {
+                                char part[32]; int size = snprintf(part, sizeof(part), "part-%lu\n", i);
+                                if (dprintf(client, "%x\r\n%s\r\n", size, part) < 0) break;
+                                usleep((useconds_t)(gap*1000));
+                            }
+                            dprintf(client, "0\r\n\r\n");
+                        } else if (route && !strncmp(route, " /count ", 8)) {
+                            /* Read a Content-Length body of up to 64 MiB in pieces; answer its size and FNV-1a hash. */
+                            size_t have = received-(size_t)(headers_end+4-request), total = 0;
+                            uint64_t hash = 1469598103934665603ULL;
+                            unsigned char piece[16384];
+                            const unsigned char *data = (const unsigned char *)headers_end+4;
+                            while (body_length <= 67108864) {
+                                for (size_t i = 0; i < have && total < body_length; i++, total++) hash = (hash ^ data[i]) * 1099511628211ULL;
+                                if (total >= body_length) break;
+                                struct pollfd readable = {.fd=client, .events=POLLIN};
+                                if (poll(&readable, 1, 2000) <= 0) break;
+                                ssize_t count = read(client, piece, sizeof(piece));
+                                if (count <= 0) break;
+                                data = piece; have = (size_t)count;
+                            }
+                            char body[96]; int length = snprintf(body, sizeof(body), "bytes=%zu fnv=%016llx", total, (unsigned long long)hash);
+                            dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", length, body);
+                        } else if (route && sscanf(route, " /sized/%lu/%lu", &bytes, &value) == 2 && bytes <= 8388609 && value <= 127) {
                             char chunk[4096]; memset(chunk, (int)value, sizeof(chunk));
                             dprintf(client, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n", bytes);
                             struct timespec transmit_start;
@@ -325,6 +370,11 @@ int main(int argc, char **argv) {
         pid_t child = fork();
         if (child < 0) fail("fork");
         if (!child) { close(0); close(1); close(2); for (;;) pause(); }
+        return 0;
+    }
+    if (!strcmp(argv[1], "ticks")) {
+        /* Five lines, 200 ms apart, each flushed at once (streamed exec output). */
+        for (int i = 0; i < 5; i++) { printf("tick %d\n", i); fflush(stdout); usleep(200000); }
         return 0;
     }
     if (!strcmp(argv[1], "delay")) {

@@ -11,12 +11,12 @@ pub struct ServerConfig {
     pub max_in_flight: usize,
     pub request_timeout_ms: u64,
     pub max_body_bytes: usize,
-    pub application_http: ApplicationHttpLimits,
     pub operation_deadlines: OperationDeadlines,
+    pub proxy: ProxyLimits,
 }
 
 // How long a blocking management request waits for its operation's real outcome.
-// Exec/HTTP wait for their own timeout_ms plus margin_ms (teardown and cleanup).
+// Exec waits for its own timeout_ms plus margin_ms (teardown and cleanup).
 // If a wait expires, the work still runs to a terminal state; only the result is lost
 // (an undelivered create is deleted as create_response_lost).
 #[derive(Clone, Deserialize)]
@@ -32,30 +32,33 @@ impl Default for OperationDeadlines {
     fn default() -> Self { Self { create_ms: 120_000, capture_ms: 300_000, delete_ms: 120_000, margin_ms: 30_000 } }
 }
 impl OperationDeadlines {
-    // Check that each outcome wait and the exec/HTTP margin are within their allowed ranges.
+    // Check that each outcome wait and the exec margin are within their allowed ranges.
     fn valid(&self) -> bool {
         (1_000..=1_800_000).contains(&self.create_ms) && (1_000..=3_600_000).contains(&self.capture_ms)
             && (1_000..=1_800_000).contains(&self.delete_ms) && (1_000..=300_000).contains(&self.margin_ms)
     }
 }
 
+// Bounds for streamed traffic (the app proxy and streaming exec forwards): how many exchanges may be
+// open at once and how long one may go without moving a byte in either direction (including the wait
+// for the response head). There is no total deadline; the client decides when to give up.
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ApplicationHttpLimits {
-    pub max_body_bytes: usize,
-    pub max_response_bytes: u64,
-    pub max_timeout_ms: u64,
+pub struct ProxyLimits {
+    pub max_connections: usize,
+    pub idle_timeout_ms: u64,
 }
-impl Default for ApplicationHttpLimits {
-    // Use small default application HTTP body, response and deadline limits.
-    fn default() -> Self { Self { max_body_bytes: 8192, max_response_bytes: 65536, max_timeout_ms: 30000 } }
+impl Default for ProxyLimits {
+    // Use 256 open exchanges and AgentENV's ten-minute response-head wait as the idle timeout.
+    fn default() -> Self { Self { max_connections: 256, idle_timeout_ms: 600_000 } }
 }
-impl ApplicationHttpLimits {
-    // Check the configured application HTTP body, response and deadline ceilings against hard bounds.
+impl ProxyLimits {
+    // Check the connection count and idle timeout against their allowed ranges.
     fn valid(&self) -> bool {
-        (1..=16384).contains(&self.max_body_bytes) && (1..=8388608).contains(&self.max_response_bytes)
-            && (1..=600000).contains(&self.max_timeout_ms)
+        (1..=65_536).contains(&self.max_connections) && (1_000..=3_600_000).contains(&self.idle_timeout_ms)
     }
+    // Return the idle timeout as a duration.
+    pub fn idle(&self) -> Duration { Duration::from_millis(self.idle_timeout_ms) }
 }
 
 impl Default for ServerConfig {
@@ -66,24 +69,20 @@ impl Default for ServerConfig {
             max_in_flight: 64,
             request_timeout_ms: 5_000,
             max_body_bytes: 16_384,
-            application_http: ApplicationHttpLimits::default(),
             operation_deadlines: OperationDeadlines::default(),
+            proxy: ProxyLimits::default(),
         }
     }
 }
 
 impl ServerConfig {
-    // Reject out-of-range request limits, application HTTP ceilings or outcome waits, or an enlarged
-    // application body without enough JSON envelope space.
+    // Reject out-of-range request limits, outcome waits or proxy bounds.
     fn validate(&self) -> Result<(), &'static str> {
         if !(1..=1_024).contains(&self.max_in_flight)
             || !(100..=30_000).contains(&self.request_timeout_ms)
             || !(256..=131_072).contains(&self.max_body_bytes)
-            || !self.application_http.valid()
             || !self.operation_deadlines.valid()
-            // Opt-in larger text bodies need room for worst-case JSON escaping.
-            || (self.application_http.max_body_bytes > 8192
-                && self.max_body_bytes < self.application_http.max_body_bytes * 6 + 8192)
+            || !self.proxy.valid()
         {
             return Err("invalid server limits");
         }
@@ -100,8 +99,9 @@ impl ServerConfig {
         Duration::from_millis(self.request_timeout_ms)
     }
 
-    // Return the longest outcome wait of a blocking route (create, delete, exec, HTTP, capture), or
-    // nothing for short routes, which use only request_timeout_ms.
+    // Return the longest outcome wait of a blocking route (create, delete, exec, exec kill, capture),
+    // or nothing for short routes, which use only request_timeout_ms. Proxied app traffic has no
+    // route deadline at all (see ProxyLimits).
     pub fn route_wait(&self, method: &axum::http::Method, path: &str) -> Option<Duration> {
         use axum::http::Method;
         let d = &self.operation_deadlines;
@@ -109,7 +109,7 @@ impl ServerConfig {
             (&Method::POST, _) if path == "/v1/sandboxes" => d.create_ms,
             (&Method::DELETE, _) if path.starts_with("/v1/sandboxes/") => d.delete_ms,
             (&Method::POST, Some("exec")) => crate::model::MAX_EXEC_TIMEOUT_MS + d.margin_ms,
-            (&Method::POST, Some("http")) => self.application_http.max_timeout_ms + d.margin_ms,
+            (&Method::POST, Some("kill")) => d.margin_ms,
             (&Method::POST, Some("capture")) => d.capture_ms,
             _ => return None,
         };
@@ -180,6 +180,9 @@ impl Default for PollConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerConfig {
+    // App traffic for `<port>-<sandbox-id>.<proxy_domain>` hosts is proxied (AgentENV host routing).
+    #[serde(default)]
+    pub proxy_domain: Option<String>,
     #[serde(default)]
     pub server: ServerConfig,
     pub auth: CredentialSource,
@@ -191,10 +194,13 @@ pub struct ControllerConfig {
 }
 
 impl ControllerConfig {
-    // Validate server and polling limits, unique worker identities and HTTP(S) origins. Reject worker URLs
-    // containing credentials or extra path, query or fragment data.
+    // Validate server and polling limits, the optional proxy domain, unique worker identities and
+    // HTTP(S) origins. Reject worker URLs containing credentials or extra path, query or fragment data.
     pub fn validate(&self) -> Result<(), &'static str> {
         self.server.validate()?;
+        if self.proxy_domain.as_deref().is_some_and(|d| !crate::proxy::valid_domain(d)) {
+            return Err("proxy_domain must be a lowercase DNS name");
+        }
         if self.workers.len() > 128
             || !(100..=30_000).contains(&self.poll.interval_ms)
             || !(100..=10_000).contains(&self.poll.timeout_ms)
@@ -253,6 +259,10 @@ pub struct NativeConfig {
     pub max_records: usize,
     #[serde(default = "default_concurrent_operations")]
     pub max_concurrent_operations: usize,
+    #[serde(default = "default_concurrent_execs")]
+    pub max_concurrent_execs: usize,
+    #[serde(default = "default_execs_per_sandbox")]
+    pub max_execs_per_sandbox: usize,
     pub max_artifact_bytes: u64,
     pub command_timeout_seconds: u64,
     #[serde(default)]
@@ -287,9 +297,14 @@ impl NetworkConfig {
 
 // Use 16 parallel operation workers unless configured.
 fn default_concurrent_operations() -> usize { 16 }
+// Allow 64 running commands per worker unless configured.
+fn default_concurrent_execs() -> usize { 64 }
+// Allow 8 running commands per sandbox unless configured.
+fn default_execs_per_sandbox() -> usize { 8 }
 
 impl NativeConfig {
-    // Reject unsafe native paths, invalid network settings and out-of-range resource or record limits.
+    // Reject unsafe native paths, invalid network settings and out-of-range resource, record or command
+    // limits.
     fn validate(&self) -> Result<(), &'static str> {
         for path in [&self.root, &self.cgroup_parent].into_iter().chain(self.tools_dir.iter()) {
             if !path.starts_with('/') || path.len() > 256
@@ -306,6 +321,8 @@ impl NativeConfig {
             || !(16..=65536).contains(&self.pids_max)
             || !(1..=100000).contains(&self.max_records)
             || !(1..=64).contains(&self.max_concurrent_operations)
+            || !(1..=1024).contains(&self.max_concurrent_execs)
+            || !(1..=64).contains(&self.max_execs_per_sandbox)
             || !(1048576..=1099511627776).contains(&self.max_artifact_bytes)
             || !(10..=300).contains(&self.command_timeout_seconds)
         { return Err("invalid native runtime bounds"); }

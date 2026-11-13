@@ -879,6 +879,8 @@ name = "sandboxd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hyper",
+ "hyper-util",
  "libc",
  "reqwest",
  "serde",

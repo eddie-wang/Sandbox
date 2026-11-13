@@ -2,19 +2,25 @@
 """Minimal real-image end-to-end gate. Explicitly privileged; never run by smoke.py.
 
 Builds a cold template from an OCI image (layout directory or layout tar, optionally
-fetched first with regctl, skopeo or crane), then drives the controller's blocking
-API: cold create, wait for the in-container HTTP server, application HTTP call,
-exec, reaping PID 1, marker write, warm capture (the worker freezes the source,
-seals its upper into an EROFS layer, checkpoints it leaving it running and thaws
-it; a probe shows the source answering except during the frozen window), two
-independent child restores (the second reuses the node's checkpoint cache), HTTP
-and marker checks in the children, source/child isolation, delete and cleanup
-checks. Printed timings are informational, not benchmarks.
+fetched first with regctl, skopeo or crane), then drives the controller's API: cold
+create, wait for the in-container HTTP server through the app proxy (path and host
+forms), exec, reaping PID 1, marker write, a streamed long-running command, two
+concurrent commands, a WebSocket echo server run by a streaming command and reached
+through the proxy, kill, bounded commands that stop without stopping the sandbox,
+per-call overhead (proxy call, direct call inside the sandbox, exec round trip),
+warm capture (the worker freezes the source, seals its upper into an EROFS layer,
+checkpoints it leaving it running and thaws it; a probe shows the source answering
+except during the frozen window), two independent child restores (the second reuses
+the node's checkpoint cache), HTTP and marker checks in the children, source/child
+isolation, delete and cleanup checks. Printed timings are informational, not
+benchmarks.
 
 Networking runs entirely inside a disposable outer network/mount namespace, as in
-network_smoke.py. The template allows only the service port; no egress.
+network_smoke.py. The template allows only the service port and the next port (for
+the WebSocket server); no egress.
 """
 import argparse
+import base64
 import concurrent.futures
 import gzip
 import hashlib
@@ -23,10 +29,13 @@ import json
 import os
 from pathlib import Path
 import platform as host_platform
+import queue
 import re
 import secrets
 import shutil
+import socket
 import stat
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -36,13 +45,46 @@ import time
 
 from network_smoke import inventory, run
 from runtime_smoke import checkpoint_cache, watch_frozen, cold_manifest, preflight_compatibility, publish_layer, write_template
-from smoke import eventually, expect, port, request as smoke_request
+from smoke import eventually, exchange, expect, port, request as smoke_request
 
 INDEX_TYPES = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
 MANIFEST_TYPES = {"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"}
 MARKER = "/workspace/sandbox-e2e-marker"
 CHILD_ONLY = "/workspace/sandbox-e2e-child-only"
 BRIDGE = "sb-test-br"
+
+# A minimal WebSocket echo server (RFC 6455 handshake, unfragmented frames) for the proxy check; it
+# runs inside the sandbox as a streaming command, with the port as its argument.
+WS_SERVER = """import base64, hashlib, socket, struct, sys
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("0.0.0.0", int(sys.argv[1])))
+listener.listen(4)
+print("listening", flush=True)
+while True:
+    client, _ = listener.accept()
+    with client:
+        head = b""
+        while b"\\r\\n\\r\\n" not in head:
+            head += client.recv(4096)
+        key = [line.split(b":", 1)[1].strip() for line in head.split(b"\\r\\n") if line.lower().startswith(b"sec-websocket-key:")][0]
+        accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        client.sendall(b"HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Accept: " + accept + b"\\r\\n\\r\\n")
+        stream = client.makefile("rb")
+        while len(first := stream.read(2)) == 2:
+            opcode, size = first[0] & 15, first[1] & 127
+            if size == 126:
+                size = struct.unpack(">H", stream.read(2))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", stream.read(8))[0]
+            mask = stream.read(4)
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(stream.read(size)))
+            if opcode == 8:
+                client.sendall(bytes([0x88, 0]))
+                break
+            length = bytes([len(payload)]) if len(payload) < 126 else (bytes([126]) + struct.pack(">H", len(payload)) if len(payload) < 65536 else bytes([127]) + struct.pack(">Q", len(payload)))
+            client.sendall(bytes([0x80 | opcode]) + length + payload)
+"""
 
 
 class UnpackError(Exception):
@@ -61,7 +103,7 @@ def parse_args():
     parser.add_argument("--fetch-tool", help="regctl, skopeo or crane executable; default: first one found on PATH")
     parser.add_argument("--fetch-only", action="store_true", help="Fetch --image into --oci-layout and stop (no privilege needed)")
     parser.add_argument("--platform", default="linux/" + {"x86_64": "amd64", "aarch64": "arm64"}.get(host_platform.machine(), host_platform.machine()))
-    parser.add_argument("--port", type=int, default=8000, help="Service port of the in-container HTTP server")
+    parser.add_argument("--port", type=int, default=8000, help="Service port of the in-container HTTP server (the next port serves the WebSocket check)")
     parser.add_argument("--init-argv", help="JSON argv of the workload; default: python3 -m http.server PORT --bind 0.0.0.0")
     parser.add_argument("--no-image-env", action="store_true", help="Do not pass the image config Env to the workload via env(1)")
     parser.add_argument("--keep-image-resolver", action="store_true", help="Keep the image's /etc/resolv.conf and /etc/hosts as shipped")
@@ -95,7 +137,7 @@ def parse_args():
         parser.error("--root and --cgroup-parent are required")
     if not str(Path(args.cgroup_parent).resolve()).startswith("/sys/fs/cgroup/"):
         parser.error("cgroup parent must be below /sys/fs/cgroup")
-    if not 0 < args.port < 65536:
+    if not 0 < args.port < 65535:
         parser.error("invalid --port")
     return args
 
@@ -555,10 +597,11 @@ gateway = "198.18.0.1"
 prefix = 24
 addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
 egress = []
-service_ports = [{args.port}]
+service_ports = [{args.port}, {args.port + 1}]
 ''')
     controller_config = session / "controller.toml"
-    controller_config.write_text(f'''[server]
+    controller_config.write_text(f'''proxy_domain = "sandbox.test"
+[server]
 listen = "127.0.0.1:{controller_port}"
 request_timeout_ms = 5000
 [auth]
@@ -575,7 +618,7 @@ node_id = "node-image"
 url = "http://127.0.0.1:{worker_port}"
 ''')
     compatibility = preflight_compatibility(binary, worker_config)
-    network = {"mode": "tcp_allowlist", "egress": [], "service_ports": [args.port]}
+    network = {"mode": "tcp_allowlist", "egress": [], "service_ports": [args.port, args.port + 1]}
     write_template(session, cold_manifest("image-cold", compatibility, prepared["base"], prepared["init_argv"], network,
                                           memory_mib=args.memory_mib, vcpus=args.vcpus, pids_max=args.pids_max))
     processes, ids, timings, observations = [], [], {}, {"prepared": prepared}
@@ -618,12 +661,21 @@ url = "http://127.0.0.1:{worker_port}"
         assert code == 201 and payload["state"] == "running", (code, payload)
         return payload["sandbox_id"], time.monotonic() - started
 
-    # One application HTTP call through the controller's HTTP operation.
-    def http_call(sandbox, timeout_ms=3000):
-        body = dict(port=args.port, method="GET", path=args.http_path, timeout_ms=timeout_ms, max_response_bytes=65536)
-        return request(controller_port, f"/v1/sandboxes/{sandbox}/http", token, body, "POST")
+    # One application request through the controller's app proxy, in path form or host form
+    # (`<port>-<id>.sandbox.test`). Returns the status, headers and body bytes.
+    def proxy_call(sandbox, path=None, port_number=None, host_form=False, timeout=30):
+        port_number, path = port_number or args.port, path or args.http_path
+        headers = {"Authorization": "Bearer " + token}
+        if host_form:
+            headers["Host"] = f"{port_number}-{sandbox}.sandbox.test"
+        return exchange(controller_port, "GET", path if host_form else f"/v1/sandboxes/{sandbox}/proxy/{port_number}{path}", headers, timeout=timeout)
 
-    # Retries the HTTP operation until the in-container server answers 200 or the
+    # One GET of --http-path through the proxy, returned as the proxy status and {status, body text}.
+    def http_call(sandbox, host_form=False):
+        status, _, body = proxy_call(sandbox, host_form=host_form)
+        return status, {"status": status, "body": body.decode(errors="replace")}
+
+    # Retries a proxied GET until the in-container server answers 200 or the
     # deadline passes. Returns the response, elapsed seconds and attempt count.
     def wait_http(sandbox, timeout):
         started, attempts, last = time.monotonic(), 0, None
@@ -637,12 +689,94 @@ url = "http://127.0.0.1:{worker_port}"
             time.sleep(0.1)
         raise AssertionError(f"HTTP server did not answer within {timeout}s: {last}")
 
+    # Runs one blocking command through the controller and returns its raw status and result.
+    def exec_call(sandbox, argv, timeout_ms=20000, max_output_bytes=65536):
+        return request(controller_port, f"/v1/sandboxes/{sandbox}/exec", token, dict(argv=argv, timeout_ms=timeout_ms, max_output_bytes=max_output_bytes), "POST")
+
     # Runs one command through the controller and requires a clean exit.
     def execute(sandbox, argv, expect_exit=0):
-        result = expect(request(controller_port, f"/v1/sandboxes/{sandbox}/exec", token,
-                                dict(argv=argv, timeout_ms=20000, max_output_bytes=65536), "POST"), 200)
+        result = expect(exec_call(sandbox, argv), 200)
         assert result["exit_code"] == expect_exit and not result["interrupted"] and result["sandbox_state"] == "running", result
         return result["stdout"]
+
+    # Starts a streaming command and returns its exec ID and a queue that a background thread fills
+    # with (arrival time, event name, data) events, then None when the stream ends.
+    def start_stream(sandbox, argv, timeout_ms):
+        connection = http.client.HTTPConnection("127.0.0.1", controller_port, timeout=timeout_ms / 1000 + 60)
+        connection.request("POST", f"/v1/sandboxes/{sandbox}/exec", json.dumps(dict(argv=argv, timeout_ms=timeout_ms, max_output_bytes=65536, stream=True)),
+                           {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        assert response.status == 200 and response.getheader("Content-Type") == "text/event-stream", response.status
+        events = queue.Queue()
+        # Parse server-sent events into the queue until the stream ends.
+        def pump():
+            name = None
+            try:
+                while line := response.readline():
+                    line = line.decode().rstrip("\n")
+                    if line.startswith("event: "):
+                        name = line[len("event: "):]
+                    elif line.startswith("data: "):
+                        events.put((time.monotonic(), name, json.loads(line[len("data: "):])))
+            finally:
+                events.put(None)
+                connection.close()
+        threading.Thread(target=pump, daemon=True).start()
+        _, name, data = events.get(timeout=10)
+        assert name == "start", name
+        return data["exec_id"], events
+
+    # Drains a stream's queue to its end; returns the events and the decoded stdout.
+    def finish_stream(events, timeout=90):
+        collected = []
+        while (item := events.get(timeout=timeout)) is not None:
+            collected.append(item)
+        return collected, b"".join(base64.b64decode(data["data"]) for _, name, data in collected if name == "stdout")
+
+    # Opens a WebSocket through the controller's proxy (path or host form), checks the handshake, echoes
+    # a text and a 70000-byte binary message, closes it and returns the handshake time in seconds.
+    def websocket_echo(sandbox, ws_port, host_form=False):
+        key = base64.b64encode(os.urandom(16)).decode()
+        target = "/ws" if host_form else f"/v1/sandboxes/{sandbox}/proxy/{ws_port}/ws"
+        host = f"{ws_port}-{sandbox}.sandbox.test" if host_form else f"127.0.0.1:{controller_port}"
+        started = time.monotonic()
+        with socket.create_connection(("127.0.0.1", controller_port), timeout=10) as ws:
+            ws.sendall((f"GET {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+                        f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n").encode())
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = ws.recv(4096)
+                assert chunk, data
+                data += chunk
+            head, rest = data.split(b"\r\n\r\n", 1)
+            handshake = time.monotonic() - started
+            fields = {line.split(b":", 1)[0].strip().lower(): line.split(b":", 1)[1].strip() for line in head.split(b"\r\n")[1:] if b":" in line}
+            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+            assert head.startswith(b"HTTP/1.1 101") and fields.get(b"sec-websocket-accept") == accept and fields.get(b"upgrade", b"").lower() == b"websocket", head
+            buffer = bytearray(rest)
+            # Reads exactly n bytes, starting with what arrived together with the handshake.
+            def read(n):
+                while len(buffer) < n:
+                    chunk = ws.recv(65536)
+                    assert chunk, "WebSocket closed early"
+                    buffer.extend(chunk)
+                out = bytes(buffer[:n])
+                del buffer[:n]
+                return out
+            for opcode, payload in ((1, b"hello-ws"), (2, os.urandom(70000))):
+                mask = os.urandom(4)
+                length = bytes([0x80 | len(payload)]) if len(payload) < 126 else (bytes([0x80 | 126]) + len(payload).to_bytes(2, "big") if len(payload) < 65536 else bytes([0x80 | 127]) + len(payload).to_bytes(8, "big"))
+                ws.sendall(bytes([0x80 | opcode]) + length + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+                first, size = read(2)
+                size &= 127
+                if size == 126:
+                    size = int.from_bytes(read(2), "big")
+                elif size == 127:
+                    size = int.from_bytes(read(8), "big")
+                assert first == 0x80 | opcode and read(size) == payload
+            ws.sendall(bytes([0x88, 0x80]) + os.urandom(4))
+            assert read(2)[0] == 0x88
+        return handshake
 
     # Returns the host PID of a sandbox's init process from runc state.
     def host_pid(sandbox):
@@ -751,6 +885,84 @@ url = "http://127.0.0.1:{worker_port}"
         execute(source, [args.shell, "-c", 'printf %s "$1" > "$2"', "sh", nonce, MARKER])
         assert execute(source, ["cat", MARKER]) == nonce
         print(f"PASS exec ({output.strip()!r}) and marker write")
+
+        # The host form (`<port>-<id>.<proxy_domain>`) reaches the same server as the path form.
+        status, hosted = http_call(source, host_form=True)
+        assert status == 200 and args.expect_body in hosted["body"], hosted
+        print("PASS app proxy: path form and host form reach the in-container server")
+
+        # A long-running command streams its output while it runs.
+        ticker = "import time\nfor i in range(6):\n    print('tick', i, flush=True)\n    time.sleep(0.5)\n"
+        started = time.monotonic()
+        _, events = start_stream(source, ["python3", "-u", "-c", ticker], 20000)
+        streamed, output = finish_stream(events)
+        arrivals = [at - started for at, name, _ in streamed if name == "stdout"]
+        assert output == b"".join(f"tick {i}\n".encode() for i in range(6)), output
+        assert streamed[-1][1] == "exit" and streamed[-1][2] == {"exit_code": 0, "interrupted": False, "error": None, "sandbox_state": "running"}, streamed[-1]
+        assert arrivals[-1] - arrivals[0] >= 2.0, f"output did not stream: {arrivals}"
+        timings["stream_first_output_s"], timings["stream_last_output_s"] = arrivals[0], arrivals[-1]
+        print(f"PASS streamed command: first output after {arrivals[0]:.2f}s, last after {arrivals[-1]:.2f}s, then the exit event")
+
+        # Two commands run at once in one sandbox, each in its own resource group.
+        span = "import time; a = time.monotonic(); time.sleep(1.5); print(a, time.monotonic())"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            running = [pool.submit(execute, source, ["python3", "-c", span]) for _ in range(2)]
+            eventually(lambda: len([p for p in (cgroup / source).glob("exec-*") if p.is_dir()]) == 2, timeout=10)
+            spans = [tuple(map(float, command.result(timeout=30).split())) for command in running]
+        assert max(begin for begin, _ in spans) < min(end for _, end in spans), f"commands were serialized: {spans}"
+        assert not list((cgroup / source).glob("exec-*"))
+        observations["concurrent_exec_spans"] = spans
+        print("PASS two concurrent commands in one sandbox, each in its own exec group")
+
+        # A WebSocket echo server, run by a streaming command on the second approved port, is reached
+        # through the proxy in both forms while the HTTP server keeps answering; then it is killed.
+        ws_port = args.port + 1
+        server_id, server_events = start_stream(source, ["python3", "-u", "-c", WS_SERVER, str(ws_port)], 60000)
+        banner = b""
+        while b"listening" not in banner:
+            item = server_events.get(timeout=30)
+            assert item is not None and item[1] in ("stdout", "stderr"), item
+            banner += base64.b64decode(item[2]["data"])
+        timings["websocket_handshake_path_s"] = websocket_echo(source, ws_port)
+        timings["websocket_handshake_host_s"] = websocket_echo(source, ws_port, host_form=True)
+        status, _ = http_call(source)
+        assert status == 200
+        killed = expect(request(controller_port, f"/v1/sandboxes/{source}/exec/{server_id}/kill", token, method="POST"), 200)
+        assert killed == {"sandbox_id": source, "exec_id": server_id, "state": "exited"}, killed
+        rest, _ = finish_stream(server_events)
+        assert rest[-1][1] == "exit" and rest[-1][2] == {"exit_code": None, "interrupted": True, "error": "exec_killed", "sandbox_state": "running"}, rest[-1]
+        assert not list((cgroup / source).glob("exec-*"))
+        print("PASS WebSocket echo (text and 70000-byte binary) through the proxy, path and host forms; kill stopped the server command only")
+
+        # A deadline or output overflow stops only that command; the sandbox and its server keep running.
+        result = expect(exec_call(source, ["sleep", "30"], timeout_ms=500), 200)
+        assert result["interrupted"] and result["error"] == "exec_timeout" and result["sandbox_state"] == "running", result
+        result = expect(exec_call(source, ["yes"], timeout_ms=10000, max_output_bytes=4096), 200)
+        assert result["interrupted"] and result["error"] == "exec_output_limit" and len(result["stdout"]) <= 4096 and result["sandbox_state"] == "running", result
+        assert get(source)["state"] == "running" and wait_http(source, 10)[0]["status"] == 200
+        print("PASS bounded commands (timeout, output limit) stopped only themselves; the sandbox still serves")
+
+        # Per-call overhead (informational): the same GET through the controller and worker proxy, and
+        # directly from inside the sandbox; plus a trivial command's round trip.
+        proxy_times = []
+        for _ in range(30):
+            started = time.monotonic()
+            assert http_call(source)[0] == 200
+            proxy_times.append(time.monotonic() - started)
+        direct = ("import json, time, urllib.request\nts = []\nfor _ in range(30):\n    t = time.monotonic()\n"
+                  f"    urllib.request.urlopen('http://127.0.0.1:{args.port}{args.http_path}').read()\n    ts.append(time.monotonic() - t)\nprint(json.dumps(ts))")
+        direct_times = json.loads(execute(source, ["python3", "-c", direct]))
+        exec_times = []
+        for _ in range(10):
+            started = time.monotonic()
+            execute(source, ["true"])
+            exec_times.append(time.monotonic() - started)
+        overhead = dict(proxy_call_median_s=statistics.median(proxy_times), proxy_call_p90_s=sorted(proxy_times)[26],
+                        direct_call_median_s=statistics.median(direct_times), direct_call_p90_s=sorted(direct_times)[26],
+                        exec_true_median_s=statistics.median(exec_times))
+        timings.update(overhead)
+        observations["per_call_overhead_samples_s"] = dict(proxy=proxy_times, direct=direct_times, exec_true=exec_times)
+        print("PER-CALL OVERHEAD (informational): " + ", ".join(f"{k} {v * 1000:.2f} ms" for k, v in overhead.items()))
 
         # Live traffic during capture: the source answers except while frozen.
         probe = availability_probe(source, "capture")

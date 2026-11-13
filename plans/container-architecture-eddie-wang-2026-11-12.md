@@ -28,6 +28,7 @@ These choices keep the first version small:
 | Support several container runtimes | **Rejected for this version.** Use runc and CRIU first; no gVisor or runtime-plugin system. |
 | Run all worker operations one at a time | **Rejected.** A slow command in one sandbox should not stop an unrelated sandbox. |
 | Let the worker repair host networking | **Rejected.** An operator prepares the surrounding network; the worker manages only its own sandbox connections. |
+| Run an agent inside each sandbox for commands and files (AgentENV's envd) | **Deferred.** Commands keep using `runc exec`, now with streaming output and several at once; app traffic uses a reverse proxy instead. |
 
 S3 transfer is **deferred**, not a prerequisite. An administrator currently places the required template files on each node before they are used.
 
@@ -120,16 +121,16 @@ A template references **one base image** plus, for a warm template, the layers i
 
 ### 3. Running a command or calling a tool service
 
-There are two different operations:
+There are two different ways in:
 
-- **Run a command:** the client submits an argument list such as `["/fixture", "counter"]`. The worker runs it inside the container with `runc exec`. It does not pass the arguments through a host shell. Each exec starts a new command process; state that must survive calls belongs in files or an application already running in the sandbox. The response contains the exit code and bounded output.
-- **Make an application HTTP request:** the client submits an approved service port, a method, a relative path and an optional text body. A worker-controlled helper connects to that sandbox's application. The response contains the application's HTTP status and text body. This does not run `runc exec`, and it is not an arbitrary-URL proxy.
+- **Run a command:** the client submits an argument list such as `["/fixture", "counter"]`. The worker runs it inside the container with `runc exec`. It does not pass the arguments through a host shell. Each exec starts a new command process; state that must survive calls belongs in files or an application already running in the sandbox. The client chooses between waiting for the whole result (exit code and bounded output) and **streaming**: output arrives as it is produced, as a series of events, followed by a final event with the exit code.
+- **Talk to the application in the sandbox:** app traffic goes through a **reverse proxy**, as in AgentENV. A client sends an ordinary HTTP request to the controller, either to a host name `<port>-<sandbox-id>.<proxy domain>` or to the path `/v1/sandboxes/<id>/proxy/<port>/...`. After checking the credential, the controller passes it to the sandbox's node, which opens a new connection from inside that sandbox's private routing environment to the application's port. Only ports the template approves are reachable. The request and the answer pass through as they are: real status and headers, large or binary bodies streamed in both directions, and WebSocket connections. The management credential is removed before the request reaches the application.
 
-Every request waits for its real result, like an ordinary function call; nothing is saved for later retrieval. Only one such operation runs in a sandbox at a time. A second request for a busy sandbox is refused immediately rather than queued. Operations in different sandboxes run at the same time.
+Requests wait for their real result, like an ordinary function call; nothing is saved for later retrieval. **Several commands can run in one sandbox at the same time**, each in its own resource group, up to a per-sandbox limit. Creating, capturing and deleting a sandbox remain one at a time per sandbox: a conflicting request is refused immediately rather than queued, and a capture is refused while commands are running. Work in different sandboxes runs at the same time.
 
-The worker limits how many operations can run at once. Creating/restoring containers and capturing templates have an additional concurrency limit. Slow mounts, commands and file copies run separately from the short checks that reserve resources and update records.
+The worker limits how many create, capture and delete jobs and how many commands can run at once. Creating/restoring containers and capturing templates have an additional concurrency limit. Slow mounts, commands and file copies run separately from the short checks that reserve resources and update records. The proxy limits how many exchanges are open and ends one that stays silent for too long; otherwise the client decides how long to wait.
 
-Command timeouts or excessive output cause the **whole sandbox** to be terminated, not just the host-side runc command. Even a successful command has its leftover child processes cleaned up; detached background jobs are not supported by this API. An application HTTP timeout or response-size failure ends that HTTP operation without automatically terminating the sandbox.
+A command's time limit or output limit stops **only that command** (and everything it started); the result says it was interrupted, and the sandbox keeps running. A command can also be stopped on request by its ID. Even a successful command has its leftover child processes cleaned up; detached background jobs are not supported by this API.
 
 ### 4. Saving an initialized application and starting a copy
 
@@ -152,11 +153,11 @@ The worker checks the architecture, kernel, CPU features, runtime versions and r
 
 ### 5. Waiting, lost answers and cleaning up
 
-Each kind of request has a time limit long enough for that operation: a command's own time limit plus a margin for cleanup, or configured limits for creating, capturing and deleting. If the limit passes, the client gets a timeout error.
+Each kind of request has a time limit long enough for that operation: a command's own time limit plus a margin for cleanup, or configured limits for creating, capturing and deleting. If the limit passes, the client gets a timeout error. Proxied app traffic and streamed command output have no overall time limit, only the idle limit described above.
 
-**A dropped connection or timeout does not stop or abandon work.** The worker, not the client's connection, owns the work. A command, HTTP call, capture or delete finishes or fails normally, including cleanup and lifetime limits, and its result is discarded. The client can read the sandbox's state afterward. A create is the exception: if its answer cannot be delivered, nobody knows the new ID, so the worker deletes that sandbox.
+**A dropped connection or timeout does not stop or abandon work.** The worker, not the client's connection, owns the work. A command, capture or delete finishes or fails normally, including cleanup and lifetime limits, and its result is discarded. The client can read the sandbox's state afterward. A create is the exception: if its answer cannot be delivered, nobody knows the new ID, so the worker deletes that sandbox.
 
-Without operation IDs, retries are not deduplicated. If a create's answer is lost and the client asks again, it may get a second sandbox. The first is normally deleted as described above; in the rare case where the answer was lost after the worker handed it over, it ends when its lifetime expires, or the client can delete it using the ID in the error. A repeated command or HTTP request runs again; an application may already have acted on the first one. Delete is safe to repeat. Deleted and failed IDs are kept and never reused.
+Without operation IDs, retries are not deduplicated. If a create's answer is lost and the client asks again, it may get a second sandbox. The first is normally deleted as described above; in the rare case where the answer was lost after the worker handed it over, it ends when its lifetime expires, or the client can delete it using the ID in the error. A repeated command or proxied request runs again; an application may already have acted on the first one. Delete is safe to repeat. Deleted and failed IDs are kept and never reused.
 
 Cleanup happens when the client deletes a sandbox, its lifetime expires, or the worker restarts:
 
@@ -164,7 +165,7 @@ Cleanup happens when the client deletes a sandbox, its lifetime expires, or the 
 - Remove its runtime state, private mounts, network connections and private files.
 - Release its reserved capacity only after cleanup succeeds.
 
-A delete request waits for cleanup to finish; if a command is running in that sandbox, delete stops it first. If a second delete request for the same sandbox arrives meanwhile, it waits for the same cleanup and gets the same answer. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
+A delete request waits for cleanup to finish; if commands are running in that sandbox, delete stops them first, and it ends the sandbox's open proxied connections. If a second delete request for the same sandbox arrives meanwhile, it waits for the same cleanup and gets the same answer. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
 
 A separate lifetime monitor can stop an expired sandbox even while a long background operation is running. The requested lifetime starts when the worker accepts the create, not when application startup finishes.
 
@@ -182,7 +183,7 @@ All guests see the same private address inside their separate environments. The 
 
 There is no implicit DNS, UDP, IPv6 or access to the host or sibling sandboxes. The allowed endpoints are fixed in the template and checked against the operator's limits. A create request cannot override them.
 
-Application HTTP is restricted to that sandbox's approved service ports. It does not forward management credentials, follow redirects or accept arbitrary upstream URLs. Its request and result bodies are bounded UTF-8 text; binary responses, streaming and WebSockets are not supported.
+The app proxy reaches only that sandbox's approved service ports, over a connection made from inside its routing environment; nothing is exposed on the host network. It does not forward management credentials, follow redirects or accept arbitrary upstream URLs.
 
 Low-level packet rules and the tested fix for paths with smaller packet-size limits are documented in [network details](../docs/network.md).
 
@@ -192,16 +193,17 @@ Low-level packet rules and the tested fix for paths with smaller packet-size lim
 | --- | --- |
 | [`main.rs`](../src/main.rs) | Chooses controller, worker or read-only preflight mode. |
 | [`config.rs`](../src/config.rs) | Loads and checks administrator settings and credential sources. |
-| [`http.rs`](../src/http.rs) | Checks management authentication and request size/time limits. |
+| [`http.rs`](../src/http.rs) | Checks management authentication and request size/time limits, and hands app traffic (proxy paths and proxy host names) to the proxy. |
+| [`proxy.rs`](../src/proxy.rs) | The reverse proxy: reads proxy host names and paths, streams requests and answers between hops, tunnels WebSockets, and opens the node's connection inside the sandbox's routing environment. |
 | [`controller.rs`](../src/controller.rs) | Polls workers, places new sandboxes, generates their IDs and forwards requests to the owner. |
 | [`scheduler.rs`](../src/scheduler.rs) | Orders ready nodes by how full their promised budgets are, for create placement. |
-| [`worker.rs`](../src/worker.rs) | Receives node-local API requests, waits for each result and returns it. |
+| [`worker.rs`](../src/worker.rs) | Receives node-local API requests, waits for each result (or streams command output) and returns it; checks proxied traffic against the sandbox's approved ports. |
 | [`model.rs`](../src/model.rs) | Defines request/status fields and checks valid values. |
-| [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work and its results, expiry and restart cleanup. |
-| [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU. |
-| [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time, and safely writes saved JSON records. |
+| [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work and its results, running commands, expiry and restart cleanup. |
+| [`native.rs`](../src/native.rs) | Prepares mounts, resource limits and container configuration; calls runc/CRIU; runs each command in its own resource group. |
+| [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time (passing command output on as it arrives), and safely writes saved JSON records. |
 | [`storage.rs`](../src/storage.rs) | Checks template files, handles file archives and publishes complete templates. |
-| [`network.rs`](../src/network.rs) | Keeps the pool of pre-built routing environments, connects each sandbox's private network to one, applies and resets its traffic rules and runs the application HTTP helper. |
+| [`network.rs`](../src/network.rs) | Keeps the pool of pre-built routing environments, connects each sandbox's private network to one, applies and resets its traffic rules. |
 | [`lifecycle.rs`](../src/lifecycle.rs) | Defines the small liveness response. Despite its name, the lifecycle logic is in `engine.rs`. |
 
 ## Interfaces/signatures/headers
@@ -223,8 +225,9 @@ The main API operations are:
 | `GET /v1/status` | Inspect worker budgets/readiness, or the controller's recent observations. |
 | `POST /v1/sandboxes` | Create a sandbox from a cold or warm template; returns its ID once running. |
 | `GET /v1/sandboxes/{id}` | Read its state and expiry time. |
-| `POST /v1/sandboxes/{id}/exec` | Run a command inside it; returns exit code and output. |
-| `POST /v1/sandboxes/{id}/http` | Call its application over HTTP; returns status and body. |
+| `POST /v1/sandboxes/{id}/exec` | Run a command inside it; returns exit code and output, or streams the output. |
+| `POST /v1/sandboxes/{id}/exec/{exec_id}/kill` | Stop one running command; returns once it has ended. |
+| any request to `/v1/sandboxes/{id}/proxy/{port}/...` or host `{port}-{id}.{proxy domain}` | App traffic to an approved port of the sandbox's application, passed through as it is. |
 | `POST /v1/sandboxes/{id}/capture` | Save its initialized state as a new template without stopping it; returns once the template is published and the source is running. |
 | `DELETE /v1/sandboxes/{id}` | Clean it up; returns when cleanup is complete. |
 
@@ -242,8 +245,8 @@ Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linu
 - Saved open files, memory mappings and an open connection inside the sandbox in that fixture; deleted and modified base files in the sealed layer.
 - A first process that cleans up finished child processes, and a second delete that waits for the first.
 - The same workflow with a real public Python image, including a measurement of how long the source is frozen during capture.
-- Waiting requests that return real results, concurrent operations in different sandboxes, immediate refusal of a conflicting request, cleanup after a client disconnects mid-command or mid-create, lifetime expiry, deletion and worker-restart cleanup.
-- Allowed and denied TCP connections, application HTTP limits, restored listeners and new connections after restore.
+- Waiting requests that return real results, concurrent operations in different sandboxes, several commands at once in one sandbox, streamed command output, stopping a command by its ID, time and output limits that stop only the command, immediate refusal of a conflicting capture, cleanup after a client disconnects mid-command or mid-create, lifetime expiry, deletion and worker-restart cleanup.
+- Allowed and denied TCP connections, the app proxy (both request forms, large binary bodies in both directions, chunked streaming, a WebSocket echo with the real image, connection and idle limits, unapproved ports), restored listeners and new connections after restore.
 - Cleanup of test-owned processes, mounts, namespaces, loop devices and resource groups.
 
 Networking tests ran inside a disposable private network environment; they did not change the default host network. Build checks and a separate nonprivileged API smoke also passed. Detailed instructions and limits are in [runtime validation](../docs/runtime.md).

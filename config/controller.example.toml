@@ -1,12 +1,20 @@
 # Static administrator-controlled origins only. Plain HTTP requires a trusted network.
+# Optional app-proxy host routing: "<port>-<sandbox-id>.sandbox.example" hosts (any
+# path) are proxied to that sandbox's approved service port; needs wildcard DNS.
+# The path form /v1/sandboxes/<id>/proxy/<port>/<path> always works.
+# proxy_domain = "sandbox.example"
 [server]
 listen = "127.0.0.1:8080"
 max_in_flight = 64
 request_timeout_ms = 5000
 max_body_bytes = 16384
 # Blocking requests hold a permit while waiting; keep max_in_flight above the
-# workers' combined operation pools. Optional [server.operation_deadlines] and
-# [server.application_http] must match the workers' values.
+# workers' combined operation pools. Optional [server.operation_deadlines] must
+# match the workers' values. Proxied app traffic and streaming exec are bounded by
+# [server.proxy] instead (defaults shown); keep the idle timeout above the workers'.
+# [server.proxy]
+# max_connections = 256
+# idle_timeout_ms = 600000
 
 [auth]
 env = "SANDBOX_CONTROLLER_TOKEN"

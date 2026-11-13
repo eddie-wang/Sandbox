@@ -1,5 +1,5 @@
-//! Blocking, bounded host commands. Called only by the dedicated lifecycle thread
-//! or spawn_blocking preflight. Never inherit management credentials into tools.
+//! Blocking, bounded host commands. Called only by dedicated lifecycle and exec
+//! threads or spawn_blocking preflight. Never inherit management credentials into tools.
 use std::{fs::{self, OpenOptions}, io::{Read, Write}, os::{fd::{AsRawFd, RawFd}, unix::process::CommandExt}, path::{Path, PathBuf}, process::{Command, Stdio}, sync::atomic::{AtomicBool, AtomicU64, Ordering}, thread, time::{Duration, Instant}};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +65,91 @@ impl Helpers {
         if let Err(e) = leaf.remove() { self.failed.store(true, Ordering::SeqCst); return Err(e); }
         result
     }
+    // Run a host command (a runc exec client) in a new tracked helper group and pass its stdout/stderr
+    // chunks to `sink` as they arrive (true marks stderr). Stop it through `kill` when the deadline
+    // passes ("exec_timeout"), the combined output would exceed `limit` ("exec_output_limit") or `stop`
+    // gives a reason. When the command ends either way, `kill` also ends what it left behind, then the
+    // remaining output (up to the limit) is drained. Drain the helper group before returning; a cleanup
+    // failure blocks later work.
+    pub fn stream(&self, program: &str, args: &[String], timeout: Duration, limit: usize, search_path: &str,
+        sink: &mut dyn FnMut(bool, &[u8]), stop: &dyn Fn() -> Option<&'static str>, kill: &dyn Fn()) -> Result<Streamed> {
+        self.ensure_healthy()?;
+        let path = self.path.join(format!("command-{}", self.sequence.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&path).map_err(|_| "helper_cgroup_create_failed")?;
+        let leaf = HelperLeaf(path, &self.failed);
+        let result = (|| {
+            let procs = OpenOptions::new().write(true).open(leaf.0.join("cgroup.procs")).map_err(|_| "helper_cgroup_open_failed")?;
+            let mut child = spawn(program, args, false, search_path, Some(procs.as_raw_fd()))?;
+            let pipes = nonblocking_pipes(&mut child);
+            let (stdout, stderr) = match pipes { Ok(p) => p, Err(e) => { kill(); let _ = child.kill(); let _ = child.wait(); return Err(e); } };
+            Ok(stream_child(child, stdout, stderr, timeout, limit, sink, stop, kill))
+        })();
+        if let Err(e) = leaf.remove() { self.failed.store(true, Ordering::SeqCst); return Err(e); }
+        result?
+    }
+}
+
+// How a streamed command ended: its exit code (none when stopped) and why it was stopped, if it was.
+pub struct Streamed { pub exit_code: Option<i32>, pub stopped: Option<&'static str> }
+
+// Read a streamed command's pipes until it exits or must stop (see Helpers::stream). Each read
+// delivers at most the bytes left in the output budget; an overflow stops the command. After the stop
+// or exit, end its leftovers with `kill`, give the client two seconds to exit before killing its
+// process group, then drain the pipes for up to five seconds.
+fn stream_child(mut child: std::process::Child, stdout: std::process::ChildStdout, stderr: std::process::ChildStderr, timeout: Duration, limit: usize,
+    sink: &mut dyn FnMut(bool, &[u8]), stop: &dyn Fn() -> Option<&'static str>, kill: &dyn Fn()) -> Result<Streamed> {
+    let mut pipes: [Option<Box<dyn Read>>; 2] = [Some(Box::new(stdout)), Some(Box::new(stderr))];
+    let mut total = 0usize;
+    let mut stopped = None;
+    // Read one bounded batch from each open pipe; report whether anything arrived.
+    let mut pump = |pipes: &mut [Option<Box<dyn Read>>; 2], stopped: &mut Option<&'static str>| {
+        let mut progress = false;
+        for (index, slot) in pipes.iter_mut().enumerate() {
+            let Some(pipe) = slot else { continue };
+            let mut chunk = [0u8; 16384];
+            match pipe.read(&mut chunk) {
+                Ok(0) => *slot = None,
+                Ok(n) => {
+                    progress = true;
+                    let keep = n.min(limit - total);
+                    if keep > 0 { sink(index == 1, &chunk[..keep]); }
+                    total += keep;
+                    if n > keep { stopped.get_or_insert("exec_output_limit"); }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => *slot = None,
+            }
+        }
+        progress
+    };
+    let start = Instant::now();
+    let mut status = None;
+    while stopped.is_none() && status.is_none() {
+        let progress = pump(&mut pipes, &mut stopped);
+        if stopped.is_none() { stopped = if start.elapsed() >= timeout { Some("exec_timeout") } else { stop() }; }
+        status = child.try_wait().map_err(|_| "tool_wait_failed")?;
+        if !progress && stopped.is_none() && status.is_none() { thread::sleep(Duration::from_millis(5)); }
+    }
+    kill();
+    if status.is_none() {
+        let waited = Instant::now();
+        while status.is_none() && waited.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+            status = child.try_wait().map_err(|_| "tool_wait_failed")?;
+        }
+        if status.is_none() {
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+            let _ = child.kill();
+            status = Some(child.wait().map_err(|_| "tool_wait_failed")?);
+        }
+    }
+    let drained = Instant::now();
+    while pipes.iter().any(Option::is_some) {
+        if drained.elapsed() >= Duration::from_secs(5) { return Err("exec_output_pipe_held"); }
+        if !pump(&mut pipes, &mut stopped) { thread::sleep(Duration::from_millis(5)); }
+    }
+    let exit_code = if stopped.is_some() { None } else { status.and_then(|s| s.code()) };
+    Ok(Streamed { exit_code, stopped })
 }
 struct HelperLeaf<'a>(PathBuf, &'a AtomicBool);
 impl HelperLeaf<'_> {
@@ -102,11 +187,10 @@ pub fn version(program: &str, search_path: &str) -> Result<Output> {
     run_inner(program, &["--version".into()], Duration::from_secs(3), 4096, false, search_path, None)
 }
 
-// Start a host command with a cleared environment, parent-death protection and output/time bounds.
-// While monitoring, deadline, read or output failures trigger a command-group kill attempt. Final
-// draining or size checks can also mark results interrupted without killing the group. Return exit
-// status and output; Helpers::run separately cleans up tracked descendants.
-fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, quiet: bool, search_path: &str, helper_procs: Option<RawFd>) -> Result<Output> {
+// Start a host command with a cleared environment, its own process group and parent-death protection,
+// joining the helper group behind `helper_procs` (if any) before exec. Output goes to pipes unless
+// `quiet`.
+fn spawn(program: &str, args: &[String], quiet: bool, search_path: &str, helper_procs: Option<RawFd>) -> Result<std::process::Child> {
     let mut command = Command::new(program);
     command.args(args).env_clear().env("PATH", search_path).env("LANG", "C")
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
@@ -122,7 +206,26 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
         }
         Ok(())
     }); }
-    let mut child = command.spawn().map_err(|_| "tool_spawn_failed")?;
+    command.spawn().map_err(|_| "tool_spawn_failed")
+}
+
+// Take a child's stdout and stderr pipes and make them nonblocking, so reads never wait for a
+// descendant that still holds a pipe.
+fn nonblocking_pipes(child: &mut std::process::Child) -> Result<(std::process::ChildStdout, std::process::ChildStderr)> {
+    let stdout = child.stdout.take().ok_or("tool_pipe_failed")?;
+    let stderr = child.stderr.take().ok_or("tool_pipe_failed")?;
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 { return Err("tool_pipe_failed"); }
+    }
+    Ok((stdout, stderr))
+}
+
+// Start a host command with a cleared environment, parent-death protection and output/time bounds.
+// While monitoring, deadline, read or output failures trigger a command-group kill attempt. Final
+// draining or size checks can also mark results interrupted without killing the group. Return exit
+// status and output; Helpers::run separately cleans up tracked descendants.
+fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, quiet: bool, search_path: &str, helper_procs: Option<RawFd>) -> Result<Output> {
+    let mut child = spawn(program, args, quiet, search_path, helper_procs)?;
     if quiet {
         let start = Instant::now();
         loop {
@@ -137,14 +240,10 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
             thread::sleep(Duration::from_millis(5));
         }
     }
-    let mut stdout = child.stdout.take().ok_or("tool_pipe_failed")?;
-    let mut stderr = child.stderr.take().ok_or("tool_pipe_failed")?;
-    // Nonblocking reads avoid unbounded reader threads if a descendant holds a pipe.
-    for fd in [std::os::fd::AsRawFd::as_raw_fd(&stdout), std::os::fd::AsRawFd::as_raw_fd(&stderr)] {
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-            let _ = child.kill(); let _ = child.wait(); return Err("tool_pipe_failed");
-        }
-    }
+    let (mut stdout, mut stderr) = match nonblocking_pipes(&mut child) {
+        Ok(pipes) => pipes,
+        Err(e) => { let _ = child.kill(); let _ = child.wait(); return Err(e); }
+    };
     let mut out = Vec::new();
     let mut err = Vec::new();
     let start = Instant::now();

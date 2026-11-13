@@ -6,14 +6,16 @@ A small Rust controller/scheduler and Linux node worker for stateful tool execut
 
 **Status: experimental real-runtime implementation; the bounded native lifecycle
 smoke passed on one approved Linux x86-64 host (runc 1.3.6, CRIU 4.3).** This includes
-IPv4 TCP allowlists and text application HTTP inside a disposable outer test netns,
-restored listening sockets/fresh connections, and the existing lifecycle cases:
-cold create, capture without stopping the source, independent warm restore
-(including an established loopback TCP connection) from a sealed EROFS layer and a
-once-per-node checkpoint cache, a reaping PID 1, overlapping commands, private
-writes/whiteouts, blocking inline results, cleanup after client disconnect
-mid-exec and mid-create, waiting concurrent DELETEs, TTL/delete
-and crash/restart cleanup. A real-image check (`python:3.12-slim`) passed too.
+IPv4 TCP allowlists and the streaming app proxy (path and host forms, binary and
+chunked bodies) inside a disposable outer test netns, restored listening
+sockets/fresh connections, and the existing lifecycle cases: cold create, capture
+without stopping the source, independent warm restore (including an established
+loopback TCP connection) from a sealed EROFS layer and a once-per-node checkpoint
+cache, a reaping PID 1, concurrent, streamed and killed commands whose bounds stop
+only themselves, private writes/whiteouts, blocking inline results, cleanup after
+client disconnect mid-exec and mid-create, waiting concurrent DELETEs, TTL/delete
+and crash/restart cleanup. A real-image check (`python:3.12-slim`, including a
+WebSocket echo through the proxy) passed too.
 This is a targeted functional result, **not production isolation, general workload
 readiness, cross-node portability or capacity qualification**. The validation host's
 indirect system-library/shell trust was not established; see the operator recipe.
@@ -77,15 +79,16 @@ RBAC, built-in TLS or Internet-facing connection defense.
   The operator provisions a stable-MAC bridge, gateway and exclusive address pool.
   No global firewall, routing or sysctl repair; no DNS, UDP, IPv6 or host-network mode.
 - One durable admission/state coordinator per worker, a fixed bounded pool for
-  parallel runtime I/O across sandboxes, per-sandbox exclusion, separate restore
-  slots and a shared-lower mailbox (no lock held over mount I/O). Durable atomic
-  lifecycle records. **Blocking API:** each request returns its real outcome
-  (create when running, exec/HTTP results, capture after publication, delete after
-  cleanup; concurrent DELETEs of one sandbox share that result) within a route-specific bounded deadline. A client
-  disconnect or timeout does not orphan a sandbox (exec/HTTP/capture/delete finish
-  with normal cleanup; a create whose reply the worker could not deliver is deleted
-  as `create_response_lost`), except when a later hop loses a reply the worker
-  already handed over; the sandbox's TTL bounds that case. The controller chooses the
+  parallel create/capture/delete across sandboxes, per-sandbox exclusion of those
+  jobs, separate restore slots and a shared-lower mailbox (no lock held over mount
+  I/O). Durable atomic lifecycle records. **Blocking API:** each request returns its
+  real outcome (create when running, exec results, kill after the command ended,
+  capture after publication, delete after cleanup; concurrent DELETEs of one
+  sandbox share that result) within a route-specific bounded deadline. A client
+  disconnect or timeout does not orphan a sandbox (commands, capture and delete
+  finish with normal cleanup; a create whose reply the worker could not deliver is
+  deleted as `create_response_lost`), except when a later hop loses a reply the
+  worker already handed over; the sandbox's TTL bounds that case. The controller chooses the
   worker and generates an opaque sandbox ID that routes later calls; clients never
   name nodes. Worker admission is final; stale controller capacity cannot
   reserve memory or start a workload. CPU quota admission has an explicit bounded
@@ -106,12 +109,21 @@ RBAC, built-in TLS or Internet-facing connection defense.
   exact kernel/CPU/architecture/runc/CRIU/config compatibility. All published
   templates/layers are retained; automatic cache eviction/GC and S3 transfer are
   not implemented.
-- `runc exec` with argv, bounded output/deadline and inline results. A bound
-  violation conservatively terminates the **whole sandbox**, not just its runc
-  client. Each exec uses an owned child cgroup and cleans descendants even after
-  a successful parent exit. Application HTTP is a distinct bounded, blocking request: a tracked helper
-  reaches only that sandbox's fixed guest address and template-approved service port.
-  Text-only requests/results, no arbitrary upstream, redirects or management credentials.
+- `runc exec` with argv, bounded output/deadline, a blocking mode (one JSON result)
+  and a streaming mode (server-sent stdout/stderr events, then an exit event).
+  Several commands may run at once per sandbox, each on its own thread and in its
+  own child cgroup; a timeout, output overflow or kill request stops **only that
+  command's group** and reports `interrupted`, the sandbox keeps running. A normal
+  end also cleans the command's leftover descendants. Capture and delete stay
+  exclusive (capture is refused while commands run; delete stops them).
+- App traffic uses an AgentENV-style reverse proxy instead of a management call:
+  `<port>-<sandbox-id>.<proxy_domain>` hosts or `/v1/sandboxes/<id>/proxy/<port>/...`,
+  authenticated by the controller, routed to the owner and from there over a new
+  connection opened **inside the sandbox's routing namespace** to its fixed guest
+  address, for template-approved service ports only. Real statuses, headers and
+  streamed bodies both ways (large, binary, chunked, server-sent events) and
+  WebSocket upgrades; the management Authorization header is never forwarded; open
+  exchanges are bounded and idle ones end; there is no total deadline.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting
@@ -126,7 +138,8 @@ from the nonprivileged smoke. No unit tests are added. No license has been selec
 
 No two-node, S3, broad application compatibility
 or performance result is claimed. Fork and user-facing pause/resume remain out of
-scope. The worker root needs operator-controlled disk capacity/quota; sandbox disk
+scope. An in-sandbox agent (AgentENV's envd: background processes, a file API) is
+deferred; commands use `runc exec` and app traffic the reverse proxy. The worker root needs operator-controlled disk capacity/quota; sandbox disk
 quotas and an automatic artifact retention policy are not implemented.
 
 The planned capacity test uses **two nodes, about 10% active and 90% resident

@@ -21,7 +21,8 @@ exclusive to that worker; operators must not share it between worker roots.
   private/<node>.<id>/
     upper/ work/ rootfs/           ordinary directories; rootfs is OverlayFS; upper
                                    starts empty for cold and warm sandboxes alike
-    config.json exec.json         worker-authored OCI/process input
+    config.json exec-<n>.json     worker-authored OCI input and one process file per
+                                   running command (removed when it ends)
     criu.conf criu-work/          protected runtime/checkpoint work
   layers/<sha256>.erofs            trusted immutable EROFS images: template bases and
                                    sealed capture layers, content-addressed
@@ -188,9 +189,12 @@ Worker admission is serialized with durable record creation before any resource
 side effect. Memory, live slots, restore slots and a configured 1–16 CPU quota
 oversubscription factor are checked against existing reservations, not controller
 snapshots. The coordinator performs only durable state/admission transitions, not
-blocking runtime tools. A fixed 1–64-thread pool bounds operation concurrency,
-per-sandbox exclusion serializes each lifecycle, and separate restore slots bound
-create/capture/restore. Shared lower mount creation has its own bounded mailbox;
+blocking runtime tools. A fixed 1–64-thread pool bounds create/capture/delete
+concurrency, per-sandbox exclusion serializes each lifecycle, and separate restore
+slots bound create/capture/restore. Commands are admitted by the same coordinator
+(not while a create, capture or delete of that sandbox is in flight; a capture is
+refused while any command runs) and run on their own threads, bounded per sandbox
+(`max_execs_per_sandbox`) and per worker (`max_concurrent_execs`). Shared lower mount creation has its own bounded mailbox;
 there is no shared-state lock across mount/process I/O. Template names in capture
 are reserved against concurrent publication. The mailbox is bounded.
 Create admission also reads the bounded template manifest on the coordinator thread
@@ -236,13 +240,19 @@ unqualified for general applications.
 TTL has a separate cgroup-kill watchdog so a long archive cannot keep an expired
 workload running until a job completes. Deletion durably records cancellation and
 signals active jobs; cleanup waits for the sandbox's in-flight job rather than
-racing it. Concurrent DELETE requests of one sandbox all wait for that one cleanup
-and receive its result (AgentENV's wait-for-transition; at most 64 waiters). Exec uses a dedicated child cgroup and kills/removes descendants on
-successful completion too, including children that close stdout/stderr. Exec clamps
-its deadline to remaining TTL; output/deadline/persistent-pipe failure kills the
-entire sandbox. Delete first
-kills the owned cgroup (all descendants), force-deletes private runc state, checks
-for no populated cgroup, unmounts the private overlay, then removes private state.
+racing it, and for its running commands, which it stops. Concurrent DELETE requests
+of one sandbox all wait for that one cleanup and receive its result (AgentENV's
+wait-for-transition; at most 64 waiters). Every exec runs on its own thread in its
+own child cgroup `<sandbox cgroup>/exec-<n>` (`runc exec --cgroup`), several at once
+per sandbox, and kills/removes its group when it ends, so descendants are cleaned
+on successful completion too, including children that keep stdout/stderr open.
+Exec clamps its deadline to remaining TTL; a deadline, output overflow, kill request
+or sandbox deletion kills **only that command's group**, never the sandbox. A group
+that cannot be emptied within five seconds deletes the sandbox (fail closed). Delete
+first kills the owned cgroup (all descendants), removes leftover `exec-<n>` groups
+(any other child group is unknown state and fails), force-deletes private runc
+state, checks for no populated cgroup, unmounts the private overlay, then removes
+private state.
 Reservation release follows successful cleanup exactly once. Failure remains
 `cleanup_failed`, reserved, observable and retryable. Never recurse into a live mount.
 
@@ -263,8 +273,9 @@ runtime behavior. XFS ftype/xattr details, EROFS options, actual seccomp compati
 restore cgroup placement and lifecycle/isolation/cleanup claims require the
 privileged gate. The static-fixture local gate passed, including independently
 overlapping commands, final worker admission, rejected template compatibility/digest/
-symlink inputs, command descendants, client disconnect mid-exec and mid-create, in-flight exec/
-capture/HTTP restart cleanup. Host trust was not qualified: the approved validation host used
+symlink inputs, command descendants, concurrent/streamed/killed/bounded commands that
+keep the sandbox, client disconnect mid-exec and mid-create, in-flight exec/capture/
+proxied-stream restart cleanup. Host trust was not qualified: the approved validation host used
 administrator-staged binaries but retained indirect system library/fixed-shell
 dependencies. No performance, S3, general hostile-workload isolation or two-node
 result is claimed.

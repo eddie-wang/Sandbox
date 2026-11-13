@@ -158,6 +158,9 @@ pub struct ExecRequest {
     pub argv: Vec<String>,
     pub timeout_ms: u64,
     pub max_output_bytes: u64,
+    // Stream output as server-sent events instead of returning one JSON result at the end.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 impl ExecRequest {
@@ -168,8 +171,8 @@ impl ExecRequest {
             && (1..=MAX_EXEC_TIMEOUT_MS).contains(&self.timeout_ms)
             && (1..=1_048_576).contains(&self.max_output_bytes)
     }
-    // Return the largest valid JSON exec result: lossy UTF-8 and escaping expand raw output bytes up
-    // to 6x, plus room for the other fields.
+    // Return the largest valid blocking JSON exec result: lossy UTF-8 and escaping expand raw output
+    // bytes up to 6x, plus room for the other fields.
     pub fn max_result_bytes(&self) -> usize { self.max_output_bytes as usize * 6 + 8192 }
 }
 
@@ -221,41 +224,9 @@ impl NetworkPolicy {
                 && egress.iter().all(TcpDestination::valid) && service_ports.iter().all(|p| *p != 0),
         }
     }
-}
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpRequest {
-    pub port: u16,
-    pub method: String,
-    pub path: String,
-    #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    pub body: String,
-    pub timeout_ms: u64,
-    pub max_response_bytes: u64,
-}
-impl HttpRequest {
-    // Check HTTP operation fields, permitted methods and headers, and a relative request path. Enforce
-    // hard body, response and deadline bounds without authorizing a service port here.
-    pub fn valid(&self) -> bool {
-        self.port != 0 && matches!(self.method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
-            && self.path.starts_with('/') && !self.path.starts_with("//") && self.path.len() <= 2048
-            && self.path.bytes().all(|b| b.is_ascii_graphic() && b != b'\\' && b != b'#')
-            && self.body.len() <= 16384 && (1..=600000).contains(&self.timeout_ms)
-            && (1..=8388608).contains(&self.max_response_bytes) && self.headers.len() <= 2
-            && self.headers.iter().all(|(k,v)| matches!(k.as_str(), "accept" | "content-type")
-                && v.len() <= 256 && v.bytes().all(|b| (32..127).contains(&b)))
+    // Decide whether app traffic may reach this guest port: only an approved service port of a TCP
+    // policy.
+    pub fn serves(&self, port: u16) -> bool {
+        matches!(self, Self::TcpAllowlist { service_ports, .. } if service_ports.contains(&port))
     }
-    // Apply configured body, response and deadline ceilings in addition to the basic HTTP request checks.
-    pub fn valid_for(&self, limits: &crate::config::ApplicationHttpLimits) -> bool {
-        self.valid() && self.body.len() <= limits.max_body_bytes && self.max_response_bytes <= limits.max_response_bytes
-            && self.timeout_ms <= limits.max_timeout_ms
-    }
-    // Return the largest valid JSON HTTP result: escaping expands raw response bytes up to 6x, plus
-    // room for the status and content type.
-    pub fn max_result_bytes(&self) -> usize { self.max_response_bytes as usize * 6 + 8192 }
 }
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpOutput { pub status: u16, pub content_type: Option<String>, pub body: String }

@@ -9,6 +9,7 @@ mod engine;
 mod native;
 mod network;
 mod process;
+mod proxy;
 mod storage;
 
 use std::path::Path;
@@ -30,7 +31,6 @@ fn start() -> Result<(), &'static str> {
     if args.len() == 1 && args[0] == "internal-forward" { return network::forward_helper(true); }
     if args.len() == 1 && args[0] == "internal-guest-network" { return network::forward_helper(false); }
     if args.len() == 1 && args[0] == "internal-slot-reset" { return network::slot_reset_helper(); }
-    if args.len() == 2 && args[0] == "internal-http" { return network::http_helper(Path::new(&args[1])); }
     if args.len() == 1 && args[0] == "--help" {
         println!("{USAGE}");
         return Ok(());
