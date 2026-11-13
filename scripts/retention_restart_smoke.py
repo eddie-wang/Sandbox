@@ -25,16 +25,20 @@ GLOBAL = MIB + 20480
 RETAINED = MIB + 8192
 
 
+# Encode fixture data as compact UTF-8 JSON so retained-byte calculations include escaping.
 def encoded(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
 
 
+# Build a synthetic operation record with no output, fingerprinting the supplied request or an empty
+# one.
 def operation(kind, state, payload=None):
     return dict(fingerprint=hashlib.sha256(encoded(payload or {})).hexdigest(),
                 kind=kind, state=state, error="fixture_failure" if state == "failed" else None,
                 output=None, http_output=None, template_id=None)
 
 
+# Build a synthetic sandbox history record with bounded resources and a short expiry.
 def record(name, state="deleted"):
     return dict(schema_version=1, request=dict(sandbox_id="node-history." + name,
                 template_id="history", runtime="runc_criu", architecture=platform.machine(),
@@ -43,6 +47,9 @@ def record(name, state="deleted"):
                 network_slot=None, network_policy=None, operations={})
 
 
+# Build trusted synthetic history near the retained-output limit, mixing bounded result data with
+# output-free metadata. Include interrupted operations and assert that populated results fit the
+# original reservation budgets.
 def history():
     # Each populated output fits a conservative reservation at its position in
     # this history under the original budgets; do not rely on impossible output
@@ -104,6 +111,10 @@ def history():
     return records, absent
 
 
+# Require explicit administrator opt-in and successful native preflight before installing synthetic
+# history. Check restart preservation, interrupted-operation cleanup and independent retention gates
+# without creating containers. Retain evidence and stop workers, then verify owned runtime directories
+# are empty.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -128,6 +139,7 @@ def main():
                         rejected_per_sandbox_budget=RETAINED - 1, rejected_global_budget=RETAINED - 1,
                         per_sandbox_admission_global_budget=2 * GLOBAL, checks=[])
 
+    # Write the isolated worker configuration with the requested per-sandbox and global retention budgets.
     def configure(per=PER_SANDBOX, total=GLOBAL):
         config.write_text(f'''node_id = "node-history"
 runtimes = ["runc_criu"]
@@ -156,6 +168,8 @@ max_artifact_bytes = 1048576
 command_timeout_seconds = 10
 ''')
 
+    # Launch a worker and require either ready admission or the expected retention-limit startup
+    # rejection. Save successful preflight evidence and record the check name.
     def start(name, rejected=False):
         log = root / f"{name}.log"
         with log.open("wb") as output:
@@ -166,6 +180,7 @@ command_timeout_seconds = 10
             assert proc.wait(timeout=20) != 0
             assert "retained_output_limit" in log.read_text()
         else:
+            # Require the launched worker to remain alive and report both admission and runtime readiness.
             def ready():
                 assert proc.poll() is None, f"worker exited; inspect {log.name}"
                 status = expect(request(worker_port, "/v1/status", token), 200)
@@ -178,14 +193,18 @@ command_timeout_seconds = 10
         observations["checks"].append(name)
         return proc
 
+    # Stop the worker cleanly and require its saved cleanup status to report no error.
     def stop(proc):
         proc.terminate()
         assert proc.wait(timeout=20) == 0
         assert json.loads((root / "worker-status.json").read_text())["cleanup_error"] is None
 
+    # Hash every saved sandbox record to detect history changes across restarts.
     def files():
         return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (root / "records").glob("*.json")}
 
+    # Compare all saved records and sandbox summaries to expected history, then verify selected full
+    # operation results through HTTP.
     def verify(expected):
         assert len(files()) == len(expected)
         for sandbox, r in expected.items():
@@ -204,6 +223,8 @@ command_timeout_seconds = 10
             for op_id, op in operations.items():
                 assert expect(request(worker_port, f"/v1/sandboxes/{sandbox}/operations/{op_id}", token), 200) == op
 
+    # Submit a bounded operation and check acceptance or retention rejection. For accepted work on
+    # terminal sandboxes, verify the saved output-free failure and update expected history.
     def submit(sandbox, kind, op_id, size, accepted=False):
         body = dict(operation_id=op_id)
         if kind == "capture":

@@ -14,12 +14,15 @@ import tempfile
 import time
 
 
+# Ask the local system for an unused loopback port, releasing it before returning the number.
 def port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
 
+# Send a loopback management request with optional authentication and JSON body. Read the JSON
+# response and always close the connection.
 def request(port_number, path, token=None, body=None, method="GET", chunked=False, timeout=4):
     headers = {}
     if token is not None:
@@ -38,6 +41,7 @@ def request(port_number, path, token=None, body=None, method="GET", chunked=Fals
         connection.close()
 
 
+# Assert the expected HTTP status and optional error code, then return the response data.
 def expect(result, status, code=None):
     actual, payload = result
     assert actual == status, f"expected HTTP {status}, got {actual}"
@@ -46,6 +50,8 @@ def expect(result, status, code=None):
     return payload
 
 
+# Poll until a check returns a truthy result, tolerating temporary connection errors until the
+# deadline.
 def eventually(check, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -59,6 +65,7 @@ def eventually(check, timeout=5):
     raise AssertionError("condition did not become true within smoke deadline")
 
 
+# Build a worker configuration with adjustable request limits and no enabled container backend.
 def worker_config(port_number, node="node-a", limit=32, timeout=800):
     return f'''node_id = "{node}"
 runtimes = ["runc_criu"]
@@ -77,6 +84,9 @@ max_concurrent_restores = 2
 '''
 
 
+# Launch local services and check authentication, input bounds, fail-closed readiness and stale-owner
+# routing. Exercise overload and shutdown without containers; clean up processes and check logs for
+# leaked tokens.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/sandboxd")
@@ -119,6 +129,8 @@ node_id = "node-b"
 url = "http://127.0.0.1:{second_port}"
 '''
 
+        # Write a service configuration, launch it with private test credentials and retain its process and
+        # log for cleanup.
         def start(role, text):
             index = len(processes)
             config = root / f"{role}-{index}.toml"
@@ -133,6 +145,8 @@ url = "http://127.0.0.1:{second_port}"
             logs.append(log)
             return process
 
+        # Terminate a service within a deadline and require a clean exit, killing it if graceful shutdown
+        # stalls.
         def stop(process):
             if process.poll() is None:
                 process.terminate()
@@ -144,6 +158,7 @@ url = "http://127.0.0.1:{second_port}"
                     raise AssertionError("service failed to terminate within smoke deadline")
             assert process.returncode == 0, "service exited unsuccessfully"
 
+        # Require startup to reject the supplied configuration without printing either test credential.
         def invalid_config(role, text, env=None):
             config = root / "invalid.toml"
             config.write_text(text)
@@ -202,6 +217,7 @@ url = "http://127.0.0.1:{second_port}"
                 {"runtime": "runc_criu", "ready": False, "reason": "runtime_disabled"},
             ]
 
+            # Read controller status and return its worker observations indexed by node ID.
             def nodes():
                 status = expect(request(controller_port, "/v1/status", controller_token), 200)
                 assert status["lifecycle_implemented"]
@@ -231,6 +247,7 @@ url = "http://127.0.0.1:{second_port}"
                     expect(request(number, f"/v1/sandboxes/{identifier}/capture", token, capture, "POST"), 400, "invalid_input")
             print("PASS strict inputs/identifiers, fixed/chunked body bounds and fail-closed create/exec/capture/HTTP")
 
+            # Send one mixed health, status or fail-closed create check to the selected service.
             def concurrent_check(index):
                 number, token = (worker_port, worker_token) if index % 2 else (controller_port, controller_token)
                 if index % 3 == 0:

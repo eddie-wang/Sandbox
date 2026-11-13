@@ -16,6 +16,10 @@ from functools import partial
 from smoke import eventually, expect, port, request as smoke_request
 
 
+# Require explicit privileged opt-in, prepare a tiny local template and launch worker/controller
+# services. Exercise cold runs, captures, restores, limits, restart cleanup and optional networking,
+# retaining observations. Route cleanup through owners and verify no owned runtime resources or leaked
+# tokens remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -166,6 +170,7 @@ url = "http://127.0.0.1:{worker_port}"
     ids = []
     observations = {"maximum_live_sandboxes": 3, "memory_mib_per_sandbox": 64, "vcpus_per_sandbox": 1, "pids_per_sandbox": 64}
 
+    # Launch the requested service, retain its log and process, and wait for its health endpoint.
     def start(role, config):
         log = root / f"{role}-{len(processes)}.log"
         with log.open("wb") as output:
@@ -174,10 +179,14 @@ url = "http://127.0.0.1:{worker_port}"
         eventually(lambda: request(worker_port if role == "worker" else controller_port, "/healthz")[0] == 200, timeout=15)
         return proc
 
+    # Read a sandbox's state through the controller and require a successful response.
     def get(sandbox):
         return expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token), 200)
 
+    # Wait for a sandbox to reach the requested state, failing early on lifecycle or cleanup errors.
     def state(sandbox, expected, timeout=120):
+        # Read current sandbox state and return it only when expected; surface terminal lifecycle failures
+        # immediately.
         def check():
             result = get(sandbox)
             if result["state"] in ("failed", "cleanup_failed"):
@@ -185,10 +194,14 @@ url = "http://127.0.0.1:{worker_port}"
             return result if result["state"] == expected else None
         return eventually(check, timeout=timeout)
 
+    # Submit a stable owned ID, wait for running state and verify identical-create replay versus
+    # conflicting reuse.
     def create(name, template_id="fixture", ttl=120):
         sandbox = "node-smoke." + name
         ids.append(sandbox)
         body = dict(sandbox_id=sandbox, template_id=template_id, runtime="runc_criu", architecture=compatibility["architecture"], memory_mib=64, vcpus=1, ttl_seconds=ttl)
+        # Retry the same create request; after an ambiguous response, check whether its sandbox record already
+        # exists.
         def accepted():
             code, payload = request(controller_port, "/v1/sandboxes", token, body, "POST")
             if code in (408, 503):
@@ -205,11 +218,14 @@ url = "http://127.0.0.1:{worker_port}"
         expect(request(worker_port, "/v1/sandboxes", worker_token, dict(body, ttl_seconds=ttl + 1), "POST"), 409, "idempotency_conflict")
         return sandbox
 
+    # Submit and poll a stable operation ID, checking completion unless failure is explicitly allowed.
+    # Retain bounded capture diagnostics on failure and verify that the completed request can be replayed.
     def op(sandbox, kind, body, allow_failure=False, operation=None):
         operation = operation or secrets.token_hex(8)
         body = dict(body, operation_id=operation)
-        # A transport timeout may have already accepted the known ID. Retry the
-        # identical request only; never generate a new operation ID on retry.
+        # Resubmit the identical operation until acknowledged; an ambiguous response may hide prior
+        # acceptance. Keep the same operation ID on retries, never creating a second job to replace an
+        # uncertain one.
         def accepted():
             code, payload = request(controller_port, f"/v1/sandboxes/{sandbox}/{kind}", token, body, "POST")
             if code in (408, 503):
@@ -217,6 +233,8 @@ url = "http://127.0.0.1:{worker_port}"
             expect((code, payload), 202)
             return True
         eventually(accepted, timeout=120)
+        # Poll saved operation state, tolerating temporary absence or unavailability until it is no longer
+        # pending.
         def complete():
             code, result = request(controller_port, f"/v1/sandboxes/{sandbox}/operations/{operation}", token)
             if code in (404, 503):
@@ -243,9 +261,12 @@ url = "http://127.0.0.1:{worker_port}"
         expect(request(worker_port, f"/v1/sandboxes/{sandbox}/{kind}", worker_token, body, "POST"), 202)
         return result
 
+    # Run a bounded fixture command inside the sandbox and return its successful standard output.
     def execute(sandbox, *argv):
         return op(sandbox, "exec", dict(argv=["/fixture", *argv], timeout_ms=3000, max_output_bytes=8192))["output"]["stdout"]
 
+    # Request deletion, wait for the deleted state and verify private files and the sandbox resource group
+    # are gone.
     def remove(sandbox):
         expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, method="DELETE"), 202)
         state(sandbox, "deleted")
@@ -304,6 +325,8 @@ url = "http://127.0.0.1:{worker_port}"
         connection = http.client.HTTPConnection("127.0.0.1", worker_port, timeout=4)
         connection.request("POST", f"/v1/sandboxes/{source}/exec", body=json.dumps(disconnected), headers={"Authorization":"Bearer " + worker_token,"Content-Type":"application/json"})
         connection.close()
+        # Poll the deliberately disconnected exec request, resubmitting its same ID only if no operation is
+        # found.
         def disconnected_completed():
             code, result = request(worker_port, f"/v1/sandboxes/{source}/operations/disconnected-response", worker_token)
             if code == 404:
@@ -328,6 +351,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert (cgroup / source / "cpu.max").read_text().strip() == "100000 100000"
         assert (cgroup / source / "pids.max").read_text().strip() == "64"
         # Namespace identities are independently owned, not a shared warm netns.
+        # Query runc for the sandbox's host process ID with a short deadline and controlled tool environment.
         def host_pid(sandbox):
             runc = str(Path(args.tools_dir) / "runc") if args.tools_dir else "runc"
             data = subprocess.run([runc, "--root", str(root / "runc"), "state", sandbox], check=True, capture_output=True, timeout=5, env={"PATH": args.tools_dir or "/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"})
@@ -341,6 +365,9 @@ url = "http://127.0.0.1:{worker_port}"
         # Examine links only inside owned netns; never change interfaces/rules.
         links = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "link", "show"], check=True, capture_output=True, timeout=5)
         assert sorted(link["ifname"] for link in json.loads(links.stdout)) == (["eth0", "lo"] if args.network else ["lo"])
+        # Inspect owned network state and exercise allowed/denied TCP, path-MTU discovery and application
+        # HTTP. Optionally check malformed and bounded HTTP failures while requiring the sandbox to remain
+        # running.
         def network_gate(sandbox, full=False):
             config_json = json.loads((root / "private" / sandbox / "config.json").read_text())
             guest = Path(config_json["linux"]["namespaces"][2]["path"]).name
@@ -353,6 +380,8 @@ url = "http://127.0.0.1:{worker_port}"
                 assert "connected=0" in execute(sandbox, "connect", ip, port_number, "0")
             # Black-hole probing must not mask the actual fragmentation-needed path.
             assert subprocess.check_output(["ip", "netns", "exec", guest, "cat", "/proc/sys/net/ipv4/tcp_mtu_probing"], text=True).strip() == "0"
+            # Sum packet counters in the selected routing-namespace firewall chain to observe path-MTU error
+            # traffic.
             def pmtu_count(chain):
                 data = json.loads(subprocess.check_output(["ip", "netns", "exec", slot, "nft", "-j", "list", "chain", "inet", "sandbox", chain], text=True))
                 return sum(expr["counter"]["packets"] for entry in data["nftables"] for expr in entry.get("rule", {}).get("expr", []) if "counter" in expr)

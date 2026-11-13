@@ -22,10 +22,13 @@ pub struct ApplicationHttpLimits {
     pub max_timeout_ms: u64,
 }
 impl Default for ApplicationHttpLimits {
+    // Use small default application HTTP body, response and deadline limits.
     fn default() -> Self { Self { max_body_bytes: 8192, max_response_bytes: 65536, max_timeout_ms: 30000 } }
 }
 impl ApplicationHttpLimits {
+    // Reserve room for the largest response after JSON escaping and metadata.
     pub fn response_reservation(&self) -> usize { self.max_response_bytes as usize * 6 + 8192 }
+    // Check that application HTTP sizes and deadlines stay within supported bounds.
     fn valid(&self) -> bool {
         (1..=16384).contains(&self.max_body_bytes) && (1..=8388608).contains(&self.max_response_bytes)
             && (1..=600000).contains(&self.max_timeout_ms)
@@ -33,6 +36,7 @@ impl ApplicationHttpLimits {
 }
 
 impl Default for ServerConfig {
+    // Set default management request limits and leave the listen address unspecified.
     fn default() -> Self {
         Self {
             listen: None,
@@ -45,6 +49,8 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    // Reject out-of-range request limits or an enlarged application body without enough JSON envelope
+    // space.
     fn validate(&self) -> Result<(), &'static str> {
         if !(1..=1_024).contains(&self.max_in_flight)
             || !(100..=30_000).contains(&self.request_timeout_ms)
@@ -59,10 +65,12 @@ impl ServerConfig {
         Ok(())
     }
 
+    // Use the configured listen address, or loopback with the supplied default port.
     pub fn address(&self, port: u16) -> SocketAddr {
         self.listen.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)))
     }
 
+    // Return the configured management request deadline.
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.request_timeout_ms)
     }
@@ -76,6 +84,8 @@ pub struct CredentialSource {
 }
 
 impl CredentialSource {
+    // Read exactly one credential source, allowing one line ending in a bounded secret file. Reject
+    // missing sources, invalid encoding, whitespace and out-of-range token lengths.
     pub fn load(&self) -> Result<String, &'static str> {
         let token = match (&self.env, &self.file) {
             (Some(name), None) if !name.is_empty() => {
@@ -120,6 +130,7 @@ pub struct PollConfig {
 }
 
 impl Default for PollConfig {
+    // Set default polling frequency, deadline, freshness window and parallelism.
     fn default() -> Self {
         Self { interval_ms: 1_000, timeout_ms: 1_000, freshness_ms: 5_000, fanout: 8 }
     }
@@ -139,6 +150,8 @@ pub struct ControllerConfig {
 }
 
 impl ControllerConfig {
+    // Validate server and polling limits, unique worker identities and HTTP(S) origins. Reject worker URLs
+    // containing credentials or extra path, query or fragment data.
     pub fn validate(&self) -> Result<(), &'static str> {
         self.server.validate()?;
         if self.workers.len() > 128
@@ -221,6 +234,8 @@ pub struct NetworkConfig {
     pub service_ports: Vec<u16>,
 }
 impl NetworkConfig {
+    // Check bridge naming, pool size and allowed destinations and ports. Require distinct usable pool
+    // addresses in the gateway subnet, excluding the gateway and egress targets.
     fn valid(&self) -> bool {
         if self.bridge.is_empty() || self.bridge.len() > 15 || !self.bridge.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             || !(8..=30).contains(&self.prefix) || self.addresses.is_empty() || self.addresses.len() > 256
@@ -234,11 +249,15 @@ impl NetworkConfig {
     }
 }
 
+// Default to a 16 MiB worker-wide retained-output budget.
 fn default_retained_output() -> usize { 16777216 }
+// Default to an 8 MiB retained-output budget per sandbox.
 fn default_sandbox_retained_output() -> usize { 8388608 }
+// Default to sixteen concurrent lifecycle operations.
 fn default_concurrent_operations() -> usize { 16 }
 
 impl NativeConfig {
+    // Reject unsafe native paths, invalid network settings and out-of-range resource or retention limits.
     fn validate(&self) -> Result<(), &'static str> {
         for path in [&self.root, &self.cgroup_parent].into_iter().chain(self.tools_dir.iter()) {
             if !path.starts_with('/') || path.len() > 256
@@ -266,6 +285,8 @@ impl NativeConfig {
 }
 
 impl WorkerConfig {
+    // Validate worker identity, capacity and runtime settings. Require HTTP result reservations, network
+    // slots and restore concurrency to fit their enclosing budgets.
     pub fn validate(&self) -> Result<(), &'static str> {
         self.server.validate()?;
         if !valid_id(&self.node_id) || !self.capacity.valid() {
@@ -289,6 +310,7 @@ impl WorkerConfig {
     }
 }
 
+// Read a bounded configuration file and decode it without exposing file contents in errors.
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, &'static str> {
     let bytes = read_bounded(path, 65_536).map_err(|_| "configuration file unavailable or too large")?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "invalid configuration encoding")?;
@@ -296,6 +318,7 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, &'static s
     toml::from_str(text).map_err(|_| "invalid configuration: check fields and types")
 }
 
+// Read only a regular file, rejecting contents larger than the supplied byte limit.
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(std::io::Error::other("expected regular file"));

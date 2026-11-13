@@ -25,6 +25,7 @@ struct Limits {
 pub struct ApiError(pub StatusCode, pub &'static str, pub &'static str);
 
 impl IntoResponse for ApiError {
+    // Return the safe API error envelope with caching disabled and a bearer challenge when unauthorized.
     fn into_response(self) -> Response {
         #[derive(Serialize)]
         struct ErrorBody {
@@ -46,14 +47,17 @@ impl IntoResponse for ApiError {
     }
 }
 
+// Return a generic bad-request error without echoing submitted data.
 pub fn invalid_input() -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, "invalid_input", "Invalid request fields or JSON")
 }
 
+// Extract parsed request data or replace parsing details with a generic input error.
 pub fn json<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     input.map(|Json(value)| value).map_err(|_| invalid_input())
 }
 
+// Wrap management routes with authentication and request bounds, plus a safe unknown-route response.
 pub fn protect(router: Router, config: &ServerConfig, token: String) -> Router {
     router
         .fallback(|| async {
@@ -67,6 +71,8 @@ pub fn protect(router: Router, config: &ServerConfig, token: String) -> Router {
         }, guard))
 }
 
+// Require a single matching bearer token except for public health reads. Limit concurrent requests,
+// body size and handling time, then disable response caching.
 async fn guard(State(limits): State<Limits>, request: Request, next: Next) -> Response {
     let public_health = request.method() == Method::GET && request.uri().path() == "/healthz";
     if !public_health {
@@ -104,6 +110,7 @@ async fn guard(State(limits): State<Limits>, request: Request, next: Next) -> Re
     response
 }
 
+// Wait for an interrupt or, where supported, a termination signal to begin graceful shutdown.
 pub async fn shutdown() {
     #[cfg(unix)]
     {

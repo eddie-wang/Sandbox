@@ -15,6 +15,7 @@ use std::path::Path;
 
 const USAGE: &str = "Usage: sandboxd <controller|worker|preflight> --config <file>\nCredentials are read only from the configured environment variable or file.";
 
+// Run the selected mode, printing a safe startup error and exiting unsuccessfully on failure.
 fn main() {
     if let Err(message) = start() {
         eprintln!("sandboxd: {message}");
@@ -22,6 +23,8 @@ fn main() {
     }
 }
 
+// Dispatch internal helpers or load and validate the selected service configuration. Load credentials
+// only for serving; preflight prints its checks and fails if prerequisites are missing.
 fn start() -> Result<(), &'static str> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "internal-forward" { return network::forward_helper(true); }
@@ -61,6 +64,7 @@ fn start() -> Result<(), &'static str> {
     }
 }
 
+// Create the event-processing runtime used to serve controller or worker requests.
 fn runtime() -> Result<tokio::runtime::Runtime, &'static str> {
     tokio::runtime::Builder::new_multi_thread().enable_all().build()
         .map_err(|_| "cannot initialize async runtime")

@@ -33,7 +33,9 @@ pub struct Record {
     pub operations: BTreeMap<String, Operation>,
 }
 impl Record {
+    // Keep capacity reserved until the record is deleted or failed.
     pub fn reserved(&self) -> bool { !matches!(self.state.as_str(), "deleted" | "failed") }
+    // Collect exec operation IDs so cleanup can find their child resource groups.
     fn exec_operations(&self) -> Vec<String> { self.operations.iter().filter(|(_, op)| op.kind == "exec").map(|(id, _)| id.clone()).collect() }
 }
 pub struct Snapshot {
@@ -52,8 +54,12 @@ enum Action { Create, Http(HttpRequest), Exec(ExecRequest), Capture(CaptureReque
 struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool> }
 struct Flight { slot: usize, restore: bool, output_bytes: usize, template: Option<String>, cancelled: Arc<AtomicBool> }
 struct Lower { manifest: storage::Manifest, done: mpsc::Sender<Result<()>> }
+// Return seconds since the Unix epoch, falling back to zero if the clock is earlier.
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+// Hash the serialized request to recognize identical operation retries.
 pub fn fingerprint<T: Serialize>(input: &T) -> String { storage::digest(&serde_json::to_vec(input).expect("serialize validated input")) }
+// Count serialized bytes only for operations with stored exec or HTTP output; absent outputs cost
+// zero.
 fn output_bytes(record: &Record) -> usize {
     // No-output history is bounded by record/operation counts, not result bytes.
     record.operations.values().filter(|o| o.output.is_some() || o.http_output.is_some())
@@ -61,6 +67,9 @@ fn output_bytes(record: &Record) -> usize {
 }
 
 impl Handle {
+    // Return an unavailable handle if the runtime is disabled or preflight fails. Otherwise reconcile
+    // durable state before starting bounded operation workers, serialized admission and expiry monitoring;
+    // accepted jobs continue independently of HTTP connections.
     pub fn start(config: &WorkerConfig, report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
@@ -165,6 +174,8 @@ struct Engine {
     stopping: Option<mpsc::Sender<Result<()>>>, stop_attempted: BTreeSet<String>,
 }
 impl Engine {
+    // Persist a sandbox record and refresh its public snapshot. A save failure closes admission, even
+    // though the in-memory view is still updated.
     fn save(&mut self, id: &str) -> Result<()> {
         let result = process::atomic_json(&self.native.root().join("records").join(format!("{id}.json")), &self.records[id]);
         if result.is_err() { self.healthy = false; }
@@ -172,11 +183,14 @@ impl Engine {
         self.snapshot.write().expect("snapshot poisoned").records.insert(id.into(), record);
         self.publish(); result
     }
+    // Total reserved memory, CPUs and sandbox slots, plus in-flight create/capture slots; not measured
+    // memory use.
     fn usage(&self) -> Usage {
         let mut u = Usage { memory_mib: 0, vcpus: 0, sandboxes: 0, restores: self.flights.values().filter(|f| f.restore).count() as u32 };
         for r in self.records.values().filter(|r| r.reserved()) { u.memory_mib += r.request.memory_mib; u.vcpus += r.request.vcpus; u.sandboxes += 1; }
         u
     }
+    // Publish reservation totals and admission readiness, with a reason when the engine is unhealthy.
     fn publish(&self) {
         let usage = self.usage();
         let mut s = self.snapshot.write().expect("snapshot poisoned");
@@ -184,7 +198,10 @@ impl Engine {
         s.status.runtimes[0].ready = self.healthy;
         s.status.runtimes[0].reason = if self.healthy { "experimental_preflight_passed" } else if self.stopping.is_some() { "shutting_down" } else { "durability_failure" }.into();
     }
+    // Find the first operation worker slot not assigned to an in-flight job.
     fn idle_slot(&self) -> Option<usize> { (0..self.pool.len()).find(|slot| !self.flights.values().any(|f| f.slot == *slot)) }
+    // Reserve a job's slot, output budget and cancellation flag, then send it to an operation worker. If
+    // dispatch fails, close admission and save the sandbox as needing cleanup.
     fn launch(&mut self, id: &str, action: Action, slot: usize) {
         let restore = matches!(action, Action::Create | Action::Capture(_));
         let output_bytes = match &action { Action::Exec(r) => r.max_output_bytes as usize * 6 + 4096, Action::Http(r) => r.max_response_bytes as usize * 6 + 8192, _ => 0 };
@@ -202,6 +219,8 @@ impl Engine {
         }
         self.publish();
     }
+    // Match a completed job to its slot, release in-flight reservations and preserve pending deletion.
+    // Schedule cleanup retries when needed and save the returned record.
     fn complete(&mut self, slot: usize, mut record: Record) {
         if self.native.helpers.ensure_healthy().is_err() { self.healthy = false; }
         let id = record.request.sandbox_id.clone();
@@ -214,6 +233,8 @@ impl Engine {
         self.records.insert(id.clone(), record);
         let _ = self.save(&id);
     }
+    // Route submitted work to admission or deletion after checking helper health. Unhealthy workers reject
+    // new work but still accept deletion requests.
     fn accept(&mut self, work: Work) {
         if self.native.helpers.ensure_healthy().is_err() { self.healthy = false; self.publish(); }
         match work {
@@ -225,6 +246,9 @@ impl Engine {
             _ => unreachable!(),
         }
     }
+    // Replay identical create IDs or reject conflicts, then check slots, budgets and resource ownership.
+    // Save either the creating record or a capacity failure before acknowledging; launch only an admitted,
+    // saved create.
     fn create(&mut self, request: CreateRequest, ack: Ack) {
         let id = request.sandbox_id.clone();
         if let Some(r) = self.records.get(&id) { let _ = ack.send(if r.request == request { Ok(()) } else { Err("idempotency_conflict") }); return; }
@@ -244,6 +268,9 @@ impl Engine {
         if saved.is_ok() && error.is_none() { self.launch(&id, Action::Create, slot); }
         let _ = ack.send(saved);
     }
+    // Replay identical operation IDs or reject conflicts; enforce per-sandbox, pool, restore and output
+    // budgets. Save a pending operation for a live sandbox, or a failure otherwise, then acknowledge
+    // acceptance. Only saved pending work is launched; output-free actions need no output reservation.
     fn operation(&mut self, id: &str, action: Action, ack: Ack) {
         let (op_id, hash, kind) = match &action {
             Action::Http(r) => (r.operation_id.clone(), fingerprint(r), "http"),
@@ -273,6 +300,7 @@ impl Engine {
         if saved.is_ok() && running { self.launch(id, action, slot); }
         let _ = ack.send(saved);
     }
+    // Mark an owned, nonterminal sandbox for deletion, signal any active job and save the request.
     fn request_delete(&mut self, id: &str) -> Result<()> {
         let record = self.records.get_mut(id).ok_or("sandbox_not_found")?;
         if !record.reserved() { return Ok(()); }
@@ -280,6 +308,8 @@ impl Engine {
         if let Some(f) = self.flights.get(id) { f.cancelled.store(true, Ordering::Relaxed); }
         self.save(id)
     }
+    // Arrange deletion for expired, cancelled or unhealthy sandboxes and retry failed cleanup. Wait for
+    // active jobs and available slots; shutdown attempts each remaining cleanup once.
     fn maintenance(&mut self) {
         let ids: Vec<_> = self.records.iter().filter(|(_, r)| r.reserved() && (!self.healthy || r.expires_at <= now() || r.delete_requested || r.state == "cleanup_failed"))
             .map(|(id, _)| id.clone()).collect();
@@ -295,6 +325,9 @@ impl Engine {
             self.launch(&id, Action::Delete, slot);
         }
     }
+    // Load durable history within retention budgets and reject invalid or untracked resources. Clean up
+    // interrupted sandboxes, mark pending operations failed and remove abandoned staging. Release unused
+    // lower mounts and save cleanup status; durability failures prevent startup.
     fn reconcile(&mut self) -> Result<()> {
         let mut retained_bytes = 0usize;
         for entry in fs::read_dir(self.native.root().join("records")).map_err(|_| "record_scan_failed")? {
@@ -345,17 +378,22 @@ impl Engine {
 
 struct Runner<'a> { native: &'a Native, lowers: &'a mpsc::SyncSender<Lower>, record: Record, cancelled: Arc<AtomicBool> }
 impl Runner<'_> {
+    // Refuse further runtime work once the sandbox is cancelled or expired.
     fn active(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Relaxed) || self.record.expires_at <= now() { Err("sandbox_cancelled_or_expired") } else { Ok(()) }
     }
+    // Run the assigned lifecycle action against this job's sandbox record.
     fn perform(&mut self, action: Action) {
         match action { Action::Create => self.create(), Action::Http(r) => self.http(r), Action::Exec(r) => self.exec(r), Action::Capture(r) => self.capture(r), Action::Delete => self.delete() }
     }
+    // Remove the sandbox's owned resources and mark it deleted, or retain a cleanup failure.
     fn delete(&mut self) {
         let result = self.native.cleanup(&self.record.request.sandbox_id, &self.record.exec_operations());
         self.record.state = if result.is_ok() { "deleted" } else { "cleanup_failed" }.into();
         if let Err(e) = result { self.record.error = Some(e.into()); }
     }
+    // Verify the template, arrange its shared lower mount and prepare a private cold run or restore. Mark
+    // success as running; on failure attempt cleanup before recording the error.
     fn create(&mut self) {
         let result = (|| -> Result<()> {
             self.active()?;
@@ -370,9 +408,13 @@ impl Runner<'_> {
         if let Err(e) = result { self.delete(); if self.record.state == "deleted" { self.record.state = "failed".into(); self.record.error = Some(e.into()); } }
         else { self.record.state = "running".into(); }
     }
+    // Mark an operation complete or failed and store its error.
     fn finish(&mut self, id: &str, error: Option<&str>) {
         let op = self.record.operations.get_mut(id).unwrap(); op.state = if error.is_some() { "failed" } else { "complete" }.into(); op.error = error.map(str::to_owned);
     }
+    // Start a new sandbox process with bounded output and a deadline capped by the remaining TTL. Drain
+    // its descendants and retain the result; interruption or execution/cleanup errors delete the whole
+    // sandbox.
     fn exec(&mut self, request: ExecRequest) {
         let id = self.record.request.sandbox_id.clone();
         let file = self.native.private(&id).join("exec.json");
@@ -394,6 +436,8 @@ impl Runner<'_> {
             Err(e) => { self.delete(); self.finish(&request.operation_id, Some(e)); }
         }
     }
+    // Run a policy-constrained application HTTP request within the remaining TTL and save its result. A
+    // failed or bounded request fails only the operation, without deleting the sandbox here.
     fn http(&mut self, request: HttpRequest) {
         let result = self.active().and_then(|_| self.record.network_policy.as_ref().ok_or("network_policy_unavailable")).and_then(|policy|
             self.native.application_http(&self.record.request.sandbox_id, &request, policy, self.record.expires_at.saturating_sub(now()).saturating_mul(1000)));
@@ -402,11 +446,16 @@ impl Runner<'_> {
             Err(e) => self.finish(&request.operation_id, Some(e)),
         }
     }
+    // Check that the source is still active, remove stopped runtime state and restore its captured
+    // processes.
     fn recover(&self, images: &Path) -> Result<()> {
         self.active()?;
         self.native.forget_stopped(&self.record.request.sandbox_id)?;
         self.native.restore_source(&self.record.request, images, self.record.expires_at, &self.cancelled)
     }
+    // Stop the source to capture matching process and filesystem state in exclusively owned staging. Hash
+    // and describe the artifacts, then recover the source before publishing the template. On failure,
+    // recover or delete the source and clean owned staging; errors after publication do not undo it.
     fn capture(&mut self, request: CaptureRequest) {
         let id = self.record.request.sandbox_id.clone();
         // Length prefix makes the pair injective even when either ID contains hyphens.

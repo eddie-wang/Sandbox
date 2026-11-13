@@ -16,10 +16,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
+# Run a fixture setup or inspection command with a short deadline, requiring success and returning its
+# output.
 def run(*args):
     return subprocess.run(args, check=True, capture_output=True, timeout=10).stdout.decode()
 
 
+# Snapshot links, routes, firewall rules and forwarding in the current network namespace.
 def inventory():
     return {"links": json.loads(run("ip", "-j", "link")),
             "routes": json.loads(run("ip", "-j", "route", "show", "table", "all")),
@@ -28,15 +31,19 @@ def inventory():
 
 
 class Fixture(BaseHTTPRequestHandler):
+    # Serve a fixed successful response from the local test HTTP peer.
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"local-approved-fixture")
 
+    # Suppress routine request logging from the fixture server.
     def log_message(self, *args):
         pass
 
 
+# Require a separate privileged network namespace and listen on the two local test ports. Acknowledge
+# only the expected 64 KiB payload, tolerating bounded connection failures.
 def pmtu_peer():
     assert os.geteuid() == 0 and os.readlink("/proc/self/ns/net") != os.environ["SANDBOX_TEST_PARENT_NETNS"]
     listeners = []
@@ -67,6 +74,9 @@ def pmtu_peer():
                     pass
 
 
+# Require explicit privileged opt-in and run fixtures inside a disposable network and mount namespace.
+# Exercise lifecycle networking against local peers, then clean owned resources and compare the outer
+# inventory.
 def main():
     if sys.argv[1:] == ["--pmtu-peer"]:
         return pmtu_peer()

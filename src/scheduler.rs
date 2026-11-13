@@ -1,7 +1,9 @@
 use crate::{controller::NodeView, model::CreateRequest};
 
-// Advisory only. A snapshot is not a reservation; worker-side atomic admission remains required.
-// Template digests and exact compatibility are checked by the worker before launch.
+// Filter only the supplied candidates for freshness, runtime readiness, compatibility and available
+// budgets. Score each by its highest projected reservation fraction; choose the lowest score, breaking
+// ties by node ID. This is advisory, not a reservation: the worker still admits atomically and checks
+// template digests and exact compatibility.
 pub fn choose<'a>(nodes: &'a [NodeView], request: &CreateRequest) -> Option<&'a str> {
     nodes.iter().filter_map(|node| {
         let status = node.status.as_ref()?;

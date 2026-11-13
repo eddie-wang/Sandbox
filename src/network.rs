@@ -5,16 +5,23 @@ use crate::{model::{NetworkPolicy, HttpRequest, HttpOutput}, native::Native, pro
 
 pub const GUEST: &str = "192.0.2.2";
 const GATEWAY: &str = "192.0.2.1";
+// Confirm a link name is absent from the current network namespace; unreadable inventory is not proof
+// of absence.
 fn link_absent(name: &str) -> bool {
     fs::read_to_string("/proc/net/dev").is_ok_and(|v| !v.lines().any(|l| l.split_once(':').is_some_and(|(n,_)| n.trim() == name)))
 }
 impl Native {
+    // Derive stable guest namespace, routing namespace and host link names from the worker root and
+    // sandbox ID.
     pub fn network_names(&self, id: &str) -> (String, String, String) {
         let hash = storage::digest(format!("{}:{id}", self.config.root).as_bytes());
         let prefix = self.network_prefix();
         (format!("{prefix}g-{}", &hash[..20]), format!("{prefix}s-{}", &hash[..20]), format!("sb{}", &hash[..12]))
     }
+    // Derive the namespace-name prefix reserved for this worker root.
     fn network_prefix(&self) -> String { format!("sb-{}-", &storage::digest(self.config.root.as_bytes())[..16]) }
+    // Check recorded sandbox network resources for ownership markers. Reject extra namespace names under
+    // this worker's prefix rather than adopting unknown state.
     pub fn verify_network_names<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Result<()> {
         let mut expected = std::collections::BTreeSet::new();
         for id in ids {
@@ -30,11 +37,14 @@ impl Native {
         }
         Ok(())
     }
+    // Confirm that both sandbox namespace pins and its host-side link are absent.
     pub fn network_absent(&self, id: &str) -> bool {
         let (guest, slot, link) = self.network_names(id);
         !Path::new("/run/netns").join(guest).exists() && !Path::new("/run/netns").join(slot).exists()
             && link_absent(&link)
     }
+    // Require a template's TCP destinations and service ports to be valid subsets of operator permissions;
+    // isolation needs none.
     pub fn network_policy(&self, policy: &NetworkPolicy) -> Result<()> {
         if let NetworkPolicy::TcpAllowlist { egress, service_ports } = policy {
             let config = self.config.network.as_ref().ok_or("network_disabled")?;
@@ -43,6 +53,10 @@ impl Native {
         }
         Ok(())
     }
+    // For an approved TCP policy, claim the network slot and create private guest and routing namespaces.
+    // Install deny-by-default filters and address translation before enabling links to the operator
+    // bridge. An isolated policy needs no external links; caller-owned cleanup handles partial setup
+    // failures.
     pub fn prepare_network(&self, id: &str, policy: &NetworkPolicy, index: Option<usize>) -> Result<()> {
         self.network_policy(policy)?;
         let NetworkPolicy::TcpAllowlist { egress, service_ports } = policy else { return Ok(()); };
@@ -97,6 +111,8 @@ impl Native {
         ns(&slot, &["route", "add", "default", "via", &config.gateway.to_string()])?;
         ip(vec!["link".into(), "set".into(), link, "up".into()])
     }
+    // Remove only network namespaces backed by this sandbox's ownership marker. Wait for pins and links to
+    // disappear; unknown state or incomplete cleanup remains an error.
     pub fn cleanup_network(&self, id: &str) -> Result<()> {
         if !self.private(id).join("network-owned").exists() {
             return if self.network_absent(id) { Ok(()) } else { Err("untracked_network_state") };
@@ -114,6 +130,8 @@ impl Native {
         }
         Ok(())
     }
+    // Before capturing a TCP-enabled sandbox, require its guest namespace to have no active TCP
+    // connections.
     pub fn capture_network_ready(&self, id: &str, policy: Option<&NetworkPolicy>) -> Result<()> {
         if matches!(policy, Some(NetworkPolicy::TcpAllowlist { .. })) {
             let (guest, _, _) = self.network_names(id);
@@ -122,6 +140,9 @@ impl Native {
         }
         Ok(())
     }
+    // Check the template/operator service-port permission and cap the request by the remaining TTL. Run a
+    // bounded HTTP helper inside the sandbox's routing namespace, remove its request file and decode the
+    // result.
     pub fn application_http(&self, id: &str, request: &HttpRequest, policy: &NetworkPolicy, remaining_ms: u64) -> Result<HttpOutput> {
         self.network_policy(policy)?;
         if !matches!(policy, NetworkPolicy::TcpAllowlist { service_ports, .. } if service_ports.contains(&request.port)) { return Err("service_port_not_authorized"); }
@@ -140,7 +161,8 @@ impl Native {
     }
 }
 
-// This mode runs in a fresh, tracked helper process, never a pooled worker thread.
+// Disable IPv6 in the current namespace and enable IPv4 forwarding only for a routing slot. This runs
+// in a fresh, tracked helper process, never a pooled worker thread.
 pub fn forward_helper(forward: bool) -> Result<()> {
     for name in ["all", "default"] {
         fs::write(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"), "1").map_err(|_| "namespace_ipv6_disable_failed")?;
@@ -148,6 +170,8 @@ pub fn forward_helper(forward: bool) -> Result<()> {
     if forward { fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|_| "slot_forwarding_failed")?; }
     Ok(())
 }
+// Read a bounded TCP socket inventory in the current namespace and allow only listening, time-wait or
+// closed sockets.
 pub fn tcp_check_helper() -> Result<()> {
     use std::io::Read;
     let mut text = String::new();
@@ -155,6 +179,10 @@ pub fn tcp_check_helper() -> Result<()> {
     if text.len() > 4194304 || text.lines().skip(1).any(|l| !matches!(l.split_whitespace().nth(3), Some("0A" | "06" | "07"))) { return Err("capture_requires_quiescent_tcp"); }
     Ok(())
 }
+// Read and validate the request already approved by the caller, then contact the fixed guest address.
+// Disable proxies and redirects, bound time and response size, and print a text HTTP result.
+// Service-port authorization belongs to the caller; this helper does not authenticate management
+// requests.
 pub fn http_helper(path: &Path) -> Result<()> {
     // Covers the opt-in 16 KiB text body after worst-case JSON escaping,
     // plus bounded path/headers/operation metadata.

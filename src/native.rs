@@ -25,6 +25,8 @@ pub struct Native {
 
 const TOOL_NAMES: &[&str] = &["runc", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip"];
 
+// Find executable tools in trusted administrator-owned directories. Reject writable or untrusted
+// binaries and disallow symlinks in an explicitly configured tools directory.
 fn tools(config: Option<&NativeConfig>) -> BTreeMap<String, String> {
     use std::os::unix::fs::MetadataExt;
     let mut tools = BTreeMap::new();
@@ -47,6 +49,8 @@ fn tools(config: Option<&NativeConfig>) -> BTreeMap<String, String> {
     tools
 }
 
+// Build a search path from verified tool directories and reject any executable that would shadow a
+// selected tool.
 fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
     let mut dirs = std::collections::BTreeSet::new();
     for path in tools.values() { if let Some(parent) = Path::new(path).parent() { dirs.insert(parent.display().to_string()); } }
@@ -63,6 +67,9 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
     Ok(dirs.into_iter().collect::<Vec<_>>().join(":"))
 }
 
+// Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
+// creating runtime state. Collect compatibility fingerprints and report readiness only if every check
+// passes; qualification stays unvalidated.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
     let search_path = tool_search_path(&tools);
@@ -130,6 +137,8 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
 }
 
 impl Native {
+    // Require successful preflight and exclusive ownership of the runtime root. Verify tools, drain old
+    // helper processes before touching runtime state and create private storage directories.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -145,33 +154,46 @@ impl Native {
         for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc"] { storage::private_dir(&root.join(dir))?; }
         Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, _lock: lock })
     }
+    // Return the configured root of this worker's runtime storage.
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
+    // Locate a sandbox's private writable state beneath the worker root.
     pub fn private(&self, id: &str) -> PathBuf { self.root().join("private").join(id) }
+    // Return the verified executable path, or fail if that tool was not discovered.
     pub fn tool(&self, name: &str) -> Result<&str> { self.tools.get(name).map(String::as_str).ok_or("tool_missing") }
+    // Run a verified host tool with the configured deadline and tracked helper cleanup, requiring success.
     pub(crate) fn command(&self, tool: &str, args: Vec<String>) -> Result<()> {
         process::checked(self.tool(tool)?, &args, self.config.command_timeout_seconds, &self.search_path, &self.helpers)
     }
+    // Run runc against this worker's private state with the supplied deadline and output limit. Discard
+    // output for detached cold runs and restores so workload streams are not retained as helper output.
     pub fn runc(&self, args: Vec<String>, timeout: Duration, limit: usize) -> Result<process::Output> {
         let mut all = vec!["--root".into(), self.root().join("runc").display().to_string(), "--log".into(), "/dev/null".into()];
         let detached = args.first().is_some_and(|a| a == "run" || a == "restore");
         all.extend(args);
         self.helpers.run(self.tool("runc")?, &all, timeout, limit, detached, &self.search_path)
     }
+    // Run runc with standard command bounds and reject interruption or a nonzero exit.
     fn runc_checked(&self, args: Vec<String>) -> Result<()> {
         let out = self.runc(args, Duration::from_secs(self.config.command_timeout_seconds), 65536)?;
         if out.interrupted { Err("runc_deadline_or_output_limit") }
         else if out.exit_code != Some(0) { Err("runc_failed") } else { Ok(()) }
     }
+    // Load and fully verify a template, then require operator-approved networking and the configured
+    // process limit.
     pub fn template(&self, id: &str) -> Result<Manifest> {
         let m = storage::load(self.root(), id, &self.compatibility, self.config.max_artifact_bytes)?;
         self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
         Ok(m)
     }
+    // Check that no network, private storage, runtime state or resource group already uses this sandbox
+    // ID.
     pub fn resources_absent(&self, id: &str) -> bool {
         self.network_absent(id) && !self.private(id).exists() && !self.root().join("runc").join(id).exists()
             && !Path::new(&self.config.cgroup_parent).join(id).exists()
     }
+    // Mount an immutable EROFS base if needed, then verify its flags and backing image even when reusing
+    // the mount.
     pub fn mount_lower(&self, manifest: &Manifest) -> Result<()> {
         let lower = self.root().join("lowers").join(&manifest.base.sha256);
         if !lower.exists() { storage::private_dir(&lower)?; }
@@ -182,6 +204,9 @@ impl Native {
         }
         storage::verify_lower(&lower, &image)
     }
+    // Build a private writable overlay, extracting both archives anew for a checkpoint restore. Apply
+    // resource limits and template networking before writing and checking the execution specification.
+    // Recheck cancellation and expiry, then cold-start or restore the sandbox and confirm it is running.
     pub fn prepare(&self, request: &CreateRequest, manifest: &Manifest, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         let id = &request.sandbox_id;
         let private = self.private(id);
@@ -212,6 +237,7 @@ impl Native {
         else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; }
         self.ensure_running(id)
     }
+    // Create a sandbox resource group and set memory, swap, process-count and CPU limits.
     fn cgroup(&self, request: &CreateRequest) -> Result<()> {
         let p = Path::new(&self.config.cgroup_parent).join(&request.sandbox_id);
         fs::create_dir(&p).map_err(|_| "cgroup_create_failed")?;
@@ -221,6 +247,9 @@ impl Native {
         }
         Ok(())
     }
+    // Write the worker-owned execution and checkpoint settings, including private storage and namespaces.
+    // Apply restricted process privileges, devices and system calls, using the template's prepared network
+    // namespace when allowed.
     fn write_spec(&self, request: &CreateRequest, manifest: &Manifest) -> Result<()> {
         let private = self.private(&request.sandbox_id);
         // Request-specific CRIU options are worker-authored. Administrator-owned
@@ -261,6 +290,8 @@ impl Native {
         }
         process::atomic_json(&private.join("config.json"), &spec)
     }
+    // Hash the saved execution specification after replacing worker-local reconstruction paths with stable
+    // markers.
     pub fn spec_digest(&self, id: &str) -> Result<String> {
         let mut spec: Value = storage::read_json(&self.private(id).join("config.json"), 65536)?;
         // Only worker-local reconstruction paths vary between independent containers.
@@ -269,18 +300,23 @@ impl Native {
         spec["annotations"]["org.criu.config"] = json!("<worker-criu-config>");
         Ok(storage::digest(&serde_json::to_vec(&spec).map_err(|_| "spec_encode_failed")?))
     }
+    // Describe an unprivileged sandbox process with fixed environment, workspace, empty capabilities and
+    // resource limits.
     pub fn process_spec(&self, argv: Vec<String>) -> Value {
         json!({"terminal":false,"user":{"uid":65534,"gid":65534},"args":argv,
             "env":["PATH=/usr/local/bin:/usr/bin:/bin","HOME=/workspace","LANG=C"],"cwd":"/workspace",
             "capabilities":{"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]},
             "noNewPrivileges":true,"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":1024},{"type":"RLIMIT_CORE","hard":0,"soft":0}]})
     }
+    // Ask runc for container state and require a successful response reporting it as running.
     pub fn ensure_running(&self, id: &str) -> Result<()> {
         let out = self.runc(vec!["state".into(), id.into()], Duration::from_secs(5), 16384)?;
         let state: Value = serde_json::from_str(&out.stdout).map_err(|_| "container_not_running")?;
         if out.exit_code != Some(0) || state["status"] != "running" { return Err("container_not_running"); }
         Ok(())
     }
+    // Checkpoint and stop the source through runc, saving process images and file locks with network
+    // locking enabled.
     pub fn checkpoint(&self, id: &str, images: &Path) -> Result<()> {
         // Mount compatibility mode is a restore-only CRIU option.
         fs::write(self.private(id).join("criu.conf"), "network-lock nftables\n").map_err(|_| "criu_config_failed")?;
@@ -288,6 +324,8 @@ impl Native {
             "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
             "--file-locks".into(), id.into()]).map_err(|_| "checkpoint_failed")
     }
+    // Restore captured processes into the prepared sandbox without replacing its resource groups, then
+    // confirm it is running.
     pub fn restore(&self, id: &str, images: &Path) -> Result<()> {
         fs::write(self.private(id).join("criu.conf"), "mntns-compat-mode\nnetwork-lock nftables\n").map_err(|_| "criu_config_failed")?;
         self.runc_checked(vec!["restore".into(), "--detach".into(), "--bundle".into(), self.private(id).display().to_string(),
@@ -295,20 +333,25 @@ impl Native {
             "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
         self.ensure_running(id)
     }
+    // Recreate missing source resource limits, reject expiry or cancellation, then restore the captured
+    // source.
     pub fn restore_source(&self, request: &CreateRequest, images: &Path, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         if !Path::new(&self.config.cgroup_parent).join(&request.sandbox_id).exists() { self.cgroup(request)?; }
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
         self.restore(&request.sandbox_id, images)
     }
+    // Remove stopped source state if it remains, never forcing deletion of a potentially running source.
     pub fn forget_stopped(&self, id: &str) -> Result<()> {
         // runc versions may remove stopped state as part of checkpoint itself.
         // Absence is expected; never force-delete a potentially running source.
         if !self.root().join("runc").join(id).exists() { return Ok(()); }
         self.runc_checked(vec!["delete".into(), id.into()]).map_err(|_| "checkpoint_source_delete_failed")
     }
+    // Create a child resource group to track one exec operation and its descendants.
     pub fn create_exec_cgroup(&self, id: &str, operation: &str) -> Result<()> {
         fs::create_dir(Path::new(&self.config.cgroup_parent).join(id).join(format!("exec-{operation}"))).map_err(|_| "exec_cgroup_create_failed")
     }
+    // Kill an exec operation's descendants, wait briefly for the group to empty, then remove it.
     pub fn cleanup_exec_cgroup(&self, id: &str, operation: &str) -> Result<()> {
         let path = Path::new(&self.config.cgroup_parent).join(id).join(format!("exec-{operation}"));
         if !path.exists() { return Ok(()); }
@@ -320,6 +363,9 @@ impl Native {
         }
         fs::remove_dir(path).map_err(|_| "exec_cgroup_remove_failed")
     }
+    // Require healthy helper cleanup before killing the sandbox and its exec descendants. Remove owned
+    // runtime and network state, unmount its writable root and delete private files; stop on cleanup
+    // errors.
     pub fn cleanup(&self, id: &str, operations: &[String]) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
@@ -345,7 +391,10 @@ impl Native {
         if storage::mounted(&rootfs)? { self.command("umount", vec!["--internal-only".into(), rootfs.display().to_string()])?; }
         storage::remove_private(&private)
     }
+    // Drain and remove the worker-owned host-command resource groups.
     pub fn remove_helpers(&self) -> Result<()> { self.helpers.remove() }
+    // Unmount known shared lower images after helper cleanup is healthy, verifying each mount before
+    // removal.
     pub fn unmount_lowers(&self) -> Result<()> {
         self.helpers.ensure_healthy()?;
         for entry in fs::read_dir(self.root().join("lowers")).map_err(|_| "lower_scan_failed")? {
@@ -361,6 +410,8 @@ impl Native {
     }
 }
 
+// Build a deny-by-default system-call policy with a restricted process-creation fallback. Only the
+// network-enabled profile permits filtered IPv4 TCP sockets and related socket operations.
 fn seccomp(network: bool) -> Value {
     // Small native-tool profile, not a universal application compatibility claim.
     // Namespace changes, mount, ptrace, bpf, perf and io_uring are absent.

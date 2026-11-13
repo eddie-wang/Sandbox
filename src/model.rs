@@ -16,6 +16,7 @@ pub struct Capacity {
 }
 
 impl Capacity {
+    // Check capacity bounds and require restore slots not to exceed sandbox slots.
     pub fn valid(&self) -> bool {
         (1..=1_048_576).contains(&self.memory_mib)
             && (1..=4_096).contains(&self.vcpus)
@@ -58,6 +59,8 @@ pub struct WorkerStatus {
 }
 
 impl WorkerStatus {
+    // Check status schema, expected node identity and field bounds. Require reported reservations to fit
+    // capacity, including the configured CPU overcommit allowance.
     pub fn valid_for(&self, node_id: &str) -> bool {
         self.schema_version == 1 && self.node_id == node_id
             && self.architecture.len() <= 32 && self.os.len() <= 32
@@ -86,6 +89,7 @@ pub struct CreateRequest {
 }
 
 impl CreateRequest {
+    // Check owned sandbox and template IDs, supported architecture, resource requests and TTL bounds.
     pub fn valid(&self) -> bool {
         sandbox_owner(&self.sandbox_id).is_some() && valid_id(&self.template_id)
             && matches!(self.architecture.as_str(), "x86_64" | "aarch64")
@@ -105,6 +109,7 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
+    // Check the operation ID, nonempty command, argument sizes and output/deadline bounds.
     pub fn valid(&self) -> bool {
         valid_id(&self.operation_id) && !self.argv.is_empty() && self.argv.len() <= 64 && !self.argv[0].is_empty()
             && self.argv.iter().all(|arg| arg.len() <= 4_096 && !arg.contains('\0'))
@@ -121,13 +126,14 @@ pub struct CaptureRequest {
     pub runtime: Runtime,
 }
 
+// Accept only short, nonempty IDs made of ASCII letters, digits, hyphens and underscores.
 pub fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-// Ownership is part of the caller-chosen id, so retries and controller restarts
-// cannot route a possibly accepted create to a different worker.
+// Validate both parts of a caller-chosen sandbox ID and return its owner. Keeping ownership in the ID
+// prevents retries or controller restarts from rerouting an accepted create.
 pub fn sandbox_owner(value: &str) -> Option<&str> {
     let (node, local) = value.split_once('.')?;
     (valid_id(node) && valid_id(local)).then_some(node)
@@ -138,6 +144,8 @@ pub fn sandbox_owner(value: &str) -> Option<&str> {
 #[serde(deny_unknown_fields)]
 pub struct TcpDestination { pub ip: std::net::Ipv4Addr, pub port: u16 }
 impl TcpDestination {
+    // Reject a zero TCP port or zero-prefix, loopback, link-local, multicast/reserved or fixed guest-range
+    // IPv4 addresses.
     pub fn valid(&self) -> bool {
         let o = self.ip.octets();
         self.port != 0 && o[0] != 0 && o[0] != 127 && o[0] < 224
@@ -151,6 +159,7 @@ pub enum NetworkPolicy {
     TcpAllowlist { egress: Vec<TcpDestination>, service_ports: Vec<u16> },
 }
 impl NetworkPolicy {
+    // Accept isolation or a bounded list of valid TCP destinations and nonzero service ports.
     pub fn valid(&self) -> bool {
         match self {
             Self::Isolated => true,
@@ -174,6 +183,8 @@ pub struct HttpRequest {
     pub max_response_bytes: u64,
 }
 impl HttpRequest {
+    // Check HTTP operation fields, permitted methods and headers, and a relative request path. Enforce
+    // hard body, response and deadline bounds without authorizing a service port here.
     pub fn valid(&self) -> bool {
         valid_id(&self.operation_id) && self.port != 0 && matches!(self.method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "HEAD")
             && self.path.starts_with('/') && !self.path.starts_with("//") && self.path.len() <= 2048
@@ -183,6 +194,7 @@ impl HttpRequest {
             && self.headers.iter().all(|(k,v)| matches!(k.as_str(), "accept" | "content-type")
                 && v.len() <= 256 && v.bytes().all(|b| (32..127).contains(&b)))
     }
+    // Apply configured body, response and deadline ceilings in addition to the basic HTTP request checks.
     pub fn valid_for(&self, limits: &crate::config::ApplicationHttpLimits) -> bool {
         self.valid() && self.body.len() <= limits.max_body_bytes && self.max_response_bytes <= limits.max_response_bytes
             && self.timeout_ms <= limits.max_timeout_ms

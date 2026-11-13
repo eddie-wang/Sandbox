@@ -3,13 +3,17 @@ use serde_json::{Value, json};
 use crate::{config::WorkerConfig, engine::{Handle, Work}, http::{self, ApiError}, lifecycle::Health,
     model::{CaptureRequest, CreateRequest, ExecRequest, HttpRequest, sandbox_owner, valid_id}};
 
+// Return a safe service-unavailable error for a disabled or failed runtime.
 fn unavailable() -> ApiError { ApiError(StatusCode::SERVICE_UNAVAILABLE, "runtime_unavailable", "Runtime is disabled or preflight failed") }
+// Extract the sandbox ID and require its owner to match this worker.
 fn id(handle: &Handle, input: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
     let Path(id) = input.map_err(|_| http::invalid_input())?;
     let node = handle.snapshot.read().map_err(|_| unavailable())?.status.node_id.clone();
     if sandbox_owner(&id) != Some(node.as_str()) { return Err(http::invalid_input()); }
     Ok(id)
 }
+// Enqueue work without waiting for queue space, then wait for the engine's durable-acceptance reply.
+// Map admission errors to safe HTTP errors; disconnecting does not cancel accepted jobs.
 async fn submit(handle: &Handle, work: impl FnOnce(crate::engine::Ack) -> Work) -> Result<(), ApiError> {
     let sender = handle.sender.as_ref().ok_or_else(unavailable)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -25,9 +29,12 @@ async fn submit(handle: &Handle, work: impl FnOnce(crate::engine::Ack) -> Work) 
         _ => Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable", "Worker could not durably accept the operation")),
     }
 }
+// Return HTTP 202 with the identifiers callers can use to poll accepted work.
 fn accepted(id: String, operation: Option<String>) -> (StatusCode, Json<Value>) {
     (StatusCode::ACCEPTED, Json(json!({"sandbox_id":id,"operation_id":operation})))
 }
+// Validate the request and local ownership, then submit creation. Return 202 after saved acceptance;
+// callers poll sandbox state for completion.
 async fn create(State(handle): State<Handle>, input: Result<Json<CreateRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let request = http::json(input)?;
     let node = handle.snapshot.read().map_err(|_| unavailable())?.status.node_id.clone();
@@ -36,6 +43,8 @@ async fn create(State(handle): State<Handle>, input: Result<Json<CreateRequest>,
     submit(&handle, |ack| Work::Create(request, ack)).await?;
     Ok(accepted(id, None))
 }
+// Read the owned sandbox's snapshot and return state plus operation summaries, excluding result
+// bodies.
 async fn get_sandbox(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>) -> Result<Json<Value>, ApiError> {
     let id = id(&handle, path)?;
     let snapshot = handle.snapshot.read().map_err(|_| unavailable())?;
@@ -43,11 +52,14 @@ async fn get_sandbox(State(handle): State<Handle>, path: Result<Path<String>, Pa
     let operations: Vec<_> = record.operations.iter().map(|(id, op)| json!({"operation_id":id,"kind":op.kind,"state":op.state,"error":op.error,"template_id":op.template_id})).collect();
     Ok(Json(json!({"sandbox_id":id,"state":record.state,"error":record.error,"expires_at":record.expires_at,"operations":operations})))
 }
+// Validate local ownership, submit deletion and return 202 after the engine acknowledges it.
 async fn delete(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = id(&handle, path)?;
     submit(&handle, |ack| Work::Delete(id.clone(), ack)).await?;
     Ok(accepted(id, None))
 }
+// Validate local ownership and command bounds, then submit exec. Return 202 after saved acceptance;
+// callers poll the operation for its eventual output.
 async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -56,6 +68,8 @@ async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejec
     submit(&handle, |ack| Work::Exec(id.clone(), request, ack)).await?;
     Ok(accepted(id, Some(op)))
 }
+// Validate local ownership and configured HTTP bounds, then submit the application request. Return 202
+// after saved acceptance; callers poll the operation for its eventual response.
 async fn application_http(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -64,6 +78,8 @@ async fn application_http(State(handle): State<Handle>, path: Result<Path<String
     submit(&handle, |ack| Work::Http(id.clone(), request, ack)).await?;
     Ok(accepted(id, Some(op)))
 }
+// Validate local ownership and capture identifiers, then submit capture. Return 202 after saved
+// acceptance; callers poll for publication success or failure.
 async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -72,6 +88,7 @@ async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRe
     submit(&handle, |ack| Work::Capture(id.clone(), request, ack)).await?;
     Ok(accepted(id, Some(op)))
 }
+// Validate local ownership and the operation ID, then return its saved state and any retained result.
 async fn operation(State(handle): State<Handle>, path: Result<Path<(String, String)>, PathRejection>) -> Result<Json<crate::engine::Operation>, ApiError> {
     let Path((sandbox, op)) = path.map_err(|_| http::invalid_input())?;
     let snapshot = handle.snapshot.read().map_err(|_| unavailable())?;
@@ -80,6 +97,8 @@ async fn operation(State(handle): State<Handle>, path: Result<Path<(String, Stri
     Ok(Json(operation.clone()))
 }
 
+// Initialize preflight and lifecycle ownership away from request handling, then serve protected
+// management routes. On shutdown, stop serving and wait for engine-owned cleanup before returning.
 pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str> {
     let server = config.server.clone();
     let handle = tokio::task::spawn_blocking(move || {

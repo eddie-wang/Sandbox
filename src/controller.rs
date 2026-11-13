@@ -43,6 +43,7 @@ struct Controller {
 }
 
 impl Controller {
+    // Copy cached worker observations, marking reachability and freshness from poll errors and age.
     async fn snapshot(&self) -> Vec<NodeView> {
         let nodes = self.nodes.read().await;
         let now = Instant::now();
@@ -68,6 +69,7 @@ struct ControllerStatus {
     nodes: Vec<NodeView>,
 }
 
+// Return controller status with the current cached worker views.
 async fn status(State(controller): State<Controller>) -> Json<ControllerStatus> {
     Json(ControllerStatus {
         service: "controller",
@@ -76,6 +78,8 @@ async fn status(State(controller): State<Controller>) -> Json<ControllerStatus> 
     })
 }
 
+// Validate the create request and check advisory capacity only on the owner named in its ID. Forward
+// to that owner without choosing another node; acceptance is not completion.
 async fn create(
     State(controller): State<Controller>,
     input: Result<Json<CreateRequest>, JsonRejection>,
@@ -90,43 +94,52 @@ async fn create(
     forward(&controller, owner, reqwest::Method::POST, "/v1/sandboxes", Some(serde_json::to_value(&request).map_err(|_| http::invalid_input())?)).await
 }
 
+// Extract a sandbox ID from the request path and reject IDs without a valid owner.
 fn path_id(path: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
     let Path(id) = path.map_err(|_| http::invalid_input())?;
     if sandbox_owner(&id).is_none() { return Err(http::invalid_input()); }
     Ok(id)
 }
+// Validate the sandbox ID and ask its owner for the current state.
 async fn get_sandbox(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::GET, &format!("/v1/sandboxes/{id}"), None).await
 }
+// Validate the sandbox ID and forward deletion to its owner.
 async fn delete(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"), None).await
 }
+// Validate command arguments and bounds, then forward exec to the sandbox owner for acceptance.
 async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     let request = http::json(input)?;
     if !request.valid() { return Err(http::invalid_input()); }
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
 }
+// Validate application HTTP fields against controller limits and forward to the sandbox owner.
 async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     let request = http::json(input)?;
     if !request.valid_for(&c.application_http_limits) { return Err(http::invalid_input()); }
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
 }
+// Validate capture identifiers and forward the capture request to the sandbox owner.
 async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let id = path_id(path)?;
     let request = http::json(input)?;
     if !valid_id(&request.template_id) || !valid_id(&request.operation_id) { return Err(http::invalid_input()); }
     forward(&c, sandbox_owner(&id).unwrap(), reqwest::Method::POST, &format!("/v1/sandboxes/{id}/capture"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?)).await
 }
+// Validate sandbox and operation IDs, then poll the owner's saved operation result.
 async fn operation(State(c): State<Controller>, path: Result<Path<(String, String)>, PathRejection>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path((id, op)) = path.map_err(|_| http::invalid_input())?;
     let owner = sandbox_owner(&id).ok_or_else(http::invalid_input)?;
     if !valid_id(&op) { return Err(http::invalid_input()); }
     forward(&c, owner, reqwest::Method::GET, &format!("/v1/sandboxes/{id}/operations/{op}"), None).await
 }
+// Require a configured owner with a fresh observation, then forward with worker credentials. Bound the
+// response and return its status and JSON; transport failures may hide an already accepted operation.
 async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or(http::invalid_input())?;
     let nodes = c.snapshot().await;
@@ -151,6 +164,8 @@ async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &st
     Ok((status, Json(value)))
 }
 
+// Start protected management routes and bounded worker polling with redirects and proxies disabled. On
+// shutdown, stop serving and cancel the poller.
 pub async fn run(config: ControllerConfig, token: String, worker_token: String) -> Result<(), &'static str> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -190,6 +205,8 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
     result.map_err(|_| "controller HTTP server failed")
 }
 
+// Poll configured workers in bounded parallel batches. Save successful observations and flag failures
+// without discarding the last known status.
 async fn poll(controller: Controller, config: ControllerConfig, client: reqwest::Client, token: Arc<String>) {
     let mut interval = tokio::time::interval(Duration::from_millis(config.poll.interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -226,6 +243,8 @@ async fn poll(controller: Controller, config: ControllerConfig, client: reqwest:
     }
 }
 
+// Fetch authenticated worker status within a response-size bound. Reject unsuccessful responses,
+// malformed status and mismatched worker identity.
 async fn fetch_status(client: &reqwest::Client, endpoint: &WorkerEndpoint, token: &str) -> Result<WorkerStatus, &'static str> {
     let mut url = reqwest::Url::parse(&endpoint.url).map_err(|_| "invalid_endpoint")?;
     url.set_path("/v1/status");

@@ -20,16 +20,22 @@ pub struct Output {
 /// The root lock must be held before opening/reconciling this owned helper tree.
 pub struct Helpers { path: PathBuf, sequence: AtomicU64, failed: AtomicBool }
 impl Helpers {
+    // Drain and remove any previous helper tree, then create a fresh one under the caller's existing root
+    // ownership.
     pub fn open(path: PathBuf) -> Result<Self> {
         let helpers = Self { path, sequence: AtomicU64::new(0), failed: AtomicBool::new(false) };
         helpers.remove()?;
         fs::create_dir(&helpers.path).map_err(|_| "helper_cgroup_create_failed")?;
         Ok(helpers)
     }
+    // Return the path of the worker-owned helper process tree.
     pub fn path(&self) -> &Path { &self.path }
+    // Reject further work if a previous helper cleanup failed and requires restart.
     pub fn ensure_healthy(&self) -> Result<()> {
         if self.failed.load(Ordering::SeqCst) { Err("helper_cleanup_requires_restart") } else { Ok(()) }
     }
+    // Kill and drain the helper tree, then remove only recognized command groups and the parent. Unknown
+    // child groups prevent removal.
     pub fn remove(&self) -> Result<()> {
         if !self.path.exists() { return Ok(()); }
         drain_helpers(&self.path)?;
@@ -44,6 +50,8 @@ impl Helpers {
         }
         fs::remove_dir(&self.path).map_err(|_| "helper_cgroup_remove_failed")
     }
+    // Run a host command inside a new tracked helper group with bounded time and output. Drain all
+    // remaining helpers before returning; a cleanup failure blocks later work.
     pub fn run(&self, program: &str, args: &[String], timeout: Duration, limit: usize, quiet: bool, search_path: &str) -> Result<Output> {
         self.ensure_healthy()?;
         let path = self.path.join(format!("command-{}", self.sequence.fetch_add(1, Ordering::Relaxed)));
@@ -60,6 +68,7 @@ impl Helpers {
 }
 struct HelperLeaf<'a>(PathBuf, &'a AtomicBool);
 impl HelperLeaf<'_> {
+    // Drain this command's helper group and remove it if it still exists.
     fn remove(&self) -> Result<()> {
         if !self.0.exists() { return Ok(()); }
         drain_helpers(&self.0)?;
@@ -67,8 +76,10 @@ impl HelperLeaf<'_> {
     }
 }
 impl Drop for HelperLeaf<'_> {
+    // On leaving the command's scope, retry cleanup and remember any failure so later work is blocked.
     fn drop(&mut self) { if self.remove().is_err() { self.1.store(true, Ordering::SeqCst); } }
 }
+// Kill all processes in the supplied helper group and wait up to five seconds for it to empty.
 fn drain_helpers(path: &Path) -> Result<()> {
     fs::write(path.join("cgroup.kill"), "1").map_err(|_| "helper_cgroup_kill_failed")?;
     let start = Instant::now();
@@ -80,16 +91,21 @@ fn drain_helpers(path: &Path) -> Result<()> {
     }
 }
 
-// Read-only preflight executes only trusted version queries, never storage/runtime
-// commands. No cgroup mutation is allowed here; parent-death signaling still applies.
+// Run a caller-selected read-only preflight query with short time and output bounds. Do not create
+// helper groups here; parent-death signaling still applies.
 pub fn inspect(program: &str, args: &[String], search_path: &str) -> Result<Output> {
     run_inner(program, args, Duration::from_secs(3), 65536, false, search_path, None)
 }
 
+// Query a trusted tool's version with short time and output bounds, without creating helper groups.
 pub fn version(program: &str, search_path: &str) -> Result<Output> {
     run_inner(program, &["--version".into()], Duration::from_secs(3), 4096, false, search_path, None)
 }
 
+// Start a host command with a cleared environment, parent-death protection and output/time bounds.
+// While monitoring, deadline, read or output failures trigger a command-group kill attempt. Final
+// draining or size checks can also mark results interrupted without killing the group. Return exit
+// status and output; Helpers::run separately cleans up tracked descendants.
 fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, quiet: bool, search_path: &str, helper_procs: Option<RawFd>) -> Result<Output> {
     let mut command = Command::new(program);
     command.args(args).env_clear().env("PATH", search_path).env("LANG", "C")
@@ -175,12 +191,15 @@ fn run_inner(program: &str, args: &[String], timeout: Duration, limit: usize, qu
     Ok(Output { exit_code: status.code(), stdout: String::from_utf8_lossy(&out).into_owned(), stderr: String::from_utf8_lossy(&err).into_owned(), interrupted })
 }
 
+// Run a tracked host command with standard output bounds and require an uninterrupted successful exit.
 pub fn checked(program: &str, args: &[String], seconds: u64, search_path: &str, helpers: &Helpers) -> Result<()> {
     let output = helpers.run(program, args, Duration::from_secs(seconds), 65536, false, search_path)?;
     if output.interrupted { Err("tool_deadline_or_output_limit") }
     else if output.exit_code != Some(0) { Err("tool_failed") } else { Ok(()) }
 }
 
+// Write and sync private JSON to a pending file, rename it into place and sync the parent directory. A
+// later sync error can occur after the new record has already replaced the old one.
 pub fn atomic_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
     use std::{fs::{self, OpenOptions}, os::unix::fs::OpenOptionsExt};
     let temp = path.with_extension("pending");

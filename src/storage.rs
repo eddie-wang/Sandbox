@@ -41,9 +41,13 @@ pub struct Manifest {
     pub gid: u32,
 }
 
+// Return the SHA-256 fingerprint of the supplied bytes.
 pub fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+// Recognize a SHA-256 fingerprint written as exactly 64 lowercase hexadecimal digits.
 pub fn hex_digest(value: &str) -> bool { value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
 
+// Require every directory in the path to be administrator-owned, not a symlink and not writable by
+// others.
 pub fn trusted_directory(path: &Path) -> Result<()> {
     // Administrator-owned ancestors exclude symlink swaps by untrusted users.
     let mut current = PathBuf::new();
@@ -55,6 +59,8 @@ pub fn trusted_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Create a directory if absent, require administrator ownership and restrict its permissions to the
+// owner.
 pub fn private_dir(path: &Path) -> Result<()> {
     if !path.exists() { fs::create_dir(path).map_err(|_| "directory_create_failed")?; }
     let meta = fs::symlink_metadata(path).map_err(|_| "directory_unavailable")?;
@@ -65,11 +71,14 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Create an owner-only directory exclusively, failing rather than adopting an existing path.
 pub fn exclusive_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().mode(0o700).create(path).map_err(|_| "directory_create_failed")
 }
 
+// Read bounded JSON only from a regular, administrator-owned file that others cannot write. Reject a
+// final symlink, oversized content or invalid data.
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<T> {
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).map_err(|_| "record_unavailable")?;
     let metadata = file.metadata().map_err(|_| "record_unavailable")?;
@@ -80,6 +89,8 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Res
     serde_json::from_slice(&bytes).map_err(|_| "invalid_record")
 }
 
+// Read the entire trusted artifact to compute its SHA-256 and byte count. Reject symlinks, empty or
+// oversized files, untrusted ownership and reads exceeding the deadline.
 pub fn artifact(path: &Path, max: u64) -> Result<Artifact> {
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).map_err(|_| "artifact_unavailable")?;
     let meta = file.metadata().map_err(|_| "artifact_unavailable")?;
@@ -99,12 +110,16 @@ pub fn artifact(path: &Path, max: u64) -> Result<Artifact> {
     Ok(Artifact { sha256: format!("{:x}", hash.finalize()), bytes })
 }
 
+// Validate the expected descriptor, then fully hash the artifact and compare both digest and size.
 pub fn verify(path: &Path, expected: &Artifact, max: u64) -> Result<()> {
     if !hex_digest(&expected.sha256) || expected.bytes > max { return Err("invalid_artifact_descriptor"); }
     let actual = artifact(path, max)?;
     if actual.sha256 != expected.sha256 || actual.bytes != expected.bytes { Err("artifact_digest_mismatch") } else { Ok(()) }
 }
 
+// Verify the manifest's ownership and digest, schema, compatibility and matching checkpoint fields.
+// Fully hash the base image and any upper/checkpoint archives before returning the template; no
+// verified-artifact cache is used.
 pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> Result<Manifest> {
     if !valid_id(id) { return Err("invalid_template_id"); }
     let dir = root.join("templates").join(id);
@@ -133,6 +148,7 @@ pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> R
     Ok(m)
 }
 
+// Durably write the manifest, exclusively create its digest file and sync the containing directory.
 pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     process::atomic_json(&dir.join("manifest.json"), manifest)?;
     let hash = artifact(&dir.join("manifest.json"), 65536)?.sha256;
@@ -142,6 +158,8 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     File::open(dir).and_then(|f| f.sync_all()).map_err(|_| "manifest_sync_failed")
 }
 
+// Archive one filesystem tree with ownership, extended attributes, ACLs and sparse files preserved.
+// Restrict the resulting archive to its owner and sync it before returning.
 pub fn archive(tar: &str, source: &Path, destination: &Path, seconds: u64, search_path: &str, helpers: &process::Helpers) -> Result<()> {
     process::checked(tar, &vec!["--create".into(), "--format=pax".into(), "--file".into(), destination.display().to_string(),
         "--numeric-owner".into(), "--xattrs".into(), "--xattrs-include=*".into(), "--acls".into(), "--sparse".into(),
@@ -150,6 +168,8 @@ pub fn archive(tar: &str, source: &Path, destination: &Path, seconds: u64, searc
     File::open(destination).and_then(|f| f.sync_all()).map_err(|_| "artifact_sync_failed")
 }
 
+// Extract a previously verified archive into the supplied private directory, restoring ownership,
+// permissions and extended metadata.
 pub fn extract(tar: &str, source: &Path, destination: &Path, seconds: u64, search_path: &str, helpers: &process::Helpers) -> Result<()> {
     // GNU tar's default traversal/symlink checks remain enabled. Only verified,
     // administrator-owned publications enter this path; there is no upload API.
@@ -158,6 +178,8 @@ pub fn extract(tar: &str, source: &Path, destination: &Path, seconds: u64, searc
         "--xattrs-include=*".into(), "--acls".into(), "--directory".into(), destination.display().to_string()], seconds, search_path, helpers)
 }
 
+// Check mount inventory for a mount at or beneath the supplied path, failing if the inventory cannot
+// be read.
 pub fn mounted(path: &Path) -> Result<bool> {
     let text = fs::read_to_string("/proc/self/mountinfo").map_err(|_| "mountinfo_unavailable")?;
     let target = path.to_str().ok_or("invalid_mount_path")?;
@@ -165,6 +187,7 @@ pub fn mounted(path: &Path) -> Result<bool> {
     Ok(text.lines().any(|l| l.split_whitespace().nth(4).is_some_and(|p| p == target || p.starts_with(&format!("{target}/")))))
 }
 
+// Require an EROFS mount with read-only, nodev and nosuid flags backed by the expected loop image.
 pub fn verify_lower(path: &Path, image: &Path) -> Result<()> {
     let text = fs::read_to_string("/proc/self/mountinfo").map_err(|_| "mountinfo_unavailable")?;
     let target = path.to_str().ok_or("invalid_mount_path")?;
@@ -177,6 +200,8 @@ pub fn verify_lower(path: &Path, image: &Path) -> Result<()> {
     Ok(())
 }
 
+// Remove an administrator-owned private directory only after confirming no mount remains at or beneath
+// it.
 pub fn remove_private(path: &Path) -> Result<()> {
     if !path.exists() { return Ok(()); }
     if mounted(path)? { return Err("private_mount_still_live"); }
