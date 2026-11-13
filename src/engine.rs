@@ -615,8 +615,8 @@ impl Engine {
     }
     // Load saved sandbox records and reject invalid or untracked workload/monitor resources. Kill and clean up every
     // sandbox left from before the restart and remove abandoned staging. Release unused lower mounts,
-    // replace the network slot pool with freshly built slots and save cleanup status; durability or
-    // slot-removal failures prevent startup.
+    // rebuild free network slots while retaining those needed by unfinished cleanup, and save status.
+    // Durability or removal failures for unreserved slots prevent startup.
     fn reconcile(&mut self) -> Result<()> {
         for entry in fs::read_dir(self.native.root().join("records")).map_err(|_| "record_scan_failed")? {
             let path = entry.map_err(|_| "record_scan_failed")?.path();

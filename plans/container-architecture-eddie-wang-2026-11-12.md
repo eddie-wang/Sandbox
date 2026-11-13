@@ -180,7 +180,7 @@ By default, a sandbox has no external network access: it still gets its own priv
 
 An operator supplies a bridge, gateway and an address pool reserved for this worker. Each networked sandbox has its own isolated network and a private routing environment that checks traffic before forwarding it. The worker installs the rules before starting the application. It does not repair the host's existing firewall, routes or forwarding settings.
 
-The routing environments are **built ahead of time and reused**, as AgentENV does. When the worker starts, it builds one per sandbox it can hold, each connected to the bridge with its own outside address and a "block everything" rule set. Creating a sandbox then only connects the sandbox's own network to a free routing environment and adds that template's allowed endpoints. Deleting a sandbox disconnects it, removes those rules and forgets all remembered connections, and returns the routing environment for the next sandbox instead of tearing it down. If one cannot be reset, it is removed and rebuilt later. A restarted worker never reuses old ones: it removes them all and builds fresh ones. A worker that shuts down removes them.
+The routing environments are **built ahead of time and reused**, as AgentENV does. When the worker starts, it builds one per sandbox it can hold, each connected to the bridge with its own outside address and a "block everything" rule set. Creating a sandbox then only connects the sandbox's own network to a free routing environment and adds that template's allowed endpoints. Deleting a sandbox disconnects it, removes those rules and forgets all remembered connections, and returns the routing environment for the next sandbox instead of tearing it down. If one cannot be reset, it is removed and rebuilt later. A restarted worker never admits new sandboxes into old routing environments: it rebuilds free ones but keeps those still needed to finish failed cleanup. Once cleanup succeeds, those retained environments are removed before reuse too. A worker that shuts down removes them after all sandbox cleanup completes.
 
 All guests see the same private address inside their separate environments. The address used outside each sandbox is different. Keeping the guest-side address stable lets saved connections restore in any child; it does not copy the outside end of external connections or the router's connection state.
 
@@ -199,6 +199,23 @@ Creation and final record writes run with the background job, still before any o
 Disposable private overlays use the volatile option only after a successful active probe on the actual upper backing directory. Startup checks directory-entry types, required extended attributes, copy-up/hardlinks, ordinary mounts and mount-option size. Only an unsupported volatile probe selects ordinary overlays; later mount errors fail closed without retrying a work directory. This avoids waiting for unrelated dirty host data during unmount. Capture reads the frozen file cache and makes the sealed layer durable before publishing it; it does not depend on making the disposable upper durable. Unpacked checkpoints sync their own files rather than the entire host filesystem. Cleanup waits for killed tasks, then tries ordinary runc delete before force deletion.
 
 Lazy-page restoration remains unimplemented: a small-image experiment is not enough to establish reliability under load, and the additional page-server lifetime would need its own correctness work. No new microVM runtime or comparison service is added. Local fixture measurements are not a two-node capacity claim.
+
+### Built CNI guest networking
+
+Guest link, address and route construction now uses Canonical noble's standalone
+CNI `ptp` and `static` IPAM binaries, running inside each private routing environment.
+The same guest address can be reused because each routing environment is separate;
+outer addresses remain unique. The worker keeps its allowlist, source translation
+and connection reset. It installs default-drop before CNI raises any link, persists
+config/results and attempted steps for reverse deletion (including failed setup),
+and starts or restores no application before all checks and policy succeed.
+Link packet-size limits are explicit and checked against the operator bridge;
+operators must choose a value suitable for the pod's actual underlying network.
+No extra network daemon, generic plugin framework or tuning plugin was added.
+The CNI/MTU layout version rejects old templates. The guest interface stays `eth0`,
+but MACs can change because CRIU restores sockets into a supplied external namespace,
+not saved links. The release-build local gates must qualify established internal
+TCP, listening sockets and fresh external connections with these CNI-built guests.
 
 ### Built resource and mount ownership
 
@@ -228,7 +245,8 @@ Before starting threads, the worker checks its operator-provided pod-private mou
 | [`monitor.rs`](../src/monitor.rs) | Completes conmon startup, owns monitor groups and retains exit/OOM evidence through cleanup and restart. |
 | [`process.rs`](../src/process.rs) | Runs and tracks host helper programs, bounds their output/time (passing command output on as it arrives), and safely writes saved JSON records. |
 | [`storage.rs`](../src/storage.rs) | Checks template files, handles file archives and publishes complete templates. |
-| [`network.rs`](../src/network.rs) | Keeps the pool of pre-built routing environments, connects each sandbox's private network to one, applies and resets its traffic rules. |
+| [`network.rs`](../src/network.rs) | Keeps the pool of pre-built routing environments, applies and resets traffic rules around CNI attachment. |
+| [`cni.rs`](../src/cni.rs) | Runs the fixed ptp/static chain in a private routing environment, saves configs/results and replays reverse deletion. |
 | [`lifecycle.rs`](../src/lifecycle.rs) | Defines the small liveness response. Despite its name, the lifecycle logic is in `engine.rs`. |
 
 ## Interfaces/signatures/headers

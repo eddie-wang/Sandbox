@@ -27,7 +27,7 @@ An operator must separately provision and approve:
   is done by the service/script.
 - Trusted standard `runc`, **`conmon` 2.1.10**, `criu`, `mount`, `umount`, GNU `tar`, `mkfs.erofs`, `ip`,
   `nft`, `iptables`, `iptables-save`, `iptables-restore`, `ip6tables-save`,
-  `ip6tables-restore`, `gzip` and a **statically linked `tini`** (preflight rejects a
+  `ip6tables-restore`, `gzip`, **CNI `ptp` and `static`** (protocol 1.0.0), and a **statically linked `tini`** (preflight rejects a
   dynamic one: it is bind-mounted read-only into every sandbox as PID 1, so it must run
   in any image; its SHA-256 is part of the template compatibility fingerprint). Take
   `tini` from a trusted, verified package (for example the distribution's static tini
@@ -114,10 +114,24 @@ with `apt-get download`, verify the archive signature/index and package SHA-256,
 extract with `dpkg-deb -x` and copy its executable root-owned into the trusted tools
 directory. Do not install a system service or run `apt install` on the node. Include
 conmon and its system-library dependencies in the worker image/tool inventory; the
-worker verifies conmon ownership and its protocol version during preflight. No CNI
-plugins are required by this stage. Preserve the root and delegated monitor subtree
-across worker process restarts so reconciliation can drain old monitors. The private
-cluster harness must stage conmon and republish templates before deploying this worker.
+worker verifies conmon ownership and its protocol version during preflight.
+Also stage **`ptp` and `static`** from Canonical noble `containernetworking-plugins`
+(`1.1.1+ds1-3ubuntu0.24.04.3` in the local qualification), using the same signed-index,
+`apt-get download`, hash-check and `dpkg-deb -x` procedure. Copy the executables
+from the extracted `usr/lib/cni` into the trusted tools directory with fixed basenames;
+no CNI daemon, kubelet integration, host-local database or tuning plugin is needed.
+Preflight checks both verified executables and their CNI 1.0.0 protocol support.
+CNI runs with the router slot as its host namespace, never the node or pod shared
+network namespace. Its guest target is the worker-owned pin. Configure
+`[native.network].mtu` (default 1500, range 1280–9000) for the actual pod underlay;
+it cannot exceed the existing stable-MAC bridge MTU. Ptp and both uplink ends use
+this value; the worker verifies both CNI link MTUs and CNI CHECK before launching.
+Keep the operator's bridge/outer routing and worker-owned nft allowlist/SNAT model.
+Preserve the root and delegated monitor subtree across worker process restarts so
+reconciliation can drain old monitors and replay persisted CNI DEL. The private
+cluster harness must stage conmon and CNI, select its MTU, and republish templates:
+pre-CNI layouts and layouts with a different MTU are rejected. No cluster run is
+implied by the local qualification.
 
 ## Bounded command plan
 
@@ -168,6 +182,29 @@ is part of the isolated command. The worker does create one owned, loopback-only
 network namespace pin per sandbox under the existing `/run/netns` and removes it on
 cleanup. `nsenter ... ip ... link show` only inspects an owned netns. Other workload
 namespaces are created by runc/CRIU; there is no host-network mode.
+
+## CNI qualification boundary
+
+The fixed standalone chain follows libcni's config/result chaining and reverse-order
+DEL semantics. Per-attachment config, intent and successful results live in
+`private/<id>/cni.json`; an unsuccessful ADD still receives DEL, failed deletion
+retains its ownership for retry, and a vanished guest supplies an empty `CNI_NETNS`.
+The slot's default-drop filter is installed **before ADD**, because ptp raises links.
+The exact custom policy is applied only after the full chain and validation succeed;
+no workload can launch/restore earlier. CNI's own masquerading is off.
+
+`network_smoke.py` checks the actual ptp-generated routes, fixed guest IP/eth0,
+random link identities, 1500-byte MTU, cached configs/results, failed ADD rollback,
+post-ADD cache failure under default drop, missing-namespace/repeated deletion,
+slot reset/restart, allowlist/SNAT, PMTU and restore with `--tcp-established`.
+A blocked startup DEL input write must retain its original slot across two worker
+restarts, exclude it from new admission, then automatically finish cleanup after
+the fault is removed, without manual namespace deletion. The retained slot must be
+destroyed before its index is rebuilt for a new sandbox.
+CRIU uses an external/empty supplied netns: no saved MAC or host-interface name is
+replayed. Established loopback and listening sockets must continue in cold, warm
+and chained copies even though MACs differ. External peers and NAT state are still
+not cloned. See [network details](network.md) for the route composition.
 
 ## Gate assertions
 

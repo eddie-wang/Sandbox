@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, fs, os::unix::fs::MetadataExt, path::{Path, Pat
 use crate::{model::NetworkPolicy, native::Native, phases::Phases, process::Result, storage};
 
 pub const GUEST: &str = "192.0.2.2";
-const GATEWAY: &str = "192.0.2.1";
+pub const GATEWAY: &str = "192.0.2.1";
 // A pooled routing slot this worker built: clean and free, or carrying a sandbox's guest and rules.
 #[derive(Clone, Copy, PartialEq)]
 pub enum SlotState { Ready, Attached }
@@ -72,10 +72,6 @@ impl Native {
     }
     // Return the pin path of a namespace this worker created by name (under /run/netns).
     fn pin(namespace: &str) -> PathBuf { Path::new("/run/netns").join(namespace) }
-    // Run the verified ip tool inside one named namespace (entered directly; see process::exec_helper).
-    fn ip_in(&self, namespace: &str, args: &[&str]) -> Result<()> {
-        self.command_in("ip", &Self::pin(namespace), args.iter().map(|s| s.to_string()).collect())
-    }
     // Run several ip commands as one `ip -batch` process inside one named namespace (or the worker's own,
     // for none), stopping at the first failure. The commands are written to `file` first.
     fn ip_batch_in(&self, namespace: Option<&str>, file: &Path, commands: &[String]) -> Result<()> {
@@ -95,8 +91,8 @@ impl Native {
         self.command_in("nft", &Self::pin(namespace), vec!["-f".into(), file.display().to_string()]).map_err(|_| "slot_firewall_failed")
     }
     // Save ownership and prebuild a routing slot with IPv6 off, forwarding on and default-deny rules.
-    // Add its uplink/address/route, then attach the host end to the operator bridge. No guest is
-    // attached yet; partial state belongs to destroy_slot.
+    // Add its uplink/address/route with explicit MTU, then attach to the operator bridge. No guest is
+    // attached yet; partial state belongs to destroy_slot, and CNI ADD must come after this boundary.
     fn create_slot(&self, index: usize) -> Result<()> {
         let config = self.config.network.as_ref().ok_or("network_disabled")?;
         let address = config.addresses.get(index).ok_or("network_slot_missing")?;
@@ -114,7 +110,7 @@ impl Native {
         fs::write(dir.join("base.nft"), base).map_err(|_| "network_policy_write_failed")?;
         self.nft_in(&slot, &dir.join("base.nft"))?;
         self.ip_batch_in(Some(&slot), &dir.join("uplink.ip"), &[
-            format!("link add uplink type veth peer name {link} netns {}", std::process::id()),
+            format!("link add uplink mtu {} type veth peer name {link} mtu {} netns {}", config.mtu, config.mtu, std::process::id()),
             format!("addr add {address}/{} dev uplink", config.prefix), "link set uplink up".into(),
             format!("route add default via {}", config.gateway)])?;
         self.ip_batch_in(None, &dir.join("host.ip"), &[format!("link set {link} master {}", config.bridge), format!("link set {link} up")])
@@ -150,12 +146,12 @@ impl Native {
         storage::remove_private(&self.slot_dir(index))?;
         fs::File::open(self.root().join("slots")).and_then(|f| f.sync_all()).map_err(|_| "network_ownership_failed")
     }
-    // Rebuild the slot pool at worker start, after sandbox reconciliation: remove every slot left by an
-    // earlier worker (never adopt it), then pre-create the first `count` slots that no remaining
-    // reservation holds. A slot that fails to build is removed and built lazily at create instead; a
-    // slot that cannot be removed stops startup.
+    // Rebuild unreserved slots at startup, retaining owned slots still needed by unfinished cleanup.
+    // Retained slots stay outside the ready pool: a later successful DEL destroys them before reuse.
+    // Pre-create up to `count` free slots; failed builds are removed and retried lazily at create.
+    // Failure to remove an unreserved slot prevents startup.
     pub fn start_slot_pool(&self, count: usize, held: &BTreeSet<usize>) -> Result<()> {
-        self.remove_slot_pool()?;
+        for index in self.owned_slots()?.into_iter().filter(|i| !held.contains(i)) { self.destroy_slot(index)?; }
         let Some(config) = self.config.network.as_ref() else { return Ok(()); };
         for index in (0..count.min(config.addresses.len())).filter(|i| !held.contains(i)) {
             match self.create_slot(index) {
@@ -165,7 +161,7 @@ impl Native {
         }
         Ok(())
     }
-    // Remove every pooled slot this worker owns (startup and shutdown, when no guest uses them).
+    // Remove every pooled slot this worker owns at shutdown, once no sandbox needs further cleanup.
     pub fn remove_slot_pool(&self) -> Result<()> {
         for index in self.owned_slots()? { self.destroy_slot(index)?; }
         Ok(())
@@ -186,10 +182,9 @@ impl Native {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner).insert(index, SlotState::Attached);
         Ok(())
     }
-    // Return a slot to the pool once its sandbox is drained (AgentENV release): delete the slot's end of
-    // the guest veth pair (which removes the guest's end at once), flush the template rules back to the
-    // default-deny base and clear connection tracking. A clean slot needs nothing. A slot that cannot be
-    // reset, or whose state is unknown, is removed instead and rebuilt lazily later.
+    // Return a slot to the pool after CNI DEL and sandbox drainage: flush template rules back to
+    // default-deny and clear connection tracking. A clean slot needs nothing; an incomplete or unknown
+    // reset destroys the slot instead of reusing it.
     fn release_slot(&self, index: usize) -> Result<()> {
         let known = self.slots.lock().unwrap_or_else(PoisonError::into_inner).get(&index).copied();
         let (slot, _) = self.slot_names(index);
@@ -199,9 +194,6 @@ impl Native {
             Some(SlotState::Attached) => {}
         }
         let reset = (|| {
-            // An already absent link fails this step harmlessly; the reset helper
-            // below verifies that no guest link remains.
-            let _ = self.ip_in(&slot, &["link", "delete", "inside"]);
             self.command_in("nft", &Self::pin(&slot), vec!["flush".into(), "table".into(), "inet".into(), "sandbox".into()])?;
             self.helper_in(&slot, "internal-slot-reset")
         })();
@@ -211,8 +203,8 @@ impl Native {
         }
     }
     // Create a timed guest namespace with loopback up and IPv6 off; isolated guests stop there.
-    // For approved TCP, claim a slot and atomically install policy before connecting its guest link.
-    // Caller-owned cleanup handles every partial setup failure.
+    // For approved TCP, claim a default-drop slot, run the CNI chain, then atomically install policy.
+    // No launch/restore can occur before both succeed; caller-owned cleanup handles every failure.
     pub fn prepare_network(&self, id: &str, policy: &NetworkPolicy, index: Option<usize>, phases: &mut Phases) -> Result<()> {
         self.network_policy(policy)?;
         if !self.network_absent(id) { return Err("network_name_conflict"); }
@@ -236,39 +228,39 @@ impl Native {
         self.claim_slot(index)?;
         phases.mark("slot_claim");
         let (slot, _) = self.slot_names(index);
+        // ptp's host operations run in this slot, never in the shared bridge namespace. Its generated
+        // host name comes from the verified result; the nft default-drop chains already exist.
+        let inside = self.cni_add(id, index)?;
+        phases.mark("slot_cni");
         // PMTU errors may come from any router, but must quote an existing
         // authorized TCP flow. Never accept arbitrary ICMP or all RELATED traffic.
         let pmtu = |e: &crate::model::TcpDestination| format!("ip daddr {GUEST} icmp type destination-unreachable icmp code frag-needed ct state related ct original protocol tcp ct original ip saddr {GUEST} ct original ip daddr {} ct original proto-dst {} counter accept", e.ip, e.port);
         // One transaction: drop any previous rules, then add this template's.
-        let mut rules = format!("flush table inet sandbox\nadd rule inet sandbox input iifname inside ip saddr {GUEST} ip daddr {GATEWAY} meta l4proto tcp ct state established accept\n");
-        for port in service_ports { rules.push_str(&format!("add rule inet sandbox output oifname inside ip saddr {GATEWAY} ip daddr {GUEST} tcp dport {port} accept\n")); }
-        for e in egress { rules.push_str(&format!("add rule inet sandbox output oifname inside {}\n", pmtu(e))); }
+        let mut rules = format!("flush table inet sandbox\nadd rule inet sandbox input iifname {inside} ip saddr {GUEST} ip daddr {GATEWAY} meta l4proto tcp ct state established accept\n");
+        for port in service_ports { rules.push_str(&format!("add rule inet sandbox output oifname {inside} ip saddr {GATEWAY} ip daddr {GUEST} tcp dport {port} accept\n")); }
+        for e in egress { rules.push_str(&format!("add rule inet sandbox output oifname {inside} {}\n", pmtu(e))); }
         for e in egress {
-            rules.push_str(&format!("add rule inet sandbox forward iifname inside oifname uplink ip saddr {GUEST} ip daddr {} tcp dport {} ct state new,established accept\n", e.ip, e.port));
-            rules.push_str(&format!("add rule inet sandbox forward iifname uplink oifname inside ip saddr {} ip daddr {GUEST} tcp sport {} ct state established accept\n", e.ip, e.port));
-            rules.push_str(&format!("add rule inet sandbox forward iifname uplink oifname inside {}\n", pmtu(e)));
+            rules.push_str(&format!("add rule inet sandbox forward iifname {inside} oifname uplink ip saddr {GUEST} ip daddr {} tcp dport {} ct state new,established accept\n", e.ip, e.port));
+            rules.push_str(&format!("add rule inet sandbox forward iifname uplink oifname {inside} ip saddr {} ip daddr {GUEST} tcp sport {} ct state established accept\n", e.ip, e.port));
+            rules.push_str(&format!("add rule inet sandbox forward iifname uplink oifname {inside} {}\n", pmtu(e)));
         }
         let file = self.private(id).join("network.nft");
         fs::write(&file, rules).map_err(|_| "network_policy_write_failed")?;
         self.nft_in(&slot, &file)?;
         phases.mark("slot_rules");
-        // No guest link is up and no untrusted process exists until the rules succeed.
-        self.ip_batch_in(Some(&slot), &self.private(id).join("slot.ip"), &[
-            format!("link add inside type veth peer name eth0 netns {guest}"), format!("addr add {GATEWAY}/30 dev inside"), "link set inside up".into()])?;
-        self.ip_batch_in(Some(&guest), &self.private(id).join("guest.ip"), &[
-            format!("addr add {GUEST}/30 dev eth0"), "link set eth0 up".into(), format!("route add default via {GATEWAY}")])?;
-        phases.mark("slot_veth");
         Ok(())
     }
-    // Remove only network state backed by this sandbox's ownership marker: return its pooled slot to the
-    // pool (reset, not deleted) and really unmount its guest pin. Unknown state or incomplete cleanup
-    // remains an error.
+    // Remove only owned network state: replay persisted CNI DEL before resetting the slot and really
+    // unmounting its guest pin. Unknown state or incomplete cleanup remains an error.
     pub fn cleanup_network(&self, id: &str, index: Option<usize>) -> Result<()> {
         if !self.private(id).join("network-owned").exists() {
             return if self.network_absent(id) { Ok(()) } else { Err("untracked_network_state") };
         }
         // Called after helper and workload drainage, so no guest traffic remains.
-        if let Some(index) = index.filter(|_| self.config.network.is_some()) { self.release_slot(index)?; }
+        if let Some(index) = index.filter(|_| self.config.network.is_some()) {
+            self.cni_del(id, index)?;
+            self.release_slot(index)?;
+        }
         let guest = self.guest_name(id);
         self.remove_pin(&guest)?;
         if self.network_absent(id) { Ok(()) } else { Err("network_cleanup_incomplete") }
@@ -297,13 +289,15 @@ fn loopback_up() -> Result<()> {
     if unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &request) } != 0 { return Err("loopback_up_failed"); }
     Ok(())
 }
-// Inside a routing slot being returned to the pool: require that no guest link remains, then flush all
-// connection-tracking entries through netlink (a delete request with no tuple), so the next sandbox
-// inherits no flow or address-translation state. This runs in a fresh, tracked helper process, never
-// a pooled worker thread.
+// Inside a routing slot being returned to the pool, require only loopback and uplink (no CNI guest
+// link) and flush connection tracking through netlink. The next sandbox inherits no flow or NAT
+// state. This runs in a fresh tracked helper, never a pooled worker thread.
 pub fn slot_reset_helper() -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    if !link_absent("inside") { return Err("slot_guest_link_remains"); }
+    let links = fs::read_to_string("/proc/net/dev").map_err(|_| "slot_link_scan_failed")?;
+    if links.lines().filter_map(|l| l.split_once(':')).any(|(name, _)| !["lo", "uplink"].contains(&name.trim())) {
+        return Err("slot_guest_link_remains");
+    }
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_NETFILTER) };
     if fd < 0 { return Err("conntrack_flush_failed"); }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };

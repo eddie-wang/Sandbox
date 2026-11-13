@@ -144,7 +144,9 @@ Strict JSON fields (unknown fields are rejected):
 restored processes map it), `layout`. The OCI network-policy digest annotation is
 preserved during normalization; the init's host path is normalized like the other
 worker-local paths. `layout` is
-`erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1`. The seccomp profile is the
+`erofs-sealed-layers-v3-cni-ptp-static-v1-mtu<value>-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1`
+where `<value>` is the configured MTU (1500 without network configuration).
+Pre-CNI templates and templates with another MTU are rejected. The seccomp profile is the
 default-allow AgentENV pattern described below; templates captured under earlier
 layouts (deny-by-default seccomp, per-create upper archives, no reaping init) are rejected. Older layout
 fingerprints are incompatible rather than silently reinterpreted. The local fixture
@@ -281,14 +283,24 @@ no record. Results are never stored,
 so records hold only lifecycle metadata. Tombstones are bounded by `max_records` and
 retained; no automatic pruning can silently reopen an ID.
 
-Network policy precedes runc launch and restore. runc alone creates/configures each
+Network policy precedes runc launch and restore. The slot's default-drop boundary
+also precedes CNI ptp/static ADD; per-attachment configs, ADD intents and results are
+persisted in `private/<id>/cni.json`. Failed ADDs receive DEL; teardown walks attempted
+plugins in reverse with the cached result and retries failed entries. Missing guest
+pins use empty `CNI_NETNS`; static has no persistent allocation database. CNI host
+operations run only in the routing slot, not the worker/pod shared network namespace.
+The fixed guest `eth0`/`192.0.2.2` survives reconstruction, while MACs may differ.
+Both CNI link MTUs and the full chain are checked before custom policy and launch. runc alone creates/configures each
 sandbox cgroup from OCI memory/swap/CPU/pids/device limits and
 `linux.resources.unified["memory.oom.group"] = "1"`, before workloads execute.
 Equal OCI memory/swap limits disable swap; cgroupfs is used, never systemd. A slot index is
 reserved in the durable record before network side effects. Router slots are
 pre-created per worker root (`slots/<index>` ownership directories, default-deny
-base rules) and reset, not deleted, when a sandbox is released; restart and shutdown
-delete them, and restart builds a fresh pool. Unique root/sandbox guest namespace
+base rules) and reset, not deleted, when a sandbox is released. Restart rebuilds
+unreserved slots but retains slots needed by unfinished cleanup outside the ready
+pool, so failed CNI DEL can retry in its original routing namespace. Those retained
+slots are destroyed after successful DEL, before reuse; shutdown deletes the pool
+once cleanup is complete. Unique root/sandbox guest namespace
 names, root/index slot names, exclusive ownership markers and bounded helper cgroups
 cover creation, cancellation and restart; unexplained namespace or slot state fails
 closed. Cleanup retains the reservation/marker on failures and retries without

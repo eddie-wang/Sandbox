@@ -237,7 +237,7 @@ def mount_inventory_gate(binary, root, worker_config):
 
 
 # Run real lifecycle, rejection, bounds and restart gates with at most three live containers.
-# Check mounts/storage, OCI limits and conmon ownership, including ordered exit and sync faults.
+# Check mounts/storage, OCI limits, conmon and CNI ownership, including startup DEL and sync faults.
 # --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
 def main():
@@ -339,6 +339,14 @@ url = "http://127.0.0.1:{worker_port}"
 ''')
     mount_inventory_gate(binary, root, worker_config)
     compatibility = preflight_compatibility(binary, worker_config)
+    assert "cni-ptp-static-v1-mtu1500" in compatibility["layout"], compatibility
+    if args.network:
+        # The operator must lower an oversized MTU, not let CNI silently choose the host default.
+        oversized = root / "oversized-mtu.toml"
+        oversized.write_text(worker_config.read_text().replace("[native.network]", "[native.network]\nmtu = 9000"))
+        report = subprocess.run([str(binary), "preflight", "--config", str(oversized)], capture_output=True, timeout=15)
+        assert report.returncode != 0 and not {c["name"]: c["ok"] for c in json.loads(report.stdout)["checks"]}["operator_bridge_mtu"]
+        oversized.unlink()
     rootfs = root / "fixture-rootfs"
     rootfs.mkdir(mode=0o755)
     for name in ("dev", "proc", "workspace"):
@@ -378,13 +386,17 @@ url = "http://127.0.0.1:{worker_port}"
         subprocess.run(["mkfs.erofs", str(probe_image), str(probe_rootfs)], check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         probe_bases[name] = publish_layer(root, probe_image)
         write_template(root, dict(manifest, template_id=name, base=probe_bases[name]))
-    for name in ("incompatible", "tampered", "symlinked", "unknown-metadata", "no-defaults", "old-schema") + (("policy-not-authorized", "unsupported-policy") if args.network else ()):
+    for name in ("incompatible", "pre-cni-layout", "other-mtu", "tampered", "symlinked", "unknown-metadata", "no-defaults", "old-schema") + (("policy-not-authorized", "unsupported-policy") if args.network else ()):
         directory = root / "templates" / name
         directory.mkdir(mode=0o700)
         invalid = json.loads(json.dumps(manifest))
         invalid["template_id"] = name
         if name == "incompatible":
             invalid["compatibility"]["kernel"] = "incompatible-kernel"
+        if name == "pre-cni-layout":
+            invalid["compatibility"]["layout"] = "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1"
+        if name == "other-mtu":
+            invalid["compatibility"]["layout"] = compatibility["layout"].replace("mtu1500", "mtu1400")
         if name == "tampered":
             invalid["base"]["bytes"] += 1
         if name == "unknown-metadata":
@@ -720,7 +732,7 @@ url = "http://127.0.0.1:{worker_port}"
         print("PASS blocking cold create, concurrent commands in one sandbox (own groups), command limit, kill, streamed output and immediate capture 409")
 
         before_dirs = {name: sorted(p.name for p in (root / name).iterdir()) for name in ("private", "runc")}
-        rejected_templates = ["incompatible", "symlinked", "unknown-metadata", "old-schema"] + (["policy-not-authorized", "unsupported-policy"] if args.network else [])
+        rejected_templates = ["incompatible", "pre-cni-layout", "other-mtu", "symlinked", "unknown-metadata", "old-schema"] + (["policy-not-authorized", "unsupported-policy"] if args.network else [])
         for invalid_template in rejected_templates:
             rejected = expect(create_call(dict(template_id=invalid_template, ttl_seconds=60)), 422, "template_unavailable")
             assert "sandbox_id" not in rejected, "a pre-launch template rejection must not name an ID"
@@ -760,6 +772,87 @@ url = "http://127.0.0.1:{worker_port}"
         eventually(lambda: get(third)["state"] == "deleted", timeout=15)
         remove(third)
         observations["cleanup_retry_after_root_holder_release"] = True
+        if args.network:
+            # Stop before ADD's input is published, then feed ptp a bad IPAM name. DEL must still
+            # replay the original persisted static config, reset the slot and leave no workload.
+            failed_id = "node-smoke.cni-add-failure"
+            ids.append(failed_id)
+            input_file = root / "private" / failed_id / "cni-input.pending"
+            tracer, trace = trace_monitor("sandbox-operat", input_file, "fsync", "fsync:signal=SIGSTOP:when=1", "cni-failed-add")
+            try:
+                pending, box = in_background(lambda: request(worker_port, "/v1/sandboxes", worker_token,
+                    dict(sandbox_id=failed_id, template_id="fixture", ttl_seconds=60), "POST"))
+                eventually(lambda: "stopped by SIGSTOP" in trace.read_text(), timeout=10)
+                slot_reset(slot_of(failed_id))
+                bad = json.loads(input_file.read_text())
+                bad["ipam"]["type"] = "missing-plugin-for-gate"
+                input_file.write_text(json.dumps(bad))
+                worker.send_signal(signal.SIGCONT)
+                pending.join(timeout=30)
+                expect(box["result"], 500, "cni_failed")
+                gone(failed_id)
+                slot_reset(slot_of(failed_id))
+            finally:
+                stop_trace(tracer)
+            observations["cni_failed_add_rolled_back"] = True
+            # Fail caching after the real link exists: the drop boundary must still be empty, no
+            # runtime may exist, and rollback must remove the pair even without a saved ADD result.
+            failed_id = "node-smoke.cni-result-failure"
+            ids.append(failed_id)
+            cache_file = root / "private" / failed_id / "cni.pending"
+            tracer, trace = trace_monitor("sandbox-operat", cache_file, "fsync", "fsync:error=EIO:signal=SIGSTOP:when=3", "cni-result-sync")
+            try:
+                pending, box = in_background(lambda: request(worker_port, "/v1/sandboxes", worker_token,
+                    dict(sandbox_id=failed_id, template_id="fixture", ttl_seconds=60), "POST"))
+                eventually(lambda: "stopped by SIGSTOP" in trace.read_text(), timeout=10)
+                record = json.loads(cache_file.read_text())
+                assert record["plugins"][0]["result"]["interfaces"][1]["name"] == "eth0"
+                slot = slot_of(failed_id)
+                table = json.loads(subprocess.check_output(["ip", "netns", "exec", slot, "nft", "-j", "list", "table", "inet", "sandbox"], timeout=5))
+                assert not any("rule" in entry for entry in table["nftables"])
+                assert all(entry["chain"]["policy"] == "drop" for entry in table["nftables"] if "chain" in entry)
+                assert not (root / "runc" / failed_id).exists() and not (cgroup / failed_id).exists()
+                worker.send_signal(signal.SIGCONT)
+                pending.join(timeout=30)
+                expect(box["result"], 500, "record_write_failed")
+                gone(failed_id)
+                slot_reset(slot)
+            finally:
+                stop_trace(tracer)
+            observations["cni_result_failure_default_drop_rollback"] = True
+            # Remove only a drained guest pin before ordinary delete; persisted DEL must tolerate
+            # the missing namespace and remain harmless on a subsequent delete retry.
+            missing = create()
+            execute(missing, "counter")
+            guest_path = Path(json.loads((root / "private" / missing / "cni.json").read_text())["netns"])
+            worker.send_signal(signal.SIGSTOP)
+            try:
+                eventually(lambda: all("T (stopped)" in (task / "status").read_text() for task in Path(f"/proc/{worker.pid}/task").iterdir()), timeout=5)
+                (cgroup / missing / "cgroup.kill").write_text("1")
+                eventually(lambda: "populated 0" in (cgroup / missing / "cgroup.events").read_text(), timeout=5)
+                subprocess.run(["umount", str(guest_path)], check=True, timeout=5)
+                guest_path.unlink()
+            finally:
+                worker.send_signal(signal.SIGCONT)
+            remove(missing)
+            remove(missing)
+            observations["cni_del_missing_netns_idempotent"] = True
+            retry = create()
+            cache_path = root / "private" / retry / "cni.json"
+            tracer, trace = trace_monitor("sandbox-operat", cache_path.with_name("cni-input.pending"), "fsync",
+                                          "fsync:error=EIO:when=1..2", "cni-del-retry")
+            try:
+                # Failed DEL input writes keep the exact attachment/attempted bit available for
+                # retry, even though the workload has already been drained and removed.
+                for _ in range(2):
+                    expect(request(worker_port, f"/v1/sandboxes/{retry}", worker_token, method="DELETE"), 500, "cleanup_failed")
+                    assert json.loads(cache_path.read_text())["plugins"][0]["attempted"]
+                    assert get(retry)["state"] == "cleanup_failed" and not (cgroup / retry).exists()
+                remove(retry)
+            finally:
+                stop_trace(tracer)
+            slot_reset(slot_of(retry))
+            observations["cni_del_failure_retains_cache_for_retry"] = True
         transient = create()
         held_root = open(root / "private" / transient / "rootfs/fixture", "rb")
         try:
@@ -1008,15 +1101,30 @@ url = "http://127.0.0.1:{worker_port}"
             routes = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "route", "show", "table", "main"], check=True, capture_output=True, timeout=5)
             assert json.loads(routes.stdout or b"[]") == []
             assert Path(json.loads((root / "private" / source / "config.json").read_text())["linux"]["namespaces"][2]["path"]).exists()
-        # Record owned network state and exercise allowed/denied TCP, path-MTU discovery and the app proxy
-        # (path and host forms). With full, also check authentication, an unapproved port, real
-        # statuses and headers, binary and chunked streaming in both directions, the idle timeout and
-        # the connection limit, with the connections opened inside the routing slot only, while
-        # requiring the sandbox to remain running. Return True.
+        # Validate persisted CNI identity, addresses/routes and MTU, then exercise policy, PMTU and
+        # the proxy. Full mode also checks auth, bounds and bidirectional HTTP/streaming behavior.
         def network_gate(sandbox, full=False):
             config_json = json.loads((root / "private" / sandbox / "config.json").read_text())
             guest = Path(config_json["linux"]["namespaces"][2]["path"]).name
             slot = slot_of(sandbox)
+            attachment = json.loads((root / "private" / sandbox / "cni.json").read_text())
+            assert attachment["version"] == 1 and attachment["id"] == sandbox and attachment["netns"] == "/run/netns/" + guest
+            assert len(attachment["plugins"]) == 1
+            plugin = attachment["plugins"][0]
+            assert plugin["attempted"] and plugin["config"]["type"] == "ptp" and plugin["config"]["ipam"]["type"] == "static"
+            assert plugin["config"]["mtu"] == 1500 and plugin["config"]["ipMasq"] is False
+            result = plugin["result"]
+            assert result["cniVersion"] == "1.0.0" and result["ips"] == [{"address": "192.0.2.2/30", "gateway": "192.0.2.1", "interface": 1}]
+            host, container = result["interfaces"]
+            assert container["name"] == "eth0" and container["sandbox"] == attachment["netns"]
+            for namespace, interface in ((guest, container), (slot, host)):
+                links = json.loads(subprocess.check_output(["ip", "-n", namespace, "-j", "link", "show", "dev", interface["name"]], timeout=5))
+                assert links[0]["mtu"] == 1500 and links[0]["address"] == interface["mac"] and "UP" in links[0]["flags"]
+            routes = json.loads(subprocess.check_output(["ip", "-n", slot, "-j", "route"], timeout=5))
+            assert any(route["dst"] == "192.0.2.2" and route["dev"] == host["name"] for route in routes), routes
+            previous = observations.setdefault("cni_attachments", {})
+            assert all(other["plugins"][0]["result"]["interfaces"][1]["mac"] != container["mac"] for name, other in previous.items() if name != sandbox)
+            previous[sandbox] = attachment
             observations.setdefault("network_rules", {})[sandbox] = {name: subprocess.check_output(["ip", "netns", "exec", name, "nft", "list", "ruleset"], text=True, timeout=5) for name in [guest, slot]}
             observations.setdefault("network_links", {})[sandbox] = {name: {what: subprocess.check_output(["ip", "-n", name, "-j", what], text=True, timeout=5) for what in ["address", "route", "neigh"]} for name in [guest, slot]}
             observations.setdefault("guest_netns_match", {})[sandbox] = [os.readlink(f"/proc/{host_pid(sandbox)}/ns/net"), os.stat("/run/netns/" + guest).st_ino]
@@ -1464,6 +1572,50 @@ url = "http://127.0.0.1:{worker_port}"
             for i in range(3):
                 slot_reset(f"{owned_prefix}s-{i}")
             observations["restart_rebuilt_slot_pool"] = True
+            # A failed startup DEL must keep its original routing domain for later retries, even
+            # across another restart. Block only its input write; never remove a namespace by hand.
+            stranded = create("warm")
+            private = root / "private" / stranded
+            attachment = json.loads((private / "cni.json").read_text())
+            held_index = attachment["slot"]
+            held_slot = slot_of(stranded)
+            held_pin = Path("/run/netns") / held_slot
+            guest_pin = Path(attachment["netns"])
+            old_identity = slot_identities()[held_index]
+            old_pins = [held_pin.stat().st_ino, guest_pin.stat().st_ino]
+            fault = private / "cni-input.pending"
+            fault.mkdir(mode=0o700)
+            restart_failures = []
+            try:
+                for attempt in range(2):
+                    kill_and_restart_worker()
+                    eventually(lambda: get(stranded)["state"] == "cleanup_failed", timeout=10)
+                    assert json.loads((root / "worker-status.json").read_text())["cleanup_error"] == "private_cleanup_failed"
+                    assert json.loads((private / "cni.json").read_text())["plugins"][0]["attempted"]
+                    assert slot_identities()[held_index] == old_identity
+                    assert [held_pin.stat().st_ino, guest_pin.stat().st_ino] == old_pins
+                    assert not (cgroup / stranded).exists() and not (root / "runc" / stranded).exists()
+                    assert any(line.split()[4] == str(private / "rootfs") for line in Path("/proc/self/mountinfo").read_text().splitlines())
+                    assert expect(request(worker_port, "/v1/status", worker_token), 200)["usage"]["sandboxes"] == 1
+                    # Readiness must not make the held slot available to a new attachment.
+                    other = create()
+                    assert slot_of(other) != held_slot
+                    remove(other)
+                    restart_failures.append(dict(attempt=attempt + 1, error=get(stranded)["error"],
+                                                 slot_identity=list(old_identity), namespace_inodes=old_pins))
+            finally:
+                fault.rmdir()
+            eventually(lambda: get(stranded)["state"] == "deleted", timeout=15)
+            gone(stranded)
+            assert not held_pin.exists() and not guest_pin.exists()
+            assert not (root / "slots" / str(held_index)).exists()
+            replacement = create()
+            assert slot_of(replacement) == held_slot and slot_identities()[held_index] != old_identity
+            remove(replacement)
+            slot_reset(held_slot)
+            observations["cni_startup_del_failure_recovered"] = dict(restarts=restart_failures, automatic_cleanup=True,
+                held_slot_excluded_from_admission=True, old_slot_removed_before_reuse=True)
+            print("PASS failed startup CNI DEL retains its slot across two restarts, then retries cleanup and rebuilds before reuse")
         # After the restart the saved state is trusted while the image keeps its identity (no rehash);
         # a changed identity (here only the change time) means hashing again, and same-size corrupted
         # content is then rejected.

@@ -8,6 +8,7 @@ mod worker;
 mod engine;
 mod native;
 mod network;
+mod cni;
 mod phases;
 mod process;
 mod proxy;
@@ -28,7 +29,7 @@ fn main() {
     }
 }
 
-// Dispatch internal helpers or load and validate the selected service configuration. Load credentials
+// Dispatch internal helpers (including standalone CNI) or validate service configuration. Load credentials
 // only for serving; preflight prints prerequisite checks. Worker mount boundaries and active probes
 // are established before starting any threads, including the request runtime.
 fn start() -> Result<(), &'static str> {
@@ -39,6 +40,7 @@ fn start() -> Result<(), &'static str> {
         return Ok(());
     }
     if args.len() == 3 && args[0] == "internal-erofs-mount" { return native::erofs_mount_helper(&args[1], &args[2]); }
+    if args.first().is_some_and(|a| a == "internal-cni") { return cni::exec(&args[1..]); }
     if args.first().is_some_and(|a| a == "internal-exec") { return process::exec_helper(&args[1..]); }
     if args.len() == 1 && args[0] == "internal-forward" { return network::forward_helper(true); }
     if args.len() == 1 && args[0] == "internal-guest-network" { return network::forward_helper(false); }

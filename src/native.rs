@@ -172,7 +172,7 @@ fn remove_group(path: &Path) -> Result<()> {
     }
 }
 
-const TOOL_NAMES: &[&str] = &["runc", "conmon", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini"];
+const TOOL_NAMES: &[&str] = &["runc", "conmon", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini", "ptp", "static"];
 
 // Decide whether a trusted tool is a statically linked ELF executable (no program interpreter), so
 // it runs inside any image's root filesystem. Unreadable or malformed files count as not static.
@@ -230,7 +230,7 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
 }
 
 // Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
-// creating runtime state. Collect compatibility fingerprints and report readiness only if every check
+// creating runtime state, including CNI protocol support and the configured link MTU. Report readiness only if every check
 // passes; qualification stays unvalidated. Active EROFS and overlay probes run only at startup.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
@@ -250,6 +250,10 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     for &name in TOOL_NAMES { add(&format!("tool_{name}"), tools.contains_key(name)); }
     add("tool_tini_static", tools.get("tini").is_some_and(|p| static_executable(p)));
     add("helper_path_matches_verified_tools", search_path.is_ok());
+    for name in ["ptp", "static"] {
+        add(&format!("cni_{name}_protocol"), tools.get(name).zip(search_path.as_ref().ok())
+            .is_some_and(|(tool, path)| crate::cni::supports_version(tool, path)));
+    }
     if let Some(network) = config.and_then(|c| c.network.as_ref()) {
         let bridge = tools.get("ip").zip(search_path.as_ref().ok()).and_then(|(ip, path)| process::inspect(ip, &["-j".into(), "-d".into(), "link".into(), "show".into(), "dev".into(), network.bridge.clone()], path).ok())
             .filter(|o| o.exit_code == Some(0) && !o.interrupted).and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok()).is_some_and(|v| v[0]["linkinfo"]["info_kind"] == "bridge");
@@ -257,6 +261,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
             .filter(|o| o.exit_code == Some(0) && !o.interrupted).and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok());
         let gateway = addresses.as_ref().and_then(|a| a.as_array()).is_some_and(|links| links.iter().any(|l| l["addr_info"].as_array().is_some_and(|a| a.iter().any(|a| a["local"] == network.gateway.to_string() && a["prefixlen"] == network.prefix))));
         add("operator_bridge_gateway", bridge && gateway);
+        add("operator_bridge_mtu", addresses.as_ref().is_some_and(|a| a[0]["mtu"].as_u64().is_some_and(|mtu| mtu >= network.mtu as u64)));
     }
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     for name in ["erofs", "overlay", "cgroup2"] { add(name, filesystems.lines().any(|l| l.split_whitespace().last() == Some(name))); }
@@ -287,7 +292,8 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let init = storage::artifact(Path::new(tools.get("tini")?), 1 << 26).ok()?;
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             runc_version: version("runc")?, criu_version: version("criu")?,
-            init_sha256: init.sha256, layout: "erofs-sealed-layers-v3-fixed-slot-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1".to_owned() })
+            init_sha256: init.sha256, layout: format!("erofs-sealed-layers-v3-cni-ptp-static-v1-mtu{}-tcp-established-pmtu-v1-seccomp-v4-agentenv-tini-v1-conmon-null-v1",
+                config.and_then(|c| c.network.as_ref()).map_or(1500, |n| n.mtu)) })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
     let erofs = ErofsStatus { file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };

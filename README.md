@@ -84,9 +84,17 @@ RBAC, built-in TLS or Internet-facing connection defense.
   builds one per admissible sandbox with its uplink and default-deny base table, a
   create only attaches the sandbox's guest namespace and installs the template's
   rules, and delete resets the slot (rules and connection tracking flushed) rather
-  than deleting it. Restart rebuilds the pool; shutdown removes it.
+  than deleting it. Restart rebuilds free slots but retains unfinished teardown's
+  slots for CNI DEL retries, never for new admission; shutdown removes the pool.
   Isolated sandboxes also get a worker-owned guest namespace, with only loopback.
   The operator provisions a stable-MAC bridge, gateway and exclusive address pool.
+  Guest veth/address/routes now use standalone **CNI ptp + static IPAM** inside the
+  router slot, never the shared pod namespace. The default-drop boundary precedes
+  ADD; cached config/results drive reverse DEL, including partial failures and
+  vanished guests. Both link pairs have explicit MTU (`native.network.mtu`, default
+  1500, no larger than the operator bridge); CNI checks and policy precede launch.
+  Stage verified `ptp` and `static` from Canonical noble containernetworking-plugins
+  alongside the other trusted tools. The versioned CNI/MTU layout rejects old templates.
   No global firewall, routing or sysctl repair; no DNS, UDP, IPv6 or host-network mode.
 - One durable admission/state coordinator per worker, a fixed bounded pool for
   parallel create/capture/delete across sandboxes, per-sandbox exclusion of those
@@ -162,7 +170,7 @@ RBAC, built-in TLS or Internet-facing connection defense.
   transient CRIU failures are not cached. Create/final record sync runs on operation
   workers, already-mounted lowers bypass the mount queue, and helpers use an
   exec trampoline rather than copying the worker's address space. Network setup
-  batches ip commands without copying the mount namespace. A bounded connector
+  uses CNI for guest links and batches uplink ip commands without copying the mount namespace. A bounded connector
   pool makes proxy sockets; guest connections are still never reused.
 - Startup actively probes the upper backing directory for directory-entry types,
   required xattrs, copy-up/hardlinks and ordinary/volatile overlay mounts. It caches

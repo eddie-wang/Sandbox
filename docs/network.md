@@ -1,7 +1,7 @@
 # Native network and app proxy architecture
 
 The implementation is intentionally small: runc/CRIU, existing Linux namespaces,
-veth, nftables and the existing worker operation/helper ownership model. No VM
+CNI `ptp` + `static` IPAM, nftables and the existing worker operation/helper ownership model. No VM
 storage, network daemon, outbound HTTP relay, domain-policy engine or S3 client.
 
 ## Authority and topology
@@ -13,7 +13,7 @@ controller: authenticated requests, routed by sandbox ID (app proxy: path form o
 worker admission: durable record + exclusive pool slot + per-sandbox exclusion
     |
     +-- guest netns (per sandbox)           pooled router-slot netns (pre-created)
-    |   192.0.2.2/30 eth0 -- veth inside -- 192.0.2.1/30      (attached at create)
+    |   192.0.2.2/30 eth0 -- CNI veth -- 192.0.2.1/32        (attached at create)
     |   runc workload                       nft default drop; template's TCP permits
     |   UID/GID 65534, no capabilities       private SNAT to the slot's pool address
     |   seccomp: io_uring/MPTCP guards only     |
@@ -29,13 +29,29 @@ Router slots are pooled, following the AgentENV network manager (`allocate_slot`
 namespace, uplink veth on the bridge, address, routes and default-deny nftables
 base (filter chains with drop policy and no rules, plus the SNAT rule) between
 sandboxes. A slot holds at most one sandbox at a time.
+
+Guest link/address/route construction is delegated to standalone CNI `ptp` with
+`static` IPAM (Canonical noble package, qualified version 1.1.1). The plugin's
+**host network namespace is the router slot**, not the shared pod namespace;
+`CNI_NETNS` is the guest pin and `CNI_IFNAME` is `eth0`. Static allocation safely
+repeats `192.0.2.2`; a shared host-local allocation domain would not. Ptp retains
+the guest `/30` address but replaces the connected subnet route with a gateway
+host route and a subnet route through that gateway; the slot receives gateway
+`192.0.2.1/32` and a host route to `192.0.2.2`. Its random host interface name comes
+from the saved result and is used in nft rules. CNI masquerading is disabled: our
+slot-local SNAT and exact allowlist remain authoritative. No tuning plugin is
+needed; loopback/IPv6 handling stays in the existing namespace helper.
 The unique pool address is outside the guest: independent restores do not need to
 rewrite an address embedded in a listening socket. The operator configures a
 bridge/gateway/prefix, an exclusive pool, exact IPv4 destination/port ceiling and
 service-port ceiling. The bridge must have an explicitly assigned stable MAC;
 auto-selection from changing veth ports is unsuitable. Preflight checks bridge
-kind/address/prefix and serialized bounds, not end-to-end routing or remote service
-readiness. External routing and avoiding pool overlap with other workers/peers are
+kind/address/prefix, bridge MTU and serialized bounds, not end-to-end routing or remote service
+readiness. `[native.network].mtu` defaults to 1500, accepts 1280–9000, and must not
+exceed the bridge MTU. The operator must select a value safe for the actual pod
+underlay; the worker does not infer overlay encapsulation overhead. Both uplink
+ends and CNI veth ends are set explicitly; guest and CNI-host MTUs are checked
+before launch. The layout fingerprint includes this MTU. External routing and avoiding pool overlap with other workers/peers are
 operator responsibilities. The worker never repairs global routing/firewall/sysctls.
 
 Manifest v3 contains the policy. `isolated` creates no external links: the worker
@@ -86,19 +102,26 @@ and mounts; no_new_privs and cgroups remain in force.
 3. Before resource creation, verify the guest name is absent and durably create an
    exclusive private ownership marker. Do not adopt unexplained existing namespaces.
 4. Create the guest namespace pin (loopback up, IPv6 disabled); isolated sandboxes
-   stop here. Otherwise claim the slot (a missing or unknown one is rebuilt now),
-   atomically replace its rules with the template's (`flush table` plus the exact
-   permits in one nftables transaction), then create the `inside`/`eth0` veth pair
-   into the guest, its addresses and the guest default route.
-5. Bring the guest links up only after the rules succeed, then run/restore runc. The
+   stop here. Otherwise claim the default-drop slot (a missing or unknown one is
+   rebuilt now), durably save the CNI config and ADD intent in `private/<id>/cni.json`,
+   invoke ptp/static and persist its result. Validate the fixed address/name and
+   both veth MTUs, then CNI CHECK. Finally atomically install the template permits.
+   CNI may raise links during ADD, but the default-drop boundary already exists.
+5. Only after the full chain, checks and custom policy succeed, run/restore runc. The
    guest OCI network namespace points to its worker-owned pin. Warm OCI
    normalization replaces only reconstruction paths; the network-policy digest
    stays bound.
 6. Delete/cancel waits for its in-flight job, drains tracked helper descendants,
    kills workload cgroups and removes runc state. It then returns the slot to the
-   pool: delete the slot's `inside` end (which removes the guest's `eth0` at once,
-   even if something still holds the guest namespace), flush the template rules
-   back to the default-deny base and flush the slot's connection tracking (a
+   pool: invoke persisted CNI DEL in reverse order (also for a failed ADD), removing
+   the guest's `eth0` and its slot peer even if something still holds the guest
+   namespace. DEL passes an empty netns when the guest pin has vanished; static has
+   no allocation database. Successful entries are durably marked complete; failed
+   entries stay available for retry. Config/result chaining and reverse deletion
+   follow [libcni v1.3.0](https://github.com/containernetworking/cni/blob/v1.3.0/libcni/api.go),
+   not a plugin daemon or a general configurable plugin framework. If both namespaces
+   are already gone, the kernel removed the pair and no static allocation remains.
+   Then flush the template rules back to default-deny and connection tracking (a
    netlink request from a same-binary helper inside the slot, after it checks that
    no guest link remains), so the next sandbox inherits no rules, flows or NAT
    mappings. A slot that cannot be reset is deleted instead (its host link removal
@@ -110,9 +133,12 @@ and mounts; no_new_privs and cgroups remain in force.
 7. Restart drains root-specific helper cgroups before any namespace/private/staging
    cleanup. Records, slot ownership directories and root-specific namespace names
    are checked for unexplained ownership; old live workloads are terminated, never
-   silently adopted. Pooled slots are not adopted either: after the sandboxes are
-   cleaned up every owned slot is deleted and the pool is built fresh (step 1).
-   Shutdown, once every sandbox is gone, deletes the whole pool.
+   silently adopted. Unreserved slots are deleted and rebuilt (step 1). A slot
+   still reserved by unfinished cleanup is retained only for teardown, never
+   admitted into the ready pool: a failed CNI DEL must keep its original routing
+   namespace for retry, including across another restart. After DEL succeeds,
+   this retained slot is destroyed and built fresh before reuse. Shutdown, once
+   every sandbox is gone, deletes the whole pool.
 
 The worker's short coordinator and bounded I/O pool are unchanged. Different
 sandboxes overlap; one sandbox's create/capture/delete do not race, and capture
@@ -141,6 +167,10 @@ copy fails on first use while the source keeps the original. Fresh post-restore 
 successful fixture is not broad application or cross-host checkpoint qualification.
 
 Manifest v1/v2 and older layout fingerprints are deliberately incompatible.
+The `cni-ptp-static-v1-mtu<value>` layout rejects pre-CNI templates. The guest name
+remains `eth0`; its MAC and the slot-side name/MAC may differ between copies. Runc
+passes the network namespace as external/empty to CRIU, so it restores sockets
+into the supplied namespace rather than replaying checkpointed links or MACs.
 The new schema/layout also applies to newly provisioned isolated templates; there
 is no silent interpretation of old deny-all artifacts as network-enabled images.
 
@@ -161,13 +191,14 @@ The mailbox holds at most 1024 requests; full or failed entry returns no socket.
 No shared worker or Tokio thread ever changes namespace, idle connectors keep no
 slot pinned, and nothing listens on or routes from the host network. The slot's
 existing nftables rules allow exactly the slot-to-guest service-port flow
-(`output oifname inside ... tcp dport <port>` and established replies). One request
+(`output oifname <CNI-host-name> ... tcp dport <port>` and established replies). One request
 per guest connection; sockets are never pooled across exchanges (guest addresses
 are reused). Threads are shared, not guest connections.
 
 Host network helpers enter only the requested network namespace, not a fresh
-copy of the worker's mount namespace. Related link/address/route operations use
-`ip -batch`; nftables policy still completes before any guest link is brought up.
+copy of the worker's mount namespace. Uplink link/address/route operations still
+use `ip -batch`; the guest-facing primitives are CNI's. The default-drop boundary
+precedes CNI ADD; all policy completes before any workload launch/restore.
 
 The request and response are forwarded as HTTP/1.1 messages, not reinterpreted:
 the method, raw path and query, headers and status are the application's; bodies

@@ -274,6 +274,8 @@ pub struct NativeConfig {
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     pub bridge: String,
+    #[serde(default = "default_network_mtu")]
+    pub mtu: u32,
     pub gateway: std::net::Ipv4Addr,
     pub prefix: u8,
     pub addresses: Vec<std::net::Ipv4Addr>,
@@ -281,11 +283,11 @@ pub struct NetworkConfig {
     pub service_ports: Vec<u16>,
 }
 impl NetworkConfig {
-    // Check bridge naming, pool size and allowed destinations and ports. Require distinct usable pool
+    // Check bridge naming, explicit MTU, pool size and permissions. Require distinct usable pool
     // addresses in the gateway subnet, excluding the gateway and egress targets.
     fn valid(&self) -> bool {
         if self.bridge.is_empty() || self.bridge.len() > 15 || !self.bridge.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-            || !(8..=30).contains(&self.prefix) || self.addresses.is_empty() || self.addresses.len() > 256
+            || !(1280..=9000).contains(&self.mtu) || !(8..=30).contains(&self.prefix) || self.addresses.is_empty() || self.addresses.len() > 256
             || self.egress.len() > 64 || self.service_ports.len() > 16 || self.service_ports.contains(&0) { return false; }
         let mask = u32::MAX << (32 - self.prefix);
         let network = u32::from(self.gateway) & mask;
@@ -295,6 +297,9 @@ impl NetworkConfig {
             && self.egress.iter().all(|e| e.valid() && !self.addresses.contains(&e.ip))
     }
 }
+
+// Use Ethernet's usual MTU unless the operator selects a smaller underlay-safe value.
+fn default_network_mtu() -> u32 { 1500 }
 
 // Use 16 parallel operation workers unless configured.
 fn default_concurrent_operations() -> usize { 16 }
