@@ -11,7 +11,8 @@ chunked bodies) inside a disposable outer test netns, restored listening
 sockets/fresh connections, and the existing lifecycle cases: cold create, capture
 without stopping the source, independent warm restore (including an established
 loopback TCP connection) from a sealed EROFS layer and a once-per-node checkpoint
-cache, a reaping PID 1, concurrent, streamed and killed commands whose bounds stop
+cache, chained capture of a restored child, deletion of a source whose dump was
+stopped at its deadline, layer verification kept across worker restarts, a reaping PID 1, concurrent, streamed and killed commands whose bounds stop
 only themselves, private writes/whiteouts, blocking inline results, cleanup after
 client disconnect mid-exec and mid-create, waiting concurrent DELETEs, TTL/delete
 and crash/restart cleanup. A real-image check (`python:3.12-slim`, including a
@@ -19,7 +20,8 @@ WebSocket echo through the proxy) passed too.
 This is a targeted functional result, **not production isolation, general workload
 readiness, cross-node portability or capacity qualification**. The validation host's
 indirect system-library/shell trust was not established; see the operator recipe.
-Compilation and the nonprivileged HTTP smoke are separate checks.
+Compilation and the nonprivileged HTTP smoke (which also checks that simultaneous
+creates spread over two stand-in workers) are separate checks.
 
 ## Safe default
 
@@ -53,7 +55,10 @@ RBAC, built-in TLS or Internet-facing connection defense.
 
 - Administrator-provisioned immutable EROFS base images plus EROFS layers sealed by
   captures, all content-addressed and mounted once per node as shared read-only
-  lowers (hashed once per node, at first use or publication); **ordinary private
+  lowers. The create job hashes a layer the first time this worker uses it (two
+  creates of the same new layer hash it once; others never wait behind a hash) and
+  saves the result with the image file's identity, so it is trusted again after a
+  worker restart until the file changes; **ordinary private
   OverlayFS upper/work directories**, a fresh empty upper per sandbox, no
   per-container block devices or storage daemon. Only the shared EROFS mounts use
   loop devices.
@@ -89,7 +94,9 @@ RBAC, built-in TLS or Internet-facing connection defense.
   finish with normal cleanup; a create whose reply the worker could not deliver is
   deleted as `create_response_lost`), except when a later hop loses a reply the
   worker already handed over; the sandbox's TTL bounds that case. The controller chooses the
-  worker and generates an opaque sandbox ID that routes later calls; clients never
+  worker (least projected load, counting its own in-flight and not-yet-polled
+  creates, with round-robin between equal scores, so simultaneous creates spread)
+  and generates an opaque sandbox ID that routes later calls; clients never
   name nodes. Worker admission is final; stale controller capacity cannot
   reserve memory or start a workload. CPU quota admission has an explicit bounded
   operator overcommit factor, rather than assuming each idle quota consumes a
@@ -99,8 +106,10 @@ RBAC, built-in TLS or Internet-facing connection defense.
   whiteouts kept), `runc checkpoint --leave-running` with `--tcp-established
   --ext-unix-sk --file-locks`, `runc resume`; then archive the images and atomically
   publish the layer, manifest and digests. On failure the source is thawed and kept
-  if it runs. Children mount the sealed layer above the base and restore from CRIU
-  images unpacked once per node per manifest digest and shared read-only. File
+  if it runs, except that a dump stopped at its deadline deletes the source (its
+  state is uncertain). Children mount the sealed layer(s) above the base (captures
+  of warm children chain up to 16 layers) and restore from CRIU images unpacked once
+  per node per manifest digest, synced before they are trusted, and shared read-only. File
   identity and independent restore are explicit qualification gates, exercised by
   open upper/lower descriptors, mappings and a loopback TCP connection in the real
   fixture. That fixture passed; arbitrary open-file/application states and other
@@ -123,7 +132,10 @@ RBAC, built-in TLS or Internet-facing connection defense.
   address, for template-approved service ports only. Real statuses, headers and
   streamed bodies both ways (large, binary, chunked, server-sent events) and
   WebSocket upgrades; the management Authorization header is never forwarded; open
-  exchanges are bounded and idle ones end; there is no total deadline.
+  exchanges are bounded, end when the sender stays silent for the idle timeout
+  (a client that stops reading is not timed out) or when the sandbox is deleted
+  (also while still connecting); there is no total deadline, and controller
+  shutdown waits for them only up to the longest management deadline.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting

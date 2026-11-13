@@ -84,12 +84,12 @@ The controller does not launch containers itself. The worker uses existing Linux
 Suppose a client wants a sandbox from template `example-template`. It sends only the template name, a lifetime and, optionally, memory and CPU. Omitted values come from the template.
 
 1. **The controller validates the request.** It checks authentication and the request fields.
-2. **The controller chooses a node.** It considers every worker with a recent, healthy status and orders them by how full their promised budgets are, least full first. The client never names a node.
+2. **The controller chooses a node.** It considers every worker with a recent, healthy status and orders them by how full their promised budgets are, least full first. A worker's last status can be a moment old, so the controller also counts the creates it has itself just sent there (still running, or answered but not yet in a newer status), and equally full workers take turns, as AgentENV's scheduler does. Creates that arrive together therefore spread over the workers instead of all going to the same one. The client never names a node.
 3. **The controller creates the sandbox ID.** The ID starts with the chosen node's name followed by a random part, for example `node-a.3f0c…`. Clients treat it as an opaque name. Because the owner is part of the ID, later requests reach the right worker without a lookup table, even after the controller restarts.
 4. **The controller forwards the request to that worker.** Worker addresses come from administrator configuration, not the caller. The controller uses its separate worker credential.
 5. **The worker makes the final decision.** The controller's information may already be out of date. The worker checks that it has a valid, compatible copy of the template, then its own reservations, container count and background-work slots. It saves a record before creating anything outside that record. If capacity has run out, it says so without saving anything.
 6. **If the worker said no before starting anything, the controller tries another node.** Examples are "no capacity", "busy" and "I don't have a usable copy of this template". It makes at most three attempts, each with a new ID. If the outcome is uncertain — the connection broke, the wait ran out, or the worker failed after it started — the controller does **not** try elsewhere. It reports the error together with the ID, so the client can look at or delete that sandbox.
-7. **Background work checks the template files.** It mounts the template's shared read-only layers (its base and, for a warm template, the layers sealed by captures). Each layer's checksum is verified the first time the node uses it; later creates reuse the verified mount. For a warm template it also takes the node's copy of the saved processes, unpacked and verified once per template and shared by every later restore.
+7. **Background work checks the template files.** The create's own background job verifies each layer's checksum the first time the node uses it (two creates needing the same new layer check it once; creates whose layers are already checked never wait for someone else's check). The result is saved with the file's identity, so a worker restart does not check an unchanged layer again; a changed file is checked again. Then the template's shared read-only layers are mounted (its base and, for a warm template, the layers sealed by captures); later creates reuse the verified mount. For a warm template it also takes the node's copy of the saved processes, unpacked and verified once per template, written safely to disk before it is used, and shared by every later restore.
 8. **The worker prepares this sandbox's private environment.** It creates the writable directories, mounts OverlayFS, installs resource limits and any permitted networking, and writes the container's configuration file.
 9. **The worker starts or restores the application.** For a files-only template it invokes `runc run --detach --bundle <private-directory> <sandbox-id>`. For a template with saved processes it invokes `runc restore` instead. These are descriptions of worker-generated commands, not standalone setup instructions. The first process in every container is a tiny standard init program, `tini`, which starts the template's application, passes signals on to it and cleans up finished child processes ("zombies"), much like Docker's `--init`.
 10. **The worker verifies the container is running, and only then does the client get its answer.** The response (`201 Created`) contains the new ID and `running`. If creation failed, the worker first cleans up and the client receives the reason.
@@ -128,7 +128,7 @@ There are two different ways in:
 
 Requests wait for their real result, like an ordinary function call; nothing is saved for later retrieval. **Several commands can run in one sandbox at the same time**, each in its own resource group, up to a per-sandbox limit. Creating, capturing and deleting a sandbox remain one at a time per sandbox: a conflicting request is refused immediately rather than queued, and a capture is refused while commands are running. Work in different sandboxes runs at the same time.
 
-The worker limits how many create, capture and delete jobs and how many commands can run at once. Creating/restoring containers and capturing templates have an additional concurrency limit. Slow mounts, commands and file copies run separately from the short checks that reserve resources and update records. The proxy limits how many exchanges are open and ends one that stays silent for too long; otherwise the client decides how long to wait.
+The worker limits how many create, capture and delete jobs and how many commands can run at once. Creating/restoring containers and capturing templates have an additional concurrency limit. Slow mounts, commands and file copies run separately from the short checks that reserve resources and update records. The proxy limits how many exchanges are open and ends one whose sender stays silent for too long; a client that simply stops reading is not cut off by this limit. Otherwise the client decides how long to wait. When the controller shuts down, it waits for open requests at most as long as the longest management request may take, then cuts any streams still open.
 
 A command's time limit or output limit stops **only that command** (and everything it started); the result says it was interrupted, and the sandbox keeps running. A command can also be stopped on request by its ID. Even a successful command has its leftover child processes cleaned up; detached background jobs are not supported by this API.
 
@@ -142,10 +142,12 @@ Capture follows the AgentENV container design and **does not stop the source**:
 2. Briefly freeze the source's processes (`runc pause`).
 3. While it is frozen, flush its private file changes to disk and seal them into a new read-only EROFS layer. The layer keeps file permissions, owners, extended attributes and records of deleted base files.
 4. Still frozen, ask runc/CRIU to save the processes and let them keep running afterwards. Open network connections are saved too, including connections inside the sandbox.
-5. Unfreeze the source. It was unavailable only between steps 2 and 5; requests that arrive meanwhile wait and are answered afterwards.
+5. Unfreeze the source. It was unavailable only between steps 2 and 5; requests that arrive meanwhile wait and are answered afterwards. (The tests report the time the source's resource group was frozen and the longest gap a client saw; the gap is slightly longer because the checkpoint tool briefly unfreezes the group while it still holds the processes.)
 6. Archive the saved processes, then publish the layer and the complete template: the matching process checkpoint, the sealed layer, the base reference, the required configuration and checksums.
 
-If any step fails, the worker unfreezes the source and keeps it if it is still running; it never kills a healthy source.
+If any step fails, the worker unfreezes the source and keeps it if it is still running; it never kills a healthy source. The exception is a checkpoint that had to be stopped at its time limit: the checkpoint tool may have left the source half-changed, so that source is deleted.
+
+A warm child can itself be captured. Its own changes become one more sealed layer on top, so templates can chain (up to 16 layers); the tests restore a copy from such a two-layer template.
 
 To create a child, the client makes another create request naming the warm template; it gets a new sandbox ID, and the controller places it on a node holding a compatible copy of that template. The worker mounts the sealed layer on top of the base with a new, empty private directory for the child's changes, reconstructs the limits and network, and invokes `runc restore`. Nothing is copied per child. Source and child then continue independently. Connections inside the sandbox keep working in the child; a connection to an outside service keeps working only in the source, because the outside service and the source's network state are not copied.
 
@@ -165,7 +167,7 @@ Cleanup happens when the client deletes a sandbox, its lifetime expires, or the 
 - Remove its runtime state, private mounts, network connections and private files.
 - Release its reserved capacity only after cleanup succeeds.
 
-A delete request waits for cleanup to finish; if commands are running in that sandbox, delete stops them first, and it ends the sandbox's open proxied connections. If a second delete request for the same sandbox arrives meanwhile, it waits for the same cleanup and gets the same answer. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
+A delete request waits for cleanup to finish; if commands are running in that sandbox, delete stops them first, and it ends the sandbox's open proxied connections, including ones still connecting or waiting for the application's first answer. If a second delete request for the same sandbox arrives meanwhile, it waits for the same cleanup and gets the same answer. If cleanup fails, the delete request reports it, the record stays in `cleanup_failed`, its capacity remains reserved, and the worker retries. Shared base files and saved templates are retained; deleting a sandbox does not delete them.
 
 A separate lifetime monitor can stop an expired sandbox even while a long background operation is running. The requested lifetime starts when the worker accepts the create, not when application startup finishes.
 
@@ -196,7 +198,7 @@ Low-level packet rules and the tested fix for paths with smaller packet-size lim
 | [`http.rs`](../src/http.rs) | Checks management authentication and request size/time limits, and hands app traffic (proxy paths and proxy host names) to the proxy. |
 | [`proxy.rs`](../src/proxy.rs) | The reverse proxy: reads proxy host names and paths, streams requests and answers between hops, tunnels WebSockets, and opens the node's connection inside the sandbox's routing environment. |
 | [`controller.rs`](../src/controller.rs) | Polls workers, places new sandboxes, generates their IDs and forwards requests to the owner. |
-| [`scheduler.rs`](../src/scheduler.rs) | Orders ready nodes by how full their promised budgets are, for create placement. |
+| [`scheduler.rs`](../src/scheduler.rs) | Orders ready nodes by how full their promised budgets are (including creates just sent there), taking turns between equally full nodes, for create placement. |
 | [`worker.rs`](../src/worker.rs) | Receives node-local API requests, waits for each result (or streams command output) and returns it; checks proxied traffic against the sandbox's approved ports. |
 | [`model.rs`](../src/model.rs) | Defines request/status fields and checks valid values. |
 | [`engine.rs`](../src/engine.rs) | Owns saved sandbox records, reservations, background work and its results, running commands, expiry and restart cleanup. |
@@ -241,7 +243,8 @@ There is no full E2B-compatible API, public fork/pause/resume API, automatic tem
 
 Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linux host, with at most three containers, each limited to 64 MiB, one vCPU and 64 processes. They checked:
 
-- Cold startup, private file changes, capture without stopping the source (and a failed capture that leaves it running), independent restore, and reuse of the node's saved-process copy.
+- Cold startup, private file changes, capture without stopping the source (and a failed capture that leaves it running, and a checkpoint stopped at its time limit that deletes it), independent restore, a capture of a restored copy and a restore from that two-layer template, and reuse of the node's saved-process copy.
+- Layer checking in the create job (once for two simultaneous creates), trusted again after a worker restart, checked again after the file changes, and a damaged layer rejected; with the real image, a cold create after a restart that does not check the base again.
 - Saved open files, memory mappings and an open connection inside the sandbox in that fixture; deleted and modified base files in the sealed layer.
 - A first process that cleans up finished child processes, and a second delete that waits for the first.
 - The same workflow with a real public Python image, including a measurement of how long the source is frozen during capture.
@@ -249,7 +252,7 @@ Real tests used runc 1.3.6, CRIU 4.3 and a tiny application on one approved Linu
 - Allowed and denied TCP connections, the app proxy (both request forms, large binary bodies in both directions, chunked streaming, a WebSocket echo with the real image, connection and idle limits, unapproved ports), restored listeners and new connections after restore.
 - Cleanup of test-owned processes, mounts, namespaces, loop devices and resource groups.
 
-Networking tests ran inside a disposable private network environment; they did not change the default host network. Build checks and a separate nonprivileged API smoke also passed. Detailed instructions and limits are in [runtime validation](../docs/runtime.md).
+Networking tests ran inside a disposable private network environment; they did not change the default host network. The real-container tests used an optimized (release) build. Build checks and a separate nonprivileged API smoke also passed; the smoke includes eight simultaneous creates against two stand-in workers, which split four and four. Detailed instructions and limits are in [runtime validation](../docs/runtime.md).
 
 These results do not prove arbitrary application compatibility, all possible crash cases, hostile-workload containment, complete host/library trust or cross-node restore. No unit tests are used by project preference; small fixture results are not a substitute for real workload testing.
 

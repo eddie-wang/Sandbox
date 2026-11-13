@@ -170,11 +170,16 @@ hops into byte tunnels. Redirects are returned, not followed.
 
 Bounds: `[server.proxy] max_connections` open exchanges per service (default 256;
 503 `busy` beyond it) and `idle_timeout_ms` (default 600,000, AgentENV's response-head
-wait): the response head, every body and a tunnel must move a byte within that
-period (504 `upstream_timeout` from the worker, `owner_response_timeout` from the
-controller). There is no total deadline: the client decides. A guest that refuses
-or drops the connection is 502 `upstream_unavailable`. Deleting the sandbox, its
-TTL expiry or the end of its running state ends its open exchanges at once.
+wait): the sending side must move a byte within that period — the response head,
+the next frame of either body, a tunnel's reads and blocked writes (504
+`upstream_timeout` from the worker, `owner_response_timeout` from the controller). A
+receiver that stops reading is not timed out; its exchange holds its permit until it
+reads or disconnects. There is no total deadline: the client decides. A guest that
+refuses or drops the connection is 502 `upstream_unavailable`. Deleting the sandbox,
+its TTL expiry or the end of its running state ends its open exchanges, including
+ones still connecting or waiting for the response head (502), so a reset slot never
+hands a pending exchange to its next sandbox; a stalled body sees the close at its
+next read.
 See the [API](api.md#app-proxy) and the
 [disposable qualification recipe](runtime.md#disposable-network-qualification).
 

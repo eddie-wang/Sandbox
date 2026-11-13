@@ -5,8 +5,8 @@
 //! guest's fixed address from inside the sandbox's routing namespace (never the host network), for
 //! template-approved service ports only. Bodies stream both ways, statuses and headers are real, and a
 //! 101 answer to an upgrade request (WebSocket) becomes a byte tunnel. The management Authorization
-//! header never reaches the sandbox. Open exchanges are bounded and end after an idle period; there is
-//! no total deadline.
+//! header never reaches the sandbox. Open exchanges are bounded and end after an idle period while
+//! the receiving side keeps reading; there is no total deadline.
 use std::{fs::File, future::Future, os::fd::{AsRawFd, FromRawFd, OwnedFd}, path::PathBuf, pin::Pin, sync::{Arc, Mutex, PoisonError}, task::{Context, Poll}, time::Duration};
 use axum::{body::{Body, Bytes}, extract::Request, http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}, response::{IntoResponse, Response}};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
@@ -113,7 +113,9 @@ fn stop_future(stop: Option<watch::Receiver<()>>) -> Stop {
 
 // A streamed body that fails when no frame arrives within the idle timeout or when its sandbox is
 // closed, reports upload progress to the response-head wait, and holds the exchange's connection
-// permit until it ends. The mutex is never locked across a wait; it only makes the body shareable.
+// permit until it ends. Both checks run only when the receiving side asks for the next frame: a
+// receiver that stops reading is not timed out, and sees the close only at its next read. The mutex
+// is never locked across a wait; it only makes the body shareable.
 pub struct Tracked<B>(Mutex<TrackedState<B>>);
 struct TrackedState<B> {
     inner: B, idle: Duration, timer: Pin<Box<tokio::time::Sleep>>, stop: Stop,
@@ -152,17 +154,22 @@ impl<B> HttpBody for Tracked<B> where B: HttpBody<Data = Bytes> + Unpin, B::Erro
     fn size_hint(&self) -> SizeHint { self.0.lock().map_or_else(|_| SizeHint::default(), |state| state.inner.size_hint()) }
 }
 
+// How the wait for an upstream response head ended.
+enum Head<T> { Ready(T), Idle, Closed }
+
 // Wait for the upstream response head (AgentENV pattern): the idle timer restarts whenever the request
-// body sends data; once the body is done, the head must arrive within one more idle period. Returns
-// nothing on timeout.
-async fn head<F: Future>(response: F, mut activity: watch::Receiver<()>, idle: Duration) -> Option<F::Output> {
+// body sends data; once the body is done, the head must arrive within one more idle period. The close
+// signal is checked first, so a closed sandbox never gets a head through.
+async fn head<F: Future>(response: F, mut activity: watch::Receiver<()>, idle: Duration, closed: &mut Stop) -> Head<F::Output> {
     let mut response = std::pin::pin!(response);
     let mut timer = std::pin::pin!(tokio::time::sleep(idle));
     let mut uploading = true;
     loop {
         tokio::select! {
-            result = &mut response => return Some(result),
-            _ = &mut timer => return None,
+            biased;
+            _ = &mut *closed => return Head::Closed,
+            result = &mut response => return Head::Ready(result),
+            _ = &mut timer => return Head::Idle,
             changed = activity.changed(), if uploading => {
                 uploading = changed.is_ok();
                 timer.as_mut().reset(Instant::now() + idle);
@@ -221,7 +228,9 @@ async fn namespace_socket(netns: PathBuf) -> Option<OwnedFd> {
 // namespace `netns`, sending `app` (path and query) with Host set to the guest address and without
 // the Authorization header. Stream both bodies; a 101 answer to an upgrade request becomes a byte
 // tunnel. The idle timeout covers the response head, both bodies and the tunnel; `stop` (sandbox
-// deletion) ends the exchange; `permit` is held until it ends.
+// deletion or expiry) ends the exchange at every step, including while it is still connecting or
+// waiting for the head, so a pooled slot never carries it to the slot's next sandbox; `permit` is
+// held until it ends.
 pub async fn to_sandbox(netns: PathBuf, port: u16, app: String, mut request: Request, idle: Duration, stop: watch::Receiver<()>, permit: OwnedSemaphorePermit) -> Response {
     let upgrade = upgrade_requested(request.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));
@@ -232,11 +241,21 @@ pub async fn to_sandbox(netns: PathBuf, port: u16, app: String, mut request: Req
     let guest = std::net::SocketAddr::from((crate::network::GUEST.parse::<std::net::Ipv4Addr>().expect("fixed guest address"), port));
     headers.insert(header::HOST, HeaderValue::from_str(&guest.to_string()).expect("socket address is a valid header"));
     let unavailable = || failed(StatusCode::BAD_GATEWAY, "upstream_unavailable", "The sandbox service did not accept or answer the connection");
-    let Some(fd) = namespace_socket(netns).await else { return unavailable() };
+    let mut closed = stop_future(Some(stop.clone()));
+    let socket = tokio::select! {
+        biased;
+        _ = &mut closed => None,
+        fd = namespace_socket(netns) => fd,
+    };
+    let Some(fd) = socket else { return unavailable() };
     let socket = tokio::net::TcpSocket::from_std_stream(std::net::TcpStream::from(fd));
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(guest)).await {
-        Ok(Ok(stream)) => stream,
-        _ => return unavailable(),
+    let stream = tokio::select! {
+        biased;
+        _ = &mut closed => return unavailable(),
+        connected = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(guest)) => match connected {
+            Ok(Ok(stream)) => stream,
+            _ => return unavailable(),
+        },
     };
     let _ = stream.set_nodelay(true);
     let permit = Arc::new(permit);
@@ -249,10 +268,10 @@ pub async fn to_sandbox(netns: PathBuf, port: u16, app: String, mut request: Req
         return failed(StatusCode::BAD_REQUEST, "invalid_input", "Invalid application request target");
     };
     *upstream.headers_mut() = headers;
-    let mut response = match head(sender.send_request(upstream), activity_rx, idle).await {
-        None => return failed(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", "The sandbox service sent nothing within the proxy idle timeout"),
-        Some(Err(_)) => return unavailable(),
-        Some(Ok(response)) => response,
+    let mut response = match head(sender.send_request(upstream), activity_rx, idle, &mut closed).await {
+        Head::Idle => return failed(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", "The sandbox service sent nothing within the proxy idle timeout"),
+        Head::Closed | Head::Ready(Err(_)) => return unavailable(),
+        Head::Ready(Ok(response)) => response,
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let Some(client_upgrade) = client_upgrade else { return unavailable() };
@@ -297,10 +316,10 @@ pub async fn to_owner(client: &reqwest::Client, url: reqwest::Url, token: &str, 
     let (activity_tx, activity_rx) = watch::channel(());
     let body = reqwest::Body::wrap(Tracked::new(body, idle, None, Some(activity_tx), permit.clone()));
     let send = client.request(parts.method, url).headers(headers).body(body).send();
-    let response = match head(send, activity_rx, idle).await {
-        None => return failed(StatusCode::GATEWAY_TIMEOUT, "owner_response_timeout", "Owner sent nothing within the proxy idle timeout"),
-        Some(Err(_)) => return failed(StatusCode::SERVICE_UNAVAILABLE, "owner_response_unavailable", "Owner connection failed or was lost"),
-        Some(Ok(response)) => response,
+    let response = match head(send, activity_rx, idle, &mut stop_future(None)).await {
+        Head::Idle => return failed(StatusCode::GATEWAY_TIMEOUT, "owner_response_timeout", "Owner sent nothing within the proxy idle timeout"),
+        Head::Closed | Head::Ready(Err(_)) => return failed(StatusCode::SERVICE_UNAVAILABLE, "owner_response_unavailable", "Owner connection failed or was lost"),
+        Head::Ready(Ok(response)) => response,
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let Some(client_upgrade) = client_upgrade else {

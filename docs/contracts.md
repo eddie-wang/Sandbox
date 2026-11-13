@@ -17,6 +17,9 @@ exclusive to that worker; operators must not share it between worker roots.
 <root>/
   worker.lock
   worker-status.json              durable shutdown cleanup error, if any
+  verified-layers.json            layers this worker fully hashed: digest, size and the
+                                  image file's identity at that time (root-owned 0600,
+                                  replaced atomically; an unusable file means rehash)
   records/<sandbox-id>.json        atomic lifecycle records (schema 2; metadata only)
   private/<node>.<id>/
     upper/ work/ rootfs/           ordinary directories; rootfs is OverlayFS; upper
@@ -29,7 +32,7 @@ exclusive to that worker; operators must not share it between worker roots.
   lowers/<sha256>/                 shared read-only EROFS mounts of those layers
   checkpoints/<manifest-sha256>/   node cache: CRIU images unpacked once per warm
                                    template manifest, shared read-only by restores
-  checkpoints/<sha256>.unpacking/  interrupted unpack; removed at worker start
+  checkpoints/<sha256>.unpacking/  unpack in progress; removed on failure and at worker start
   templates/<template-id>/
     manifest.json manifest.sha256
     checkpoint.tar                present only for warm templates
@@ -65,16 +68,36 @@ directory into a new immutable EROFS layer (see below); a child mounts it as a l
 with its own fresh empty upper, so nothing is copied per create.
 
 **Verified once per node.** A create checks only the manifest digest sidecar and
-fields. Each layer image is fully hashed the first time this worker mounts its
-digest (or when this worker publishes it at capture); the worker remembers the
-digest and size in memory and checks mount flags and backing image on every use.
+fields at admission. The create job then fully hashes each layer image this worker
+does not already trust, before handing the mounts to the shared-lower thread (which
+never hashes and refuses an untrusted layer). Creates hash in parallel on their own
+operation threads; a per-digest turn makes two creates of the same new layer hash
+it once, and creates whose layers are trusted never wait behind a hash. A capture
+marks the layer it publishes as verified. Each result is kept as digest, size and
+the image file's identity when hashed (device, inode, size, modification and change
+time, read from the hashed file before and after reading it), and saved atomically
+to `verified-layers.json`. A layer is trusted, in memory or after a restart, only
+while its image is still administrator-owned, not group/other writable and has that
+exact identity; any write, truncation, replacement or permission change alters the
+identity and means hashing again, and a mismatching hash fails the create and drops
+the entry. The state file is used only if it is a root-owned regular file that
+group/others cannot write, at most 16 MiB and well-formed; otherwise every layer is
+hashed again. A known digest whose manifest size differs is rejected. Mount flags
+and backing image are checked on every use.
+
 A warm template's `checkpoint.tar` is fully hashed and unpacked once into
 `checkpoints/<manifest-sha256>/` under a per-key turn: concurrent restores of the
-same manifest wait for that unpack, later ones reuse the directory, and the
-staging-then-rename makes the directory itself the "verified" record, which
-survives worker restarts. CRIU only reads the images; the gate checks the cache is
-unchanged by restores. Published artifacts must therefore never be modified in
-place: a change after first use on a node is not re-detected there.
+same manifest wait for that unpack and later ones reuse the directory. GNU tar does
+not sync what it writes, so the worker calls `syncfs` on the staging directory (one
+filesystem) and syncs the directory itself before renaming
+`<key>.unpacking` to `<key>` and syncing `checkpoints/`; a crash cannot leave
+truncated images under the final name. A failed unpack removes its `.unpacking`
+directory (after all helpers drained); start-up removes any left by a crash. The
+renamed directory is the "verified" record and survives worker restarts. CRIU only
+reads the images; the gate checks the cache is unchanged by restores. Published
+artifacts must still never be modified in place: the cache directory is not
+re-checked, and a layer changed in a way that keeps its identity (only possible by
+resetting the clock or with raw device writes) is not re-detected.
 
 Deletion checks mountinfo before recursive private removal, never uses lazy unmount
 or broad recursive mount deletion, and never deletes shared templates/images.
@@ -133,17 +156,25 @@ run on a bounded operation pool. Capture follows the AgentENV container backend 
 3. `runc checkpoint --leave-running --tcp-established --ext-unix-sk --file-locks`,
    with `network-lock nftables` and `skip-in-flight` (plus `allow-uprobes` when step
    2 found uprobes) in the per-container CRIU config.
-4. `runc resume` thaws the source. The frozen window is steps 1–4.
+4. `runc resume` thaws the source. The source is stopped from step 1 to step 4; the
+   gates report the cgroup-freezer time inside it (CRIU briefly thaws the cgroup
+   while the tasks stay ptrace-stopped, so freezer time slightly undercounts) and
+   the longest gap a client or counter saw.
 5. Outside the window: hash the sealed layer, archive the images into
    `checkpoint.tar` (GNU tar, numeric ownership/xattrs), write the manifest, publish
    the layer as `layers/<sha256>.erofs` without replacing an existing file (same
    digest = same content), then sync and atomically rename the staged template.
 
-On any failure the worker thaws the source and keeps it if runc reports it running;
-CRIU leaves dumped tasks alive, so a failed dump is not treated as terminating the
-source (the gate forces a dump failure with an undumpable file and checks the source
-keeps running). Only a source that stays frozen, or was cancelled/expired, is
-deleted. A layer published before a later step failed stays in `layers/`
+On an ordinary failure the worker thaws the source and keeps it if runc reports it
+running; CRIU leaves dumped tasks alive, so a failed dump is not treated as
+terminating the source (the gate forces a dump failure with an undumpable file and
+checks the source keeps running). A source that stays frozen, or was
+cancelled/expired, is deleted. So is a source whose `runc checkpoint` was stopped at
+its command deadline or output limit (`checkpoint_interrupted`): a killed CRIU can
+leave its network lock, sockets in repair mode or parasite code behind, so the state
+is uncertain even if runc reports it running (the gate stops the checkpoint helper
+and checks the source is deleted). A source template already at 16 sealed layers is
+refused before the pause (`template_layer_limit`). A layer published before a later step failed stays in `layers/`
 (content-addressed, retained like every layer). Failed/stale staging is removed
 without touching live mounts or published templates.
 

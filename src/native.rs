@@ -1,8 +1,8 @@
 //! Linux runc/CRIU backend. There is no runtime adapter or simulated success path.
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::Read, os::{fd::AsRawFd, unix::fs::OpenOptionsExt}, path::{Path, PathBuf}, sync::{Condvar, Mutex, PoisonError}, time::Duration};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use crate::{config::NativeConfig, model::SandboxSpec, process::{self, Result}, storage::{self, Artifact, Compatibility, Manifest}};
+use crate::{config::NativeConfig, model::SandboxSpec, process::{self, Result}, storage::{self, Artifact, Compatibility, FileIdentity, Manifest}};
 
 #[derive(Clone, Serialize)]
 pub struct Check { pub name: String, pub ok: bool }
@@ -20,14 +20,44 @@ pub struct Native {
     tools: BTreeMap<String, String>,
     pub search_path: String,
     pub helpers: process::Helpers,
-    // Layer digests (with sizes) whose image this worker has fully hashed; checked once per node.
-    verified: Mutex<BTreeMap<String, u64>>,
+    // Layers whose image this worker has fully hashed, by digest: their size and the identity of the
+    // image file when hashed. Trusted only while the file keeps that identity; saved in
+    // verified-layers.json so a restart does not rehash them.
+    verified: Mutex<BTreeMap<String, VerifiedLayer>>,
+    // Layer digests being hashed, plus the state-file write; other creates wait on `layer_turn_done`.
+    layer_turns: Mutex<BTreeSet<String>>,
+    layer_turn_done: Condvar,
     // Checkpoint cache keys being unpacked; other restores of the same key wait on `unpacked`.
     unpacking: Mutex<BTreeSet<String>>,
     unpacked: Condvar,
     // State of each pooled routing slot this worker built (see network.rs); never held across I/O.
     pub(crate) slots: Mutex<BTreeMap<usize, crate::network::SlotState>>,
     _lock: File,
+}
+
+// One fully hashed layer: its digest and size, and the identity its image file had when hashed.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedLayer { sha256: String, bytes: u64, file: FileIdentity }
+// The saved verified-layer state (root-owned, 0600, replaced atomically).
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedState { schema_version: u32, layers: Vec<VerifiedLayer> }
+// The state file's name in the worker root, its format version and its size limit.
+const VERIFIED_STATE: &str = "verified-layers.json";
+const VERIFIED_STATE_SCHEMA: u32 = 1;
+const VERIFIED_STATE_MAX_BYTES: u64 = 16 << 20;
+// The layer turn that serializes writes of the state file; never a layer digest.
+const VERIFIED_STATE_TURN: &str = "verified-state-write";
+
+// Read the saved verified-layer state of a worker root. A missing, unsafe (not root-owned or writable
+// by group or others), oversized or malformed file, or an invalid entry, yields an empty state, so
+// every layer is hashed again.
+fn load_verified(root: &Path) -> BTreeMap<String, VerifiedLayer> {
+    let Ok(state) = storage::read_json::<VerifiedState>(&root.join(VERIFIED_STATE), VERIFIED_STATE_MAX_BYTES) else { return BTreeMap::new() };
+    if state.schema_version != VERIFIED_STATE_SCHEMA
+        || state.layers.iter().any(|l| !storage::hex_digest(&l.sha256) || l.bytes != l.file.size) { return BTreeMap::new(); }
+    state.layers.into_iter().map(|l| (l.sha256.clone(), l)).collect()
 }
 
 // Where the reaping init (the trusted static tini) is bind-mounted read-only in every sandbox.
@@ -188,7 +218,7 @@ impl Native {
     // Require successful preflight and exclusive ownership of the runtime root. Verify tools, drain old
     // helper processes before touching runtime state, create private storage directories (including
     // the slot-pool ownership directory) and drop half-unpacked checkpoint cache entries. Unknown cache
-    // entries fail closed.
+    // entries fail closed. Load the saved verified-layer state (an unusable file means rehashing).
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -211,8 +241,9 @@ impl Native {
                 _ => return Err("unknown_checkpoint_cache_state"),
             }
         }
+        let verified = load_verified(root);
         Ok(Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers,
-            verified: Mutex::new(BTreeMap::new()), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), _lock: lock })
+            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), _lock: lock })
     }
     // Return the configured root of this worker's runtime storage.
     pub fn root(&self) -> &Path { Path::new(&self.config.root) }
@@ -241,7 +272,7 @@ impl Native {
     }
     // Cheap check before each create or capture: load the manifest (digest sidecar, strict fields, host
     // compatibility) and require operator-approved networking and the configured process limit. Return
-    // the manifest and its digest. Artifact contents are not hashed here; see mount_lower and
+    // the manifest and its digest. Artifact contents are not hashed here; see verify_layers and
     // checkpoint_images for the once-per-node checks.
     pub fn template_manifest(&self, id: &str) -> Result<(Manifest, String)> {
         let (m, digest) = storage::load_manifest(self.root(), id, &self.compatibility)?;
@@ -265,25 +296,69 @@ impl Native {
     fn lower(&self, digest: &str) -> PathBuf { self.root().join("lowers").join(digest) }
     // Return the content-addressed image file of one EROFS layer.
     pub fn layer_image(&self, digest: &str) -> PathBuf { self.root().join("layers").join(format!("{digest}.erofs")) }
-    // Remember that a layer image was fully hashed (at first use or when this worker published it), so
-    // later creates skip rehashing it. A known digest with a different size is rejected.
-    pub fn mark_verified(&self, layer: &Artifact) -> Result<()> {
-        let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
-        if verified.get(&layer.sha256).is_some_and(|bytes| *bytes != layer.bytes) { return Err("artifact_digest_mismatch"); }
-        verified.insert(layer.sha256.clone(), layer.bytes);
+    // Decide whether a layer can be used without hashing: this worker hashed that digest before and its
+    // image file still has the identity it had then (and is administrator-owned and not writable by
+    // group or others). A known digest with a different size is rejected.
+    fn layer_trusted(&self, layer: &Artifact) -> Result<bool> {
+        let known = self.verified.lock().unwrap_or_else(PoisonError::into_inner).get(&layer.sha256).cloned();
+        let Some(known) = known else { return Ok(false) };
+        if known.bytes != layer.bytes { return Err("artifact_digest_mismatch"); }
+        Ok(storage::artifact_identity(&self.layer_image(&layer.sha256), self.config.max_artifact_bytes).is_ok_and(|file| file == known.file))
+    }
+    // Fully hash every layer image of a create that is not already trusted, on the calling create job,
+    // so creates run their hashes in parallel and never wait behind another create's hash. Creates of
+    // the same new digest hash it once: the others wait for that turn and then trust the result. New
+    // results, and a failed digest's removal, are saved to the state file.
+    pub fn verify_layers(&self, layers: &[Artifact]) -> Result<()> {
+        let mut changed = false;
+        for layer in layers {
+            if self.layer_trusted(layer)? { continue; }
+            let _turn = KeyTurn::take(&self.layer_turns, &self.layer_turn_done, &layer.sha256);
+            if self.layer_trusted(layer)? { continue; }
+            let hashed = storage::verify_identified(&self.layer_image(&layer.sha256), layer, self.config.max_artifact_bytes);
+            let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
+            match hashed {
+                Ok(file) => { verified.insert(layer.sha256.clone(), VerifiedLayer { sha256: layer.sha256.clone(), bytes: layer.bytes, file }); }
+                Err(e) => {
+                    verified.remove(&layer.sha256);
+                    drop(verified);
+                    let _ = self.save_verified();
+                    return Err(e);
+                }
+            }
+            changed = true;
+        }
+        // A failed write only costs a rehash after the next restart.
+        if changed { let _ = self.save_verified(); }
         Ok(())
     }
-    // Mount one immutable EROFS layer (a template base or a sealed capture layer) if needed. Fully hash
-    // its image the first time this worker uses that digest, then check the mount flags and backing
-    // image on every use, including reuse of an existing mount.
-    pub fn mount_lower(&self, layer: &Artifact) -> Result<()> {
-        let known = self.verified.lock().unwrap_or_else(PoisonError::into_inner).get(&layer.sha256).copied();
-        let image = self.layer_image(&layer.sha256);
-        match known {
-            Some(bytes) if bytes != layer.bytes => return Err("artifact_digest_mismatch"),
-            Some(_) => {}
-            None => { storage::verify(&image, layer, self.config.max_artifact_bytes)?; self.mark_verified(layer)?; }
+    // Remember a layer this worker just hashed and published, with the identity of its published image,
+    // so restores never rehash it; save the state file. A known digest with a different size is
+    // rejected.
+    pub fn mark_verified(&self, layer: &Artifact) -> Result<()> {
+        let file = storage::artifact_identity(&self.layer_image(&layer.sha256), self.config.max_artifact_bytes)?;
+        if file.size != layer.bytes { return Err("artifact_digest_mismatch"); }
+        {
+            let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
+            if verified.get(&layer.sha256).is_some_and(|known| known.bytes != layer.bytes) { return Err("artifact_digest_mismatch"); }
+            verified.insert(layer.sha256.clone(), VerifiedLayer { sha256: layer.sha256.clone(), bytes: layer.bytes, file });
         }
+        let _ = self.save_verified();
+        Ok(())
+    }
+    // Atomically replace the state file with the current verified-layer set (root-owned, 0600). Writers
+    // take turns; each writes the newest set, and the set's lock is not held during the write.
+    fn save_verified(&self) -> Result<()> {
+        let _turn = KeyTurn::take(&self.layer_turns, &self.layer_turn_done, VERIFIED_STATE_TURN);
+        let layers = self.verified.lock().unwrap_or_else(PoisonError::into_inner).values().cloned().collect();
+        process::atomic_json(&self.root().join(VERIFIED_STATE), &VerifiedState { schema_version: VERIFIED_STATE_SCHEMA, layers })
+    }
+    // Mount one immutable EROFS layer (a template base or a sealed capture layer) if needed. The create
+    // job verified it first (see verify_layers); an untrusted layer is refused, never hashed here. Check
+    // the mount flags and backing image on every use, including reuse of an existing mount.
+    pub fn mount_lower(&self, layer: &Artifact) -> Result<()> {
+        if !self.layer_trusted(layer)? { return Err("layer_not_verified"); }
+        let image = self.layer_image(&layer.sha256);
         let lower = self.lower(&layer.sha256);
         if !lower.exists() { storage::private_dir(&lower)?; }
         storage::trusted_directory(&lower)?;
@@ -293,9 +368,11 @@ impl Native {
         storage::verify_lower(&lower, &image)
     }
     // Return the node's shared CRIU image directory for a warm template, keyed by its manifest digest.
-    // The first restore of a key hashes checkpoint.tar fully and unpacks it once (staged, then renamed);
-    // concurrent restores of that key wait for it, and later ones reuse the directory without reading
-    // the archive. CRIU only reads these images, so restores share them.
+    // The first restore of a key hashes checkpoint.tar fully and unpacks it once: into a staging
+    // directory whose files are all made durable before it is renamed into place, so a crash never
+    // leaves a truncated directory under the final name. A failed unpack removes its staging
+    // directory. Concurrent restores of that key wait for it, and later ones reuse the directory
+    // without reading the archive. CRIU only reads these images, so restores share them.
     pub fn checkpoint_images(&self, manifest: &Manifest, key: &str) -> Result<PathBuf> {
         let archive = manifest.checkpoint.as_ref().ok_or("checkpoint_missing")?;
         if !storage::hex_digest(key) { return Err("invalid_checkpoint_cache_key"); }
@@ -307,9 +384,20 @@ impl Native {
         storage::remove_private(&staging)?;
         storage::exclusive_private_dir(&staging)?;
         let template = self.root().join("templates").join(&manifest.template_id);
-        storage::verify(&template.join("checkpoint.tar"), archive, self.config.max_artifact_bytes)?;
-        storage::extract(self.tool("tar")?, &template.join("checkpoint.tar"), &staging, self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
-        File::open(&staging).and_then(|f| f.sync_all()).map_err(|_| "checkpoint_cache_sync_failed")?;
+        let unpacked = (|| {
+            storage::verify(&template.join("checkpoint.tar"), archive, self.config.max_artifact_bytes)?;
+            storage::extract(self.tool("tar")?, &template.join("checkpoint.tar"), &staging, self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
+            // tar does not sync what it writes. syncfs flushes every extracted file and directory
+            // (one filesystem) before the rename makes the cache entry trusted.
+            let dir = File::open(&staging).map_err(|_| "checkpoint_cache_sync_failed")?;
+            if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 { return Err("checkpoint_cache_sync_failed"); }
+            dir.sync_all().map_err(|_| "checkpoint_cache_sync_failed")
+        })();
+        if let Err(e) = unpacked {
+            // Only after every helper drained (tar may have been killed at its deadline).
+            let _ = self.helpers.ensure_healthy().and_then(|_| storage::remove_private(&staging));
+            return Err(e);
+        }
         fs::rename(&staging, &ready).map_err(|_| "checkpoint_cache_publish_failed")?;
         File::open(&cache).and_then(|f| f.sync_all()).map_err(|_| "checkpoint_cache_sync_failed")?;
         Ok(ready)
@@ -458,7 +546,8 @@ impl Native {
     // Checkpoint the paused source through runc and leave it running afterwards. Save process images,
     // established TCP connections, external Unix sockets and file locks, with the network locked during
     // the dump; skip connections not yet accepted, and allow uprobes mappings only when the caller found
-    // some.
+    // some. A dump stopped at its deadline or output limit is `checkpoint_interrupted` (the source's
+    // state is then uncertain); any other failure is `checkpoint_failed`.
     pub fn checkpoint(&self, id: &str, images: &Path, allow_uprobes: bool) -> Result<()> {
         // Clients that connect while the source is frozen sit unaccepted in a listen
         // backlog, which CRIU otherwise refuses to dump. The running source still
@@ -469,7 +558,8 @@ impl Native {
         fs::write(self.private(id).join("criu.conf"), config).map_err(|_| "criu_config_failed")?;
         self.runc_checked(vec!["checkpoint".into(), "--leave-running".into(), "--image-path".into(), images.display().to_string(),
             "--work-path".into(), self.private(id).join("criu-work").display().to_string(),
-            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), id.into()]).map_err(|_| "checkpoint_failed")
+            "--tcp-established".into(), "--ext-unix-sk".into(), "--file-locks".into(), id.into()])
+            .map_err(|e| if e == "runc_deadline_or_output_limit" { "checkpoint_interrupted" } else { "checkpoint_failed" })
     }
     // Restore captured processes, including established TCP connections, external Unix sockets and
     // file locks, into the prepared sandbox without replacing its resource groups, then confirm it is

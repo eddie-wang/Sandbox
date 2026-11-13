@@ -15,6 +15,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -70,8 +72,9 @@ def checkpoint_cache(root, template_id):
 
 
 # Polls a sandbox cgroup's cgroup.events every 5 ms until stop is set. Returns the
-# number of freezer periods ("frozen 1") seen and their total and longest length:
-# the capture's frozen window (CRIU may briefly thaw and refreeze inside it).
+# number of freezer periods ("frozen 1") seen and their total and longest length.
+# This is cgroup-freezer time only: CRIU thaws the cgroup while its tasks stay
+# ptrace-stopped and refreezes it, so the source is stopped somewhat longer.
 def watch_frozen(events, stop):
     periods, since, frozen = [], None, False
     while not stop.is_set():
@@ -93,7 +96,7 @@ def watch_frozen(events, stop):
 
 # Polls a source's counter file (as the host sees it in the upper directory)
 # until stop is set. Returns the samples, the longest interval without a change
-# (the frozen window plus one 100 ms tick at most) and whether it advanced.
+# (the time the source was stopped plus one 100 ms tick at most) and whether it advanced.
 def watch_counter(path, stop):
     samples = []
     while not stop.is_set():
@@ -117,12 +120,10 @@ def write_template(root, manifest):
     return template
 
 
-# Run the privileged lifecycle gate: build the fixture template, start a real worker and controller,
-# and drive cold create, reaping PID 1, concurrent, streamed and killed execs, per-command bounds,
-# rejections, disconnects, waiting DELETEs, non-stopping capture with sealed layers and established
-# loopback TCP, cached warm restore, TTL and restart cleanup through the blocking API. --network adds
-# policy networking and the app proxy. Retain the root and observations, then require no owned state
-# to remain.
+# Run the privileged gate on fixture templates through a real worker and controller: creates, execs
+# and bounds, rejections, disconnects, DELETE waits, captures (failed, interrupted, chained), warm
+# restores, layer verification across restarts, TTL and crash cleanup; --network adds policy
+# networking and the app proxy. Retain the root and observations; require no owned state to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -238,6 +239,17 @@ url = "http://127.0.0.1:{worker_port}"
                              ({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}),
                              memory_mib=64, vcpus=1, pids_max=64)
     write_template(root, manifest)
+    # Two more cold bases for the layer-verification checks: "probe" adds 16 MiB of ballast (so
+    # hashing it shows in the worker's read counter) and "probe-small" only a marker file.
+    probe_bases = {}
+    for name, ballast in (("probe", os.urandom(16 << 20)), ("probe-small", b"marker\n")):
+        probe_rootfs = root / f"{name}-rootfs"
+        shutil.copytree(rootfs, probe_rootfs, symlinks=True)
+        (probe_rootfs / "ballast").write_bytes(ballast)
+        probe_image = root / f"{name}.erofs"
+        subprocess.run(["mkfs.erofs", str(probe_image), str(probe_rootfs)], check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        probe_bases[name] = publish_layer(root, probe_image)
+        write_template(root, dict(manifest, template_id=name, base=probe_bases[name]))
     for name in ("incompatible", "tampered", "symlinked", "unknown-metadata", "no-defaults", "old-schema") + (("policy-not-authorized", "unsupported-policy") if args.network else ()):
         directory = root / "templates" / name
         directory.mkdir(mode=0o700)
@@ -432,6 +444,18 @@ url = "http://127.0.0.1:{worker_port}"
         table = json.loads(subprocess.check_output(["ip", "netns", "exec", name, "nft", "-j", "list", "table", "inet", "sandbox"], timeout=5))
         assert not any("rule" in entry for entry in table["nftables"]), (name, table)
         assert tracked_connections(name) == 0, name
+
+    # Return how many bytes the worker process has read so far (rchar in /proc/<pid>/io). Hashing a
+    # layer reads its whole image; reads through a loop-mounted layer are not counted.
+    def worker_read_bytes():
+        return int(next(line for line in Path(f"/proc/{worker.pid}/io").read_text().splitlines() if line.startswith("rchar:")).split()[1])
+
+    # Return the identity the worker records for a layer image: device, inode, size, and modification
+    # and change times in seconds and nanoseconds.
+    def file_identity(path):
+        info = path.stat()
+        return dict(dev=info.st_dev, ino=info.st_ino, size=info.st_size, mtime=info.st_mtime_ns // 10**9, mtime_nsec=info.st_mtime_ns % 10**9,
+                    ctime=info.st_ctime_ns // 10**9, ctime_nsec=info.st_ctime_ns % 10**9)
 
     # Kill the worker abruptly, start a new one on the same root and wait for a fresh observation.
     def kill_and_restart_worker():
@@ -836,6 +860,43 @@ url = "http://127.0.0.1:{worker_port}"
         execute(source, "unlink", "hold-uffd")
         eventually(lambda: uffd_status().startswith("released"), timeout=10)
         observations["failed_checkpoint_keeps_source_running"] = True
+        # A dump stopped at its deadline leaves the source in an uncertain state, so it is deleted rather
+        # than kept. The test stops the `runc checkpoint` helper (SIGSTOP) as soon as it appears; the
+        # worker kills it at the 30 s command deadline.
+        doomed = create()
+        stopped = {}
+        # Find this sandbox's runc checkpoint process among the worker's helpers and stop it.
+        def stop_checkpoint():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                for procs in helpers.glob("command-*/cgroup.procs"):
+                    try:
+                        pids = procs.read_text().split()
+                    except OSError:
+                        continue
+                    for pid in pids:
+                        try:
+                            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                        except OSError:
+                            continue
+                        if b"checkpoint" in argv and doomed.encode() in argv:
+                            os.kill(int(pid), signal.SIGSTOP)
+                            stopped["pid"] = int(pid)
+                            return
+                time.sleep(0.001)
+        stopper = threading.Thread(target=stop_checkpoint, daemon=True)
+        stopper.start()
+        started = time.monotonic()
+        code, interrupted = capture(doomed, "interrupted-dump")
+        interrupted_seconds = time.monotonic() - started
+        stopper.join(timeout=5)
+        assert stopped and code == 500 and interrupted["error"]["code"] == "checkpoint_interrupted", (stopped, code, interrupted)
+        assert interrupted_seconds >= 29, interrupted_seconds
+        assert get(doomed)["state"] == "deleted" and get(doomed)["error"] == "checkpoint_interrupted", get(doomed)
+        gone(doomed)
+        assert not (root / "templates" / "interrupted-dump").exists() and not (root / "staging" / "interrupted-dump").exists()
+        assert get(source)["state"] == "running" and get(isolated)["state"] == "running"
+        observations["interrupted_checkpoint_deletes_source"] = dict(stopped_pid=stopped["pid"], capture_s=round(interrupted_seconds, 3))
         isolated_nonce = int(execute(isolated, "counter").split()[1])
         # The source keeps running during capture except while frozen (pause to resume).
         stop_watch = threading.Event()
@@ -914,8 +975,29 @@ url = "http://127.0.0.1:{worker_port}"
             observations["source_listening_socket_and_fresh_egress"] = network_gate(source)
         # CRIU only read the shared images while restoring the child.
         assert checkpoint_cache(root, "warm")[1] == warm_cache_state
-        print("PASS capture without stopping the source (frozen window only), sealed EROFS layer with whiteout/xattr, "
+        print("PASS capture without stopping the source (stopped only while frozen and dumped), sealed EROFS layer with whiteout/xattr, "
               "warm restore with established loopback TCP, independent child")
+        # Chained capture: capturing the warm child seals its own changes as a second layer above the
+        # source's; a grandchild restores from that two-layer template.
+        captured(child, "chained")
+        chained_manifest = json.loads((root / "templates" / "chained" / "manifest.json").read_text())
+        assert len(chained_manifest["layers"]) == 2 and chained_manifest["layers"][1]["sha256"] == layer, chained_manifest["layers"]
+        assert chained_manifest["base"] == warm_manifest["base"]
+        assert get(child)["state"] == "running" and execute(child, "read", "copied") == "child-private"
+        grandchild = create("chained")
+        time.sleep(0.3)
+        assert int(execute(grandchild, "counter").split()[1]) == nonce
+        assert execute(grandchild, "read", "copied") == "child-private"
+        missing = expect(exec_call(grandchild, ["/fixture", "read", "removed"], timeout_ms=2000, max_output_bytes=1024), 200)
+        assert missing["exit_code"] != 0 and not missing["interrupted"]
+        grandchild_trips = loopback(grandchild)
+        time.sleep(0.5)
+        assert loopback(grandchild) > grandchild_trips
+        execute(grandchild, "write", "copied", "grandchild-private")
+        assert execute(child, "read", "copied") == "child-private"
+        remove(grandchild)
+        observations["chained_capture"] = dict(layers=[l["sha256"] for l in chained_manifest["layers"]], grandchild_roundtrips=grandchild_trips)
+        print("PASS chained capture of a warm child and restore from the two-layer template (counter, files, whiteout, loopback TCP)")
         if args.network:
             child_slot = slot_of(child)
             assert tracked_connections(child_slot) > 0
@@ -948,6 +1030,26 @@ url = "http://127.0.0.1:{worker_port}"
         observations["exec_bound_violation_keeps_sandbox"] = True
         print("PASS configured cgroup limits, namespace separation, seccomp checkpoint guards, TTL and per-command bounds that keep the sandbox")
 
+        # Layer verification runs in the create job: two simultaneous first creates of a new base hash it
+        # once. The result is saved with the image's identity in a root-owned 0600 state file.
+        probe_bytes = probe_bases["probe"]["bytes"]
+        read_before = worker_read_bytes()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            pair = [f.result(timeout=200) for f in [pool.submit(create, "probe"), pool.submit(create, "probe")]]
+        first_use_read = worker_read_bytes() - read_before
+        assert probe_bytes <= first_use_read < probe_bytes * 3 // 2, (first_use_read, probe_bytes)
+        for sandbox in pair:
+            remove(sandbox)
+        small = create("probe-small")
+        remove(small)
+        state_file = root / "verified-layers.json"
+        state_info = state_file.lstat()
+        assert stat.S_ISREG(state_info.st_mode) and state_info.st_uid == 0 and stat.S_IMODE(state_info.st_mode) == 0o600
+        saved = {entry["sha256"]: entry for entry in json.loads(state_file.read_text())["layers"]}
+        for descriptor in (probe_bases["probe"], probe_bases["probe-small"], manifest["base"], warm_manifest["layers"][0]):
+            image = root / "layers" / f"{descriptor['sha256']}.erofs"
+            assert saved[descriptor["sha256"]]["bytes"] == descriptor["bytes"] and saved[descriptor["sha256"]]["file"] == file_identity(image), descriptor
+        observations["layer_verification"] = dict(first_use_two_creates_read_bytes=first_use_read, probe_bytes=probe_bytes, saved_layers=len(saved))
         pending_thread, _ = in_background(lambda: exec_call(source, ["/fixture", "hang"], timeout_ms=60000, max_output_bytes=1024))
         eventually(lambda: exec_cgroup_populated(source), timeout=10)
         kill_and_restart_worker()
@@ -962,6 +1064,38 @@ url = "http://127.0.0.1:{worker_port}"
             for i in range(3):
                 slot_reset(f"{owned_prefix}s-{i}")
             observations["restart_rebuilt_slot_pool"] = True
+        # After the restart the saved state is trusted while the image keeps its identity (no rehash);
+        # a changed identity (here only the change time) means hashing again, and same-size corrupted
+        # content is then rejected.
+        probe_image = root / "layers" / f"{probe_bases['probe']['sha256']}.erofs"
+        read_before = worker_read_bytes()
+        trusted = create("probe")
+        trusted_read = worker_read_bytes() - read_before
+        assert trusted_read < probe_bytes // 2, (trusted_read, probe_bytes)
+        remove(trusted)
+        probe_image.chmod(0o600)
+        read_before = worker_read_bytes()
+        rehashed = create("probe")
+        rehash_read = worker_read_bytes() - read_before
+        assert rehash_read >= probe_bytes, (rehash_read, probe_bytes)
+        remove(rehashed)
+        # probe-small is not mounted since the restart, so its image can be changed in place safely.
+        small_image = root / "layers" / f"{probe_bases['probe-small']['sha256']}.erofs"
+        assert not any(line.split()[4] == str(root / "lowers" / probe_bases["probe-small"]["sha256"]) for line in Path("/proc/self/mountinfo").read_text().splitlines())
+        with small_image.open("r+b") as image_file:
+            image_file.seek(small_image.stat().st_size // 2)
+            original = image_file.read(1)
+            image_file.seek(-1, os.SEEK_CUR)
+            image_file.write(bytes([original[0] ^ 0xFF]))
+        code, corrupted = create_call(dict(template_id="probe-small", ttl_seconds=60))
+        assert code == 500 and corrupted["error"]["code"] == "artifact_digest_mismatch", (code, corrupted)
+        assert get(corrupted["sandbox_id"])["state"] == "failed"
+        gone(corrupted["sandbox_id"])
+        assert probe_bases["probe-small"]["sha256"] not in {entry["sha256"] for entry in json.loads(state_file.read_text())["layers"]}
+        observations["layer_verification"].update(trusted_after_restart_read_bytes=trusted_read, rehash_after_identity_change_read_bytes=rehash_read,
+                                                  corrupted_same_size_rejected=True)
+        print("PASS layer hashing in the create job (once for two simultaneous creates), saved verified state trusted after restart, "
+              "rehash on identity change, corrupted image rejected")
         # Publication survives source/restart cleanup and is still independently restorable.
         retained = create("warm")
         time.sleep(0.3)

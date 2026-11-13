@@ -42,6 +42,8 @@ pub struct Manifest {
     pub gid: u32,
 }
 
+// Manifest format this worker reads and writes: sealed EROFS capture layers listed in `layers`.
+// Other versions (such as schema 2 with a per-create upper archive) are rejected, not migrated.
 pub const MANIFEST_SCHEMA: u32 = 3;
 // Sealed capture layers a template may stack above its base (chained captures add one each).
 pub const MAX_LAYERS: usize = 16;
@@ -94,12 +96,42 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Res
     serde_json::from_slice(&bytes).map_err(|_| "invalid_record")
 }
 
+// Where a file is and when it last changed: device, inode, size, and modification and change times.
+// Writing, truncating, replacing or re-permissioning the file changes at least one of them.
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileIdentity { pub dev: u64, pub ino: u64, pub size: u64, pub mtime: i64, pub mtime_nsec: i64, pub ctime: i64, pub ctime_nsec: i64 }
+impl FileIdentity {
+    // Read the identity fields from file metadata.
+    fn of(meta: &fs::Metadata) -> Self {
+        Self { dev: meta.dev(), ino: meta.ino(), size: meta.size(), mtime: meta.mtime(), mtime_nsec: meta.mtime_nsec(), ctime: meta.ctime(), ctime_nsec: meta.ctime_nsec() }
+    }
+}
+
+// Open a trusted artifact without following a final symlink. Reject anything but a nonempty regular
+// file within `max` bytes that is administrator-owned and not writable by group or others.
+fn open_artifact(path: &Path, max: u64) -> Result<(File, fs::Metadata)> {
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).map_err(|_| "artifact_unavailable")?;
+    let meta = file.metadata().map_err(|_| "artifact_unavailable")?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > max || meta.uid() != 0 || meta.mode() & 0o022 != 0 { return Err("invalid_artifact"); }
+    Ok((file, meta))
+}
+
+// Return the identity of a trusted artifact file without reading its contents (same checks as
+// `artifact`).
+pub fn artifact_identity(path: &Path, max: u64) -> Result<FileIdentity> {
+    open_artifact(path, max).map(|(_, meta)| FileIdentity::of(&meta))
+}
+
 // Read the entire trusted artifact to compute its SHA-256 and byte count. Reject symlinks, empty or
 // oversized files, untrusted ownership and reads exceeding the deadline.
 pub fn artifact(path: &Path, max: u64) -> Result<Artifact> {
-    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).map_err(|_| "artifact_unavailable")?;
-    let meta = file.metadata().map_err(|_| "artifact_unavailable")?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > max || meta.uid() != 0 || meta.mode() & 0o022 != 0 { return Err("invalid_artifact"); }
+    let (file, _) = open_artifact(path, max)?;
+    hash_file(file, max)
+}
+
+// Hash an open artifact from its start within the five-minute deadline and return its digest and size.
+fn hash_file(mut file: File, max: u64) -> Result<Artifact> {
     let mut hash = Sha256::new();
     let mut buf = [0u8; 65536];
     let mut bytes = 0u64;
@@ -117,9 +149,20 @@ pub fn artifact(path: &Path, max: u64) -> Result<Artifact> {
 
 // Validate the expected descriptor, then fully hash the artifact and compare both digest and size.
 pub fn verify(path: &Path, expected: &Artifact, max: u64) -> Result<()> {
+    verify_identified(path, expected, max).map(|_| ())
+}
+
+// Verify an artifact like `verify` and return the identity its file had while it was hashed. Fail if
+// the identity of the open file changed during hashing.
+pub fn verify_identified(path: &Path, expected: &Artifact, max: u64) -> Result<FileIdentity> {
     if !hex_digest(&expected.sha256) || expected.bytes > max { return Err("invalid_artifact_descriptor"); }
-    let actual = artifact(path, max)?;
-    if actual.sha256 != expected.sha256 || actual.bytes != expected.bytes { Err("artifact_digest_mismatch") } else { Ok(()) }
+    let (file, meta) = open_artifact(path, max)?;
+    let before = FileIdentity::of(&meta);
+    let probe = file.try_clone().map_err(|_| "artifact_unavailable")?;
+    let actual = hash_file(file, max)?;
+    let after = probe.metadata().map_err(|_| "artifact_unavailable")?;
+    if FileIdentity::of(&after) != before { return Err("artifact_changed_while_hashed"); }
+    if actual.sha256 != expected.sha256 || actual.bytes != expected.bytes { Err("artifact_digest_mismatch") } else { Ok(before) }
 }
 
 // Load a template manifest with bounded manifest-only checks (digest sidecar, strict fields, exact

@@ -15,8 +15,12 @@ fn id(handle: &Handle, input: Result<Path<String>, PathRejection>) -> Result<Str
     Ok(id)
 }
 // Map an engine/runtime error code to its HTTP status and fixed message. Unlisted runtime failures
-// are 500 with their static code.
+// are 500 with their static code. Too many waiting DELETE or kill requests answer with the public
+// `busy` code.
 fn failure(code: &'static str) -> ApiError {
+    if code == "waiter_limit" {
+        return ApiError(StatusCode::SERVICE_UNAVAILABLE, "busy", "Too many requests already wait for this delete or kill; nothing was started");
+    }
     let (status, message) = match code {
         "sandbox_not_found" => (StatusCode::NOT_FOUND, "Sandbox does not exist"),
         "idempotency_conflict" => (StatusCode::CONFLICT, "Sandbox ID was already used for a different create request"),
@@ -29,6 +33,8 @@ fn failure(code: &'static str) -> ApiError {
         "template_resource_mismatch" => (StatusCode::UNPROCESSABLE_ENTITY, "Warm template requires its captured memory_mib/vcpus; nothing was started"),
         "resources_required" => (StatusCode::UNPROCESSABLE_ENTITY, "Template declares no default memory_mib/vcpus; supply them"),
         "template_already_exists" => (StatusCode::CONFLICT, "Capture rejected before checkpoint; the source keeps running"),
+        "template_layer_limit" => (StatusCode::CONFLICT, "Source template already has the maximum sealed layers; capture rejected before checkpoint, the source keeps running"),
+        "checkpoint_interrupted" => (StatusCode::INTERNAL_SERVER_ERROR, "Checkpoint was stopped at its deadline; the source state was uncertain, so it was deleted"),
         "service_port_not_authorized" => (StatusCode::FORBIDDEN, "Port is not an approved service port of this sandbox"),
         "busy" => (StatusCode::SERVICE_UNAVAILABLE, "Operation pool, restore slots or command limit are busy; nothing was started"),
         "admission_exhausted" => (StatusCode::SERVICE_UNAVAILABLE, "Worker capacity is exhausted; nothing was started or recorded"),

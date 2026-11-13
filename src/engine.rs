@@ -70,8 +70,12 @@ enum Action { Create, Capture(CaptureRequest, String), Delete }
 // the kill requests waiting for it to end.
 struct RunningExec { stop: Arc<AtomicU8>, kill_waiters: Vec<Reply> }
 struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool> }
+// One in-flight job of a sandbox: its operation worker slot, whether it holds a restore slot (create
+// or capture), whether it is the delete cleanup (which has no reply of its own; waiting DELETEs are
+// answered when it completes), the template name a capture reserves, its cancel flag and its reply.
 struct Flight { slot: usize, restore: bool, delete: bool, template: Option<String>, cancelled: Arc<AtomicBool>, reply: Option<Reply> }
-// Mount (and, at first use, verify) these shared layers: a template's sealed layers and its base.
+// Mount these shared layers, already verified by the create job: a template's sealed layers and its
+// base.
 struct Lower { layers: Vec<storage::Artifact>, done: mpsc::Sender<Result<()>> }
 // Concurrent DELETE requests waiting for one sandbox's cleanup (and kill requests waiting for one
 // command's end); more are refused as busy.
@@ -113,6 +117,7 @@ impl Handle {
         snapshot.write().expect("snapshot poisoned").records = restored;
         // Shared lower creation is serialized by its own bounded mailbox, never
         // by holding a lock over mount I/O or blocking the admission authority.
+        // Hashing never happens here: create jobs verify layers before sending.
         let (lower_tx, lower_rx) = mpsc::sync_channel::<Lower>(native.config.max_concurrent_operations);
         let lower_native = native.clone();
         std::thread::Builder::new().name("sandbox-lowers".into()).spawn(move || {
@@ -334,7 +339,8 @@ impl Engine {
         // Bounded manifest read on this dedicated thread (never Tokio). A template this
         // worker cannot launch is rejected before any record, so the controller may
         // place the create elsewhere. The job hashes each layer image once per node
-        // (first mount) and each checkpoint archive once (first unpack).
+        // (first use, kept across restarts while the file is unchanged) and each
+        // checkpoint archive once (first unpack).
         let Ok((manifest, _)) = self.native.template_manifest(&request.template_id) else { let _ = reply.send(Err("template_unavailable")); return; };
         let warm = manifest.checkpoint.is_some();
         let resolve = |explicit: Option<u64>, template: Option<u64>| match (explicit, template) {
@@ -427,7 +433,7 @@ impl Engine {
         };
         let _ = running.stop.compare_exchange(0, STOP_KILLED, Ordering::Relaxed, Ordering::Relaxed);
         running.kill_waiters.retain(|waiter| !waiter.is_closed());
-        if running.kill_waiters.len() >= MAX_DELETE_WAITERS { let _ = reply.send(Err("busy")); return; }
+        if running.kill_waiters.len() >= MAX_DELETE_WAITERS { let _ = reply.send(Err("waiter_limit")); return; }
         running.kill_waiters.push(reply);
     }
     // Forget a finished command and answer the kill requests waiting for it. A command whose resource
@@ -456,7 +462,7 @@ impl Engine {
         if let Some(reply) = reply {
             let waiters = self.delete_waiters.entry(id.into()).or_default();
             waiters.retain(|waiter| !waiter.is_closed());
-            if waiters.len() >= MAX_DELETE_WAITERS { let _ = reply.send(Err("busy")); return; }
+            if waiters.len() >= MAX_DELETE_WAITERS { let _ = reply.send(Err("waiter_limit")); return; }
             waiters.push(reply);
             self.retry_after.remove(id);
         }
@@ -558,16 +564,19 @@ impl Runner<'_> {
         self.record.state = if result.is_ok() { "deleted" } else { "cleanup_failed" }.into();
         if let Err(e) = result { self.record.error = Some(e.into()); }
     }
-    // Check the template manifest, wait for its shared layer mounts, take the node's cached checkpoint
-    // images of a warm template (unpacked once per manifest digest), then prepare and start or restore
-    // the sandbox. On failure, clean up and record it as failed (or cleanup_failed).
+    // Check the template manifest, verify its layer images here (hashing only those not yet trusted on
+    // this node), wait for their shared mounts, take the node's cached checkpoint images of a warm
+    // template (unpacked once per manifest digest), then prepare and start or restore the sandbox. On
+    // failure, clean up and record it as failed (or cleanup_failed).
     fn create(&mut self) -> Result<Outcome> {
         let result = (|| -> Result<()> {
             self.active()?;
             let (manifest, digest) = self.native.template_manifest(&self.record.request.template_id)?;
             self.record.network_policy = Some(manifest.network.clone());
             let (tx, rx) = mpsc::channel();
-            let layers = manifest.layers.iter().chain(std::iter::once(&manifest.base)).cloned().collect();
+            let layers: Vec<_> = manifest.layers.iter().chain(std::iter::once(&manifest.base)).cloned().collect();
+            self.native.verify_layers(&layers)?;
+            self.active()?;
             self.lowers.send(Lower { layers, done: tx }).map_err(|_| "lower_worker_unavailable")?;
             rx.recv().map_err(|_| "lower_worker_unavailable")??;
             self.active()?;
@@ -587,8 +596,9 @@ impl Runner<'_> {
     // Capture a running sandbox as a new warm template without stopping it (AgentENV order): freeze it,
     // flush and seal its upper directory into an EROFS layer, checkpoint it with CRIU leaving it running,
     // then thaw it. Afterwards archive the images, write the manifest and publish the layer and template.
-    // On any failure thaw the source and keep it if it runs; only a source that stays frozen or was
-    // cancelled is deleted. Success means publication and a running source.
+    // On an ordinary failure thaw the source and keep it if it runs; a source that stays frozen or was
+    // cancelled is deleted, and so is one whose dump was interrupted at its deadline (its state is
+    // uncertain). Success means publication and a running source.
     fn capture(&mut self, request: CaptureRequest, generation: String) -> Result<Outcome> {
         let id = self.record.request.sandbox_id.clone();
         let max = self.native.config.max_artifact_bytes;
@@ -636,9 +646,15 @@ impl Runner<'_> {
         })();
         // CRIU leaves the dumped tasks alive, so a failed step needs only a thaw. A
         // resume error is not final: runc state decides (a paused source is not running).
+        // A dump killed midway may leave CRIU's network lock, repaired sockets or
+        // parasite code behind, so that source is deleted even if it runs.
         if paused { let _ = self.native.resume(&id); }
-        let recovery = self.active().and_then(|_| self.native.ensure_running(&id));
-        if recovery.is_ok() { self.record.state = "running".into(); } else { self.delete(); }
+        let recovery = if matches!(result, Err("checkpoint_interrupted")) { Err("checkpoint_interrupted") }
+            else { self.active().and_then(|_| self.native.ensure_running(&id)) };
+        if recovery.is_ok() { self.record.state = "running".into(); } else {
+            if recovery == Err("checkpoint_interrupted") { self.record.error = Some("checkpoint_interrupted".into()); }
+            self.delete();
+        }
         let cleanup = if stage_owned { self.native.helpers.ensure_healthy().and_then(|_| storage::remove_private(&stage)) } else { Ok(()) };
         // Success means both publication and a running source.
         result.and(recovery).and(cleanup).map(|_| Outcome::Captured(CaptureResult {

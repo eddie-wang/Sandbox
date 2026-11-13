@@ -31,8 +31,16 @@ infrastructure.
 
 Clients talk only to the controller and never choose or need to know nodes. For
 create, the controller ranks every fresh, ready worker by advisory reserved load
-(least projected memory/vCPU/slot load, then fewer active restores, then node ID),
-generates the sandbox ID and forwards the create. The controller does not read
+(least projected memory/vCPU/slot load, then fewer active restores, then round-robin
+between equal scores, as AgentENV's scheduler takes turns), generates the sandbox ID
+and forwards the create. The projected load adds the controller's own creates that
+are still in flight or were answered after the worker's last polled status (their
+requested memory, vCPUs and one slot each); an entry is dropped once a poll sent
+after the answer counts it, when the node refused before reserving anything, or
+after the freshness window. Creates sent at the same moment therefore spread over
+equal workers instead of all landing on the first one. This view is advisory (it can
+briefly count a create twice) and holds at most 4,096 entries; worker admission
+stays final. The controller does not read
 templates: a worker without a valid, compatible template answers before creating
 anything. IDs are currently `<node_id>.<32 hex>`; treat them as **opaque**. The owner
 prefix lets later calls and controller restarts route without an assignment table.
@@ -168,11 +176,15 @@ requires the captured memory/vCPU/pids/config and host compatibility.
 
 During admission the worker checks the template manifest (digest sidecar, strict
 fields, exact host compatibility including architecture, network policy and pids);
-failure is a pre-launch `422 template_unavailable`. The create job hashes each layer
-image the first time this worker mounts it and a warm template's checkpoint archive
-the first time it is unpacked into the node cache, so a damaged artifact is a failed
-create with a tombstone and static error, never a running ID; later creates reuse
-the verified mounts and cache. TTL starts at admission. A dedicated expiry watchdog kills the
+failure is a pre-launch `422 template_unavailable`. The create job itself hashes
+each layer image this worker does not yet trust (creates hash in parallel; two
+creates of the same new layer hash it once; creates whose layers are trusted never
+wait behind a hash) and a warm template's checkpoint archive the first time it is
+unpacked into the node cache, so a damaged artifact is a failed create with a
+tombstone and static error, never a running ID. A hashed layer stays trusted, also
+across worker restarts, while its image file keeps the same identity (device, inode,
+size, modification and change time); any change means hashing it again. Later
+creates reuse the verified mounts and cache. TTL starts at admission. A dedicated expiry watchdog kills the
 cgroup at expiration independently of long artifact work; private cleanup follows.
 Timer/scheduling granularity is not a hard real-time guarantee.
 
@@ -257,11 +269,18 @@ Capture **does not stop the source** (AgentENV pattern): the worker freezes it w
 `runc pause`, seals its upper directory into a content-addressed EROFS layer, takes a
 CRIU checkpoint with `--leave-running` (established TCP, external Unix sockets and
 file locks included) and thaws it, then archives the images and publishes the
-manifest. The source is unavailable only during that frozen window (the real-image
-gate measures it; it grows with the upper's size and the process memory); clients
-connecting meanwhile wait and are served after the thaw. On any failure the source
-is thawed and stays running if runc reports it running; only a source that stays
-frozen or was cancelled/expired is deleted. Failure publishes no template.
+manifest. The source is unavailable only from the pause to the resume (the real-image
+gate reports the cgroup-freezer time and the longest gap a client saw, which is
+somewhat longer because CRIU briefly thaws the cgroup while the tasks stay stopped;
+both grow with the upper's size and the process memory); clients connecting
+meanwhile wait and are served after the thaw. On an ordinary failure the source is
+thawed and stays running if runc reports it running (`500 checkpoint_failed`); a
+source that stays frozen or was cancelled/expired is deleted, and so is one whose
+CRIU dump was stopped at its command deadline (`500 checkpoint_interrupted`, record
+error `checkpoint_interrupted`), because a killed dump can leave CRIU's network lock,
+repaired sockets or parasite code behind. A source template that already has 16
+sealed layers is refused before the pause (`409 template_layer_limit`; the source
+keeps running). Failure publishes no template.
 Established connections, including outbound ones, do not block capture. Loopback
 connections continue in children; a child's copy of a connection to an external
 peer fails on first use because the peer and the source slot's conntrack/NAT state
@@ -336,13 +355,21 @@ application with `Accept: */*`, added by the controller's HTTP client.
 
 Bounds (`[server.proxy]` on each service): `max_connections` open exchanges
 (default 256; `503 busy` beyond it, held until the response or tunnel ends) and
-`idle_timeout_ms` (default 600,000): the response head, each body and a tunnel must
-move a byte within it. There is no total deadline: the client decides how long to
-wait. Errors are JSON envelopes: `502 upstream_unavailable` (the service refused,
+`idle_timeout_ms` (default 600,000): the proxy waits at most that long for the sending
+side to move a byte — the response head, the next frame of either body, and a
+tunnel's reads and blocked writes. A receiver that stops reading (its TCP window
+closes) is not timed out: that exchange and its permit stay held until the client
+reads again or disconnects. There is no total deadline: the client decides how long
+to wait. On shutdown the controller stops accepting and waits for open requests at
+most the longest management route wait plus two `request_timeout_ms`, then cuts any
+exchange still open. Errors are JSON envelopes: `502 upstream_unavailable` (the service refused,
 reset or answered nothing valid), `504 upstream_timeout` (worker idle timeout),
 `504 owner_response_timeout` and `503 owner_response_unavailable` (controller to
-worker). Deleting or expiring the sandbox ends its open exchanges at once. A retry
-sends the request again; there are no exactly-once application semantics.
+worker). Deleting or expiring the sandbox ends its open exchanges, including ones
+still connecting or waiting for the response head (`502 upstream_unavailable`), so a
+pooled routing slot never carries a pending exchange to its next sandbox; a body
+whose receiver has stopped reading sees the close at its next read. A retry sends
+the request again; there are no exactly-once application semantics.
 
 ## Status and bounds
 
@@ -386,8 +413,10 @@ limit, 422 template unavailable or resource rules, 500 failed operation or
 unavailability, busy or capacity, 504 outcome wait or proxy idle timeout expired.
 Proxied applications return their own statuses, which pass through unchanged.
 Failed operations name a static code; read the sandbox state afterward, because a
-capture that leaves the source frozen, or a command whose resource group cannot be
-emptied, terminates the sandbox.
+capture that leaves the source frozen or whose dump was interrupted, or a command
+whose resource group cannot be emptied, terminates the sandbox. A 65th concurrent
+DELETE of one sandbox (or kill of one command) gets `503 busy` with a message saying
+too many requests already wait for it.
 
 Server bounds: concurrency 1–1024, request timeout 100–30,000 ms, body 256–131,072 bytes,
 `[server.proxy]` `max_connections` 1–65,536 and `idle_timeout_ms` 1,000–3,600,000.

@@ -40,8 +40,9 @@ impl OperationDeadlines {
 }
 
 // Bounds for streamed traffic (the app proxy and streaming exec forwards): how many exchanges may be
-// open at once and how long one may go without moving a byte in either direction (including the wait
-// for the response head). There is no total deadline; the client decides when to give up.
+// open at once and how long the proxy waits for a sending side to move a byte (including the wait for
+// the response head and a blocked tunnel write). A receiver that stops reading is not timed out.
+// There is no total deadline; the client decides when to give up.
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyLimits {

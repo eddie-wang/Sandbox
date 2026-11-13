@@ -10,10 +10,11 @@ through the proxy, kill, bounded commands that stop without stopping the sandbox
 per-call overhead (proxy call, direct call inside the sandbox, exec round trip),
 warm capture (the worker freezes the source, seals its upper into an EROFS layer,
 checkpoints it leaving it running and thaws it; a probe shows the source answering
-except during the frozen window), two independent child restores (the second reuses
+except while it is stopped), two independent child restores (the second reuses
 the node's checkpoint cache), HTTP and marker checks in the children, source/child
-isolation, delete and cleanup checks. Printed timings are informational, not
-benchmarks.
+isolation, delete and cleanup checks, then a graceful worker restart and a cold
+create that trusts the saved verified-layer state instead of rehashing the base.
+Printed timings are informational, not benchmarks.
 
 Networking runs entirely inside a disposable outer network/mount namespace, as in
 network_smoke.py. The template allows only the service port and the next port (for
@@ -631,14 +632,19 @@ url = "http://127.0.0.1:{worker_port}"
     def request(*call, timeout=None, **named):
         return smoke_request(*call, timeout=timeout or 400, **named)
 
-    # Starts a service process with its log in the session root and waits for /healthz.
+    # Starts a service process with its own log in the session root and waits for /healthz.
     def start(role, config):
-        log = session / f"{role}.log"
+        log = session / f"{role}-{len(processes)}.log"
         with log.open("wb") as output:
             process = subprocess.Popen([binary, role, "--config", str(config)], env=env, stdout=output, stderr=subprocess.STDOUT)
         processes.append(process)
         eventually(lambda: request(worker_port if role == "worker" else controller_port, "/healthz", timeout=4)[0] == 200, timeout=15)
         return process
+
+    # Returns how many bytes the worker process has read so far (rchar in /proc/<pid>/io). Hashing a
+    # layer reads its whole image; reads through a loop-mounted layer are not counted.
+    def worker_read_bytes():
+        return int(next(line for line in Path(f"/proc/{worker.pid}/io").read_text().splitlines() if line.startswith("rchar:")).split()[1])
 
     # Returns the controller's view of a sandbox.
     def get(sandbox):
@@ -857,7 +863,11 @@ url = "http://127.0.0.1:{worker_port}"
         assert sorted(p.name for p in Path("/run/netns").iterdir()) == [f"{owned_prefix}s-{i}" for i in range(3)]
         slots_reset()
 
+        read_before = worker_read_bytes()
         source, timings["cold_create_s"] = create("image-cold")
+        # The first use of the base on this node hashes it fully in the create job.
+        timings["cold_create_read_bytes"] = worker_read_bytes() - read_before
+        assert timings["cold_create_read_bytes"] >= prepared["base"]["bytes"], timings
         first, ready_after_create, attempts = wait_http(source, args.ready_timeout)
         timings["first_http_ready_after_create_s"] = ready_after_create
         timings["first_http_ready_total_s"] = timings["cold_create_s"] + ready_after_create
@@ -981,7 +991,8 @@ url = "http://127.0.0.1:{worker_port}"
         assert code == 200 and captured["state"] == "running" and captured["template_id"] == "image-warm", (code, captured, availability)
         assert get(source)["state"] == "running"
         observations["source_during_capture"] = availability
-        timings["capture_frozen_window_s"] = availability["frozen_s"]
+        # Freezer time only; the longest gap without an answer is the client-visible stop.
+        timings["capture_freezer_s"] = availability["frozen_s"]
         timings["capture_longest_without_answer_s"] = availability["longest_without_answer_s"]
         assert availability["freeze_periods"] >= 1 and 0 < availability["frozen_s"] < timings["capture_s"], availability
         assert availability["successes_during_capture"] > 0 and availability["longest_without_answer_s"] < timings["capture_s"], availability
@@ -990,7 +1001,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert warm_manifest["schema_version"] == 3 and len(warm_manifest["layers"]) == 1 and not (warm / "upper.tar").exists()
         observations["warm_artifacts"] = {"checkpoint.tar": (warm / "checkpoint.tar").stat().st_size, "sealed_layer": warm_manifest["layers"][0]}
         source_after, timings["source_http_after_capture_s"], _ = wait_http(source, 10)
-        print(f"PASS capture {timings['capture_s']:.2f}s without stopping the source: frozen {availability['frozen_s']:.3f}s; "
+        print(f"PASS capture {timings['capture_s']:.2f}s without stopping the source: freezer {availability['frozen_s']:.3f}s; "
               f"{availability['successes_during_capture']} probe answers during it, longest client-visible gap {availability['longest_without_answer_s']:.3f}s, "
               f"slowest answer {availability['slowest_answer_s']:.3f}s; "
               f"checkpoint {observations['warm_artifacts']['checkpoint.tar']} bytes, sealed layer {warm_manifest['layers'][0]['bytes']} bytes")
@@ -1041,6 +1052,26 @@ url = "http://127.0.0.1:{worker_port}"
         assert sorted(p.name for p in Path("/run/netns").iterdir()) == [f"{owned_prefix}s-{i}" for i in range(3)], "guest netns remain after delete"
         slots_reset()
         print("PASS delete of source and child: no runc state, private state, cgroups or guest namespaces remain; pooled slots reset")
+
+        # A graceful worker restart (it unmounts the shared layers and removes the slot pool) keeps the
+        # saved verified-layer state, so the next cold create trusts the unchanged base instead of
+        # hashing it again: the worker reads (rchar) far less than the base's size.
+        worker.terminate()
+        assert worker.wait(timeout=180) == 0
+        saved = {entry["sha256"]: entry for entry in json.loads((session / "verified-layers.json").read_text())["layers"]}
+        assert saved[prepared["base"]["sha256"]]["bytes"] == prepared["base"]["bytes"]
+        worker = start("worker", worker_config)
+        eventually(lambda: (lambda node: node["fresh"] and node["status"]["admission_ready"])(
+            expect(request(controller_port, "/v1/status", token, timeout=4), 200)["nodes"][0]), timeout=30)
+        read_before = worker_read_bytes()
+        again, timings["cold_create_after_restart_s"] = create("image-cold")
+        timings["cold_create_after_restart_read_bytes"] = worker_read_bytes() - read_before
+        assert timings["cold_create_after_restart_read_bytes"] < prepared["base"]["bytes"] // 2, timings
+        wait_http(again, args.ready_timeout)
+        assert expect(request(controller_port, f"/v1/sandboxes/{again}", token, method="DELETE"), 200)["state"] == "deleted"
+        gone(again)
+        print(f"PASS cold create after a worker restart {timings['cold_create_after_restart_s']:.2f}s without rehashing the base "
+              f"(worker read {timings['cold_create_after_restart_read_bytes']} bytes; base {prepared['base']['bytes']} bytes)")
     finally:
         # All cleanup goes through the owner; never recurse through live mounts.
         if worker is not None and worker.poll() is None:

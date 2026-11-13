@@ -121,10 +121,11 @@ class RoutingDouble:
 
     # Start a loopback HTTP server that answers worker status, create, get, exec (blocking and
     # streaming), delete and app-proxy calls for one node ID. The mode selects accept, busy, drop,
-    # template, fail or hang behavior for creates.
+    # template, fail or hang behavior for creates; an accepted create can be answered after a delay
+    # (its record counts in the status at once, as a real worker's reservation does).
     def __init__(self, node_id, token):
         self.node_id, self.token = node_id, token
-        self.mode, self.ready, self.peer_closed = "accept", True, False
+        self.mode, self.ready, self.peer_closed, self.create_delay = "accept", True, False, 0
         self.create_attempts, self.records, self.calls = [], {}, []
         self.lock = threading.Lock()
         double = self
@@ -230,7 +231,8 @@ class RoutingDouble:
                 self.close_connection = True
 
             # Check the worker token and answer one routing or proxied call from the double's records and
-            # mode. In hang mode, hold a create open until the controller closes its connection.
+            # mode. In hang mode, hold a create open until the controller closes its connection; with a
+            # create delay, answer an accepted create only after it.
             def handle_any(self, method):
                 if self.headers.get("Authorization") != "Bearer " + double.token:
                     return self.reply(401, {"error": {"code": "unauthorized", "message": "test double"}})
@@ -276,22 +278,28 @@ class RoutingDouble:
                             return self.reply(500, {"error": {"code": "incompatible_template", "message": "test double failure"}})
                         view = dict(sandbox_id=body["sandbox_id"], template_id=body["template_id"], state="running", error=None, expires_at=0)
                         double.records[body["sandbox_id"]] = view
-                        return self.reply(201, view)
-                    parts = self.path.split("/")
-                    record = double.records.get(parts[3]) if len(parts) > 3 else None
-                    if record is None:
-                        return self.reply(404, {"error": {"code": "sandbox_not_found", "message": "test double"}})
-                    if method == "GET" and len(parts) == 4:
-                        return self.reply(200, record)
-                    if method == "DELETE" and len(parts) == 4:
-                        record["state"] = "deleted"
-                        return self.reply(200, record)
-                    streamed = method == "POST" and parts[4:] == ["exec"] and body.get("stream")
-                    if method == "POST" and parts[4:] == ["exec"] and not streamed:
-                        return self.reply(200, dict(exec_id=1, exit_code=0, stdout=double.node_id, stderr="", interrupted=False, error=None, sandbox_state="running"))
-                    if not streamed:
-                        return self.reply(404, {"error": {"code": "not_found", "message": "test double"}})
-                # Outside the lock: the stream takes a while.
+                        if not double.create_delay:
+                            return self.reply(201, view)
+                        delayed = view
+                    else:
+                        parts = self.path.split("/")
+                        record = double.records.get(parts[3]) if len(parts) > 3 else None
+                        if record is None:
+                            return self.reply(404, {"error": {"code": "sandbox_not_found", "message": "test double"}})
+                        if method == "GET" and len(parts) == 4:
+                            return self.reply(200, record)
+                        if method == "DELETE" and len(parts) == 4:
+                            record["state"] = "deleted"
+                            return self.reply(200, record)
+                        streamed = method == "POST" and parts[4:] == ["exec"] and body.get("stream")
+                        if method == "POST" and parts[4:] == ["exec"] and not streamed:
+                            return self.reply(200, dict(exec_id=1, exit_code=0, stdout=double.node_id, stderr="", interrupted=False, error=None, sandbox_state="running"))
+                        if not streamed:
+                            return self.reply(404, {"error": {"code": "not_found", "message": "test double"}})
+                # Outside the lock: a delayed create answer and the stream take a while.
+                if method == "POST" and self.path == "/v1/sandboxes":
+                    time.sleep(double.create_delay)
+                    return self.reply(201, delayed)
                 return self.exec_stream()
 
             # Handle a GET request.
@@ -752,6 +760,10 @@ command_timeout_seconds = 10
                     assert ambiguous["sandbox_id"] == doubles[0].create_attempts[-1] and ambiguous["sandbox_id"].startswith("stub-a.")
                     assert len(doubles[1].create_attempts) == attempts_b, "ambiguous create outcome was retried on another node"
                 print("PASS no failover after a lost response or post-acceptance failure; error names the generated ID")
+                # The controller counts those ambiguous creates against stub-a until a poll sent after
+                # their answers; wait for one so stub-a ranks first again.
+                time.sleep(0.4)
+                settle({"stub-a": 1, "stub-b": 2})
 
                 # A client that disconnects mid-create makes the controller drop its
                 # forward, so the owner sees the lost reply (and deletes the sandbox).
@@ -785,6 +797,30 @@ command_timeout_seconds = 10
                 expect(request(placing_port, "/v1/sandboxes", controller_token, spec, "POST"), 503, "no_capacity")
                 print("PASS DELETE routing and no_capacity without fresh ready candidates")
                 stop(placing)
+
+                # Creates sent at the same moment spread over equal workers: the controller counts its
+                # own in-flight and not-yet-polled creates, and equal scores take turns. Each double
+                # answers creates only after 0.5 s, so every create ranks before any answer.
+                spreading = [RoutingDouble("spread-a", worker_token), RoutingDouble("spread-b", worker_token)]
+                doubles.extend(spreading)
+                spread_port = port()
+                spread_text = placing_text.replace(f"127.0.0.1:{placing_port}", f"127.0.0.1:{spread_port}")
+                spread_text = spread_text.replace('node_id = "stub-a"', 'node_id = "spread-a"').replace(f"http://127.0.0.1:{doubles[0].port}", f"http://127.0.0.1:{spreading[0].port}")
+                spread_text = spread_text.replace('node_id = "stub-b"', 'node_id = "spread-b"').replace(f"http://127.0.0.1:{doubles[1].port}", f"http://127.0.0.1:{spreading[1].port}")
+                spread = start("controller", spread_text)
+                eventually(lambda: request(spread_port, "/healthz")[0] == 200)
+                eventually(lambda: all(n["fresh"] for n in expect(request(spread_port, "/v1/status", controller_token), 200)["nodes"]))
+                for double in spreading:
+                    double.create_delay = 0.5
+                light = {"template_id": "example-template", "memory_mib": 64, "ttl_seconds": 300}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    placed = [f.result(timeout=30) for f in [pool.submit(request, spread_port, "/v1/sandboxes", controller_token, light, "POST", timeout=10) for _ in range(8)]]
+                assert all(code == 201 for code, _ in placed), placed
+                split = {double.node_id: len(double.records) for double in spreading}
+                print("spread of 8 simultaneous creates:", split)
+                assert all(3 <= count <= 5 for count in split.values()), f"simultaneous creates were not spread: {split}"
+                stop(spread)
+                print("PASS 8 simultaneous creates split across two equal workers (in-flight placements counted, round-robin ties)")
             finally:
                 for double in doubles:
                     double.close()

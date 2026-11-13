@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{sync::{Arc, Mutex, PoisonError}, time::{Duration, Instant}};
 
 use axum::{Json, Router, body::Body, extract::{Path, Request, State, rejection::{JsonRejection, PathRejection}}, http::{StatusCode, header}, response::{IntoResponse, Response}, routing::{get, post}};
 use serde_json::Value;
@@ -19,6 +19,8 @@ struct CachedNode {
     node_id: String,
     status: Option<WorkerStatus>,
     observed: Option<Instant>,
+    // When the poll that produced `status` was sent; it counts every create answered before then.
+    polled_at: Option<Instant>,
     error: Option<&'static str>,
 }
 
@@ -30,6 +32,8 @@ pub struct NodeView {
     pub age_ms: Option<u64>,
     pub error: Option<&'static str>,
     pub status: Option<WorkerStatus>,
+    #[serde(skip)]
+    pub polled_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -41,6 +45,8 @@ struct Controller {
     // Streams app traffic and streaming exec output to owners: no total deadline (see ProxyLimits).
     proxy_client: reqwest::Client,
     proxy_permits: Arc<tokio::sync::Semaphore>,
+    // Recent creates per node not yet in its polled status, and the round-robin turn (see scheduler).
+    placements: Arc<Mutex<scheduler::Placements>>,
     worker_token: Arc<String>,
     server: ServerConfig,
     short_wait: Duration,
@@ -66,6 +72,7 @@ impl Controller {
                 age_ms: age.map(|age| age.as_millis().min(u64::MAX as u128) as u64),
                 error: node.error,
                 status: node.status.clone(),
+                polled_at: node.polled_at,
             }
         }).collect()
     }
@@ -94,7 +101,7 @@ const MAX_CREATE_ATTEMPTS: usize = 3;
 const MAX_SANDBOX_VIEW_BYTES: usize = 65_536;
 
 // Return 32 random hex characters for the local part of a new sandbox ID, or a 503 error if the
-// kernel cannot supply randomness without blocking.
+// kernel randomness call fails or returns fewer bytes (it never blocks).
 fn random_local_id() -> Result<String, ApiError> {
     let mut bytes = [0u8; 16];
     // Nonblocking after kernel entropy initialization; never reads a file.
@@ -110,15 +117,36 @@ fn with_sandbox_id(status: StatusCode, mut body: Value, sandbox_id: &str) -> Res
     (status, Json(body)).into_response()
 }
 
-// Validate a client create, rank fresh workers and try up to three of them, each with a newly
-// generated owner-prefixed ID, within one shared deadline. Move on only after a definitive pre-launch
+// One create's entry in the recent-placement table. Dropping it forgets the entry if nothing was sent;
+// once the create was sent (including when the client left mid-create), the entry stays counted
+// until a newer poll of the node, since the node may have admitted it.
+struct Placed { placements: Arc<Mutex<scheduler::Placements>>, id: u64, sent: bool }
+impl Placed {
+    // Forget the entry at once: the node refused this create before reserving anything.
+    fn refused(mut self) { self.sent = false; }
+}
+impl Drop for Placed {
+    // Report the create's end to the placement table.
+    fn drop(&mut self) { self.placements.lock().unwrap_or_else(PoisonError::into_inner).finish(self.id, self.sent); }
+}
+
+// Validate a client create, rank fresh workers (counting creates still in flight or not yet polled)
+// and try up to three of them, each with a newly generated owner-prefixed ID, within one shared
+// deadline. Move on only when nothing was sent to a worker or it gave a definitive pre-launch
 // rejection; any other answer is final and names the ID when the outcome is uncertain. Return 422
 // if every candidate answered template_unavailable, otherwise 503 no_capacity.
 async fn create(State(c): State<Controller>, input: Result<Json<CreateSpec>, JsonRejection>) -> Result<Response, ApiError> {
     let spec = http::json(input)?;
     if !spec.valid() { return Err(http::invalid_input()); }
     let nodes = c.snapshot().await;
-    let candidates: Vec<String> = scheduler::rank(&nodes, &spec).into_iter().take(MAX_CREATE_ATTEMPTS).map(str::to_owned).collect();
+    // Ranking and recording the first choice happen in one step, so creates that arrive together
+    // see each other.
+    let (candidates, first) = {
+        let mut placements = c.placements.lock().unwrap_or_else(PoisonError::into_inner);
+        let (ranked, id) = placements.choose(&nodes, &spec, c.freshness);
+        (ranked.into_iter().take(MAX_CREATE_ATTEMPTS).map(str::to_owned).collect::<Vec<String>>(), id)
+    };
+    let mut first = first.map(|id| Placed { placements: c.placements.clone(), id, sent: false });
     let wait = Duration::from_millis(c.server.operation_deadlines.create_ms);
     // All attempts share one budget that ends a request_timeout_ms before this
     // route's guard deadline, so a running attempt reports its ID, never a bare 408.
@@ -126,22 +154,28 @@ async fn create(State(c): State<Controller>, input: Result<Json<CreateSpec>, Jso
     // template_unavailable is reported only if every candidate answered exactly that.
     let mut only_template_rejections = !candidates.is_empty();
     for owner in candidates {
+        let mut placed = first.take().unwrap_or_else(|| {
+            let id = c.placements.lock().unwrap_or_else(PoisonError::into_inner).start(&owner, &spec);
+            Placed { placements: c.placements.clone(), id, sent: false }
+        });
         let remaining = budget_end.saturating_duration_since(Instant::now());
         // Too little budget left for another attempt: nothing was sent to it.
         if remaining < c.server.timeout() { only_template_rejections = false; break; }
         let sandbox_id = format!("{owner}.{}", random_local_id()?);
         let body = serde_json::to_value(spec.clone().with_id(sandbox_id.clone())).map_err(|_| http::invalid_input())?;
+        placed.sent = true;
         match forward(&c, &owner, reqwest::Method::POST, "/v1/sandboxes", Some(body), remaining, MAX_SANDBOX_VIEW_BYTES).await {
-            Err(Forward::NotSent(_)) => { only_template_rejections = false; continue; }
+            Err(Forward::NotSent(_)) => { placed.refused(); only_template_rejections = false; continue; }
             Err(Forward::Lost(ApiError(status, code, message))) =>
                 return Ok(with_sandbox_id(status, serde_json::json!({"error":{"code":code,"message":message}}), &sandbox_id)),
             Ok((status, body)) if status.is_success() => return Ok((status, Json(body)).into_response()),
             Ok((_, body)) if body["error"]["code"].as_str().is_some_and(|code| PRE_LAUNCH_REJECTIONS.contains(&code)) => {
+                placed.refused();
                 only_template_rejections &= body["error"]["code"] == "template_unavailable";
                 continue;
             }
             // Other 4xx answers created nothing: invalid input or template resource rules.
-            Ok((status, body)) if status.is_client_error() => return Ok((status, Json(body)).into_response()),
+            Ok((status, body)) if status.is_client_error() => { placed.refused(); return Ok((status, Json(body)).into_response()) }
             // Any other answer (including a failed launch) is final for this ID; never retry elsewhere.
             Ok((status, body)) => return Ok(with_sandbox_id(status, body, &sandbox_id)),
         }
@@ -281,7 +315,8 @@ async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &st
 
 // Start protected management routes, the app proxy (path form, plus host routing below the configured
 // proxy domain) and bounded worker polling, with redirects and environment proxies disabled. On
-// shutdown, stop serving and cancel the poller.
+// shutdown, stop accepting, let open requests finish for at most the longest management route wait
+// (plus one request_timeout_ms per hop), then cut any still-open streams and cancel the poller.
 pub async fn run(config: ControllerConfig, token: String, worker_token: String) -> Result<(), &'static str> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -299,11 +334,12 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
         .build().map_err(|_| "cannot initialize worker proxy client")?;
     let controller = Controller {
         nodes: Arc::new(RwLock::new(config.workers.iter().map(|worker| CachedNode {
-            node_id: worker.node_id.clone(), status: None, observed: None, error: Some("not_polled"),
+            node_id: worker.node_id.clone(), status: None, observed: None, polled_at: None, error: Some("not_polled"),
         }).collect())),
         freshness: Duration::from_millis(config.poll.freshness_ms),
         endpoints: Arc::new(config.workers.clone()), client: client.clone(), proxy_client,
-        proxy_permits: Arc::new(tokio::sync::Semaphore::new(config.server.proxy.max_connections)), worker_token: Arc::new(worker_token),
+        proxy_permits: Arc::new(tokio::sync::Semaphore::new(config.server.proxy.max_connections)),
+        placements: Arc::new(Mutex::new(scheduler::Placements::default())), worker_token: Arc::new(worker_token),
         server: config.server.clone(),
         // Plain reads stay within the short route deadline.
         short_wait: Duration::from_millis(config.poll.timeout_ms.min(config.server.request_timeout_ms / 2)),
@@ -322,17 +358,29 @@ pub async fn run(config: ControllerConfig, token: String, worker_token: String) 
     let app = http::protect(router, &config.server, token, 2, proxy, config.proxy_domain.clone());
     let listener = tokio::net::TcpListener::bind(config.server.address(8080)).await
         .map_err(|_| "cannot bind controller listener")?;
+    // Streamed exchanges have no route deadline, so shutdown waits for them only this long.
+    let deadlines = &config.server.operation_deadlines;
+    let longest = [deadlines.create_ms, deadlines.delete_ms, deadlines.capture_ms, crate::model::MAX_EXEC_TIMEOUT_MS + deadlines.margin_ms].into_iter().max().unwrap_or(0);
+    let grace = Duration::from_millis(longest) + config.server.timeout() * 2;
     let worker_token = controller.worker_token.clone();
     let poller = tokio::spawn(poll(controller, config, client, worker_token));
     println!("controller listening; controller-assigned placement and ID-prefix routing enabled");
-    let result = axum::serve(listener, app).with_graceful_shutdown(http::shutdown()).await;
+    let (signaled, shutdown_started) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move { http::shutdown().await; let _ = signaled.send(()); });
+    let result = tokio::select! {
+        result = async { server.await } => result,
+        _ = async { if shutdown_started.await.is_ok() { tokio::time::sleep(grace).await } else { std::future::pending().await } } => {
+            println!("controller shutdown grace expired; open streams were cut");
+            Ok(())
+        }
+    };
     poller.abort();
     let _ = poller.await;
     result.map_err(|_| "controller HTTP server failed")
 }
 
-// Poll configured workers in bounded parallel batches. Save successful observations and flag failures
-// without discarding the last known status.
+// Poll configured workers in bounded parallel batches. Save successful observations with the time each
+// poll was sent, and flag failures without discarding the last known status.
 async fn poll(controller: Controller, config: ControllerConfig, client: reqwest::Client, token: Arc<String>) {
     let mut interval = tokio::time::interval(Duration::from_millis(config.poll.interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -348,18 +396,20 @@ async fn poll(controller: Controller, config: ControllerConfig, client: reqwest:
                 let token = token.clone();
                 let timeout = Duration::from_millis(config.poll.timeout_ms);
                 tasks.spawn(async move {
+                    let sent = Instant::now();
                     let status = tokio::time::timeout(timeout, fetch_status(&client, &endpoint, &token))
                         .await.unwrap_or(Err("poll_timeout"));
-                    (index, status)
+                    (index, sent, status)
                 });
             }
             let Some(completed) = tasks.join_next().await else { break };
-            if let Ok((index, result)) = completed {
+            if let Ok((index, sent, result)) = completed {
                 let mut nodes = controller.nodes.write().await;
                 match result {
                     Ok(status) => {
                         nodes[index].status = Some(status);
                         nodes[index].observed = Some(Instant::now());
+                        nodes[index].polled_at = Some(sent);
                         nodes[index].error = None;
                     }
                     Err(error) => nodes[index].error = Some(error),

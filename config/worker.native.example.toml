@@ -10,7 +10,8 @@ max_in_flight = 64
 request_timeout_ms = 5000
 max_body_bytes = 16384
 # App proxy bounds (defaults shown): open proxied exchanges and the idle timeout
-# (no byte either way, including the wait for the response head). No total deadline.
+# (the sender moves no byte, including the wait for the response head; a receiver
+# that stops reading is not timed out). No total deadline.
 # [server.proxy]
 # max_connections = 256
 # idle_timeout_ms = 600000

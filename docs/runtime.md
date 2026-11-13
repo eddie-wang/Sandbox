@@ -101,6 +101,10 @@ python3 scripts/runtime_smoke.py \
   --cgroup-parent /sys/fs/cgroup/sandbox-validation
 ```
 
+Any build works; the recorded gate runs use `cargo build --release --locked` and
+`--binary target/release/sandboxd` (layer hashing in a debug build is several times
+slower, which mainly shows in the first cold create of a large base).
+
 The script refuses without both opt-in and UID 0. It creates a unique owned session
 root under the already trusted directory and writes temporary configurations with
 random environment-only credentials. It runs read-only preflight before any runtime
@@ -158,8 +162,8 @@ The script fails rather than substituting a fake runtime/result. It exercises:
 4. A CRIU checkpoint with **open upper and lower descriptors/mappings**, an in-memory
    counter and random nonce, and an **ESTABLISHED loopback TCP connection** that the
    init uses every 100 ms. The source must keep running: its counter advances during
-   the capture except while its cgroup is frozen (the frozen window is recorded), and
-   its loopback connection keeps working. A new container restores the same memory
+   the capture except while it is stopped (the cgroup-freezer time and the longest
+   unchanged interval are recorded), and its loopback connection keeps working. A new container restores the same memory
    nonce, continues the loopback connection, sees the filesystem delta/whiteout, and
    writes independently of the source. The published template has a sealed EROFS layer
    and `checkpoint.tar` but no upper archive; the mounted layer holds a whiteout for
@@ -168,7 +172,12 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    checkpoint cache once; it is unchanged by that restore and reused unchanged by a
    later restore after a worker restart. A checkpoint that fails after the freeze
    (the fixture holds an undumpable userfaultfd) leaves the source running and
-   publishes nothing. Restored host PIDs must be in their own cgroups. This is a
+   publishes nothing; a `runc checkpoint` stopped by the test (SIGSTOP) until the
+   worker kills it at the 30 s command deadline is `500 checkpoint_interrupted` and
+   deletes that source. A **chained capture** of the warm child (two sealed layers)
+   restores a grandchild with the same nonce, the child's file change, the source's
+   whiteout and a working loopback connection. Restored host PIDs must be in their
+   own cgroups. This is a
    targeted file-identity check, not blanket CRIU compatibility for all
    filesystem/syscall/application states. Two captures run concurrently into
    distinct, exclusively created staging leaves and restore independently. A
@@ -178,7 +187,14 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    child that closes its stdio), and a deadline or output overflow (stdout only and
    both streams) that stops only that command, with bounded output reported inline,
    while the sandbox keeps running.
-6. One worker SIGKILL with a live owned source and an actually running blocking exec,
+6. Layer verification: two simultaneous first creates of a new 16 MiB base make the
+   worker read (`rchar`) between one and one and a half times its size (hashed once,
+   in the create jobs); `verified-layers.json` is root-owned 0600 and records each
+   used layer's digest, size and current file identity. After the restart below, a
+   create of that base reads less than half its size (trusted, not rehashed), a
+   permission change makes the next create hash it again, and a same-size in-place
+   corruption of an unmounted layer is `500 artifact_digest_mismatch`.
+7. One worker SIGKILL with a live owned source and an actually running blocking exec,
    then restart using the same root: records, exec child cgroup, processes and private
    mounts must reconcile. Retained warm artifacts
    must still restore after source cleanup/restart. A second crash occurs with a
@@ -186,7 +202,7 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    holding a staging FD is explicitly placed in that leaf to stand in for a surviving
    helper descendant outside the worker's parent-death signal/process group. Restart
    must kill/drain it and discard interrupted staging before becoming ready.
-7. Final graceful shutdown: no owned mounts, cgroups or private sandbox directories;
+8. Final graceful shutdown: no owned mounts, cgroups or private sandbox directories;
    management tokens absent from service logs. Shared **artifacts**, records and
    fixture build inputs are intentionally retained for inspection, not mistaken for
    live-container leaks. `validation.json` retains actual overlap, namespace and
@@ -376,7 +392,8 @@ What the script does:
 - **Lifecycle.** The script runs these steps in order:
   0. Before any create, the worker has pre-created three clean routing slots
      (loopback and uplink only, no rules in the filter chains).
-  1. Cold create, then retry a GET through the app proxy (path form) until the
+  1. Cold create (the worker reads at least the base's size: the first use hashes
+     it), then retry a GET through the app proxy (path form) until the
      server answers 200 with the expected body. Check the init process's UID,
      capabilities and no_new_privs.
   2. Check that PID 1 is the reaping init and that a killed background exec child
@@ -392,8 +409,9 @@ What the script does:
      GETs, 30 GETs made inside the sandbox by one command, and 10 `true` commands.
   3. Capture a warm template while a probe in the sandbox's routing namespace
      requests the service port every 20 ms. The source must answer during the
-     capture outside the frozen window, which a host-side watch of its cgroup
-     freezer measures; the longest client-visible gap is recorded too. It must still
+     capture except while it is stopped; a host-side watch of its cgroup freezer
+     measures the freezer time, and the longest client-visible gap (slightly longer,
+     since CRIU thaws and refreezes the cgroup) is recorded too. It must still
      be running and answering afterward. The template has one sealed layer and no
      upper archive.
   4. Create a child from the warm template (the first restore on the node unpacks
@@ -404,12 +422,16 @@ What the script does:
      that the pid/mnt/net namespaces are distinct.
   6. Delete both. No runc state, private state, cgroups or guest namespaces may
      remain; the three pooled slots remain and are clean again (reset, not deleted).
-  7. After shutdown, no owned mounts, cgroups, namespace pins or veths may remain
+  7. Stop the worker gracefully (exit 0) and start it again. `verified-layers.json`
+     lists the base; the next cold create trusts it (the worker reads less than half
+     the base's size), answers HTTP and is deleted.
+  8. After shutdown, no owned mounts, cgroups, namespace pins or veths may remain
      and service logs must not contain the tokens.
 - **Defaults.** 256 MiB, one vCPU and 128 pids per container, at most three
   containers. PASS lines print informational timings (cold create, first HTTP
   ready, streamed output, WebSocket handshakes, per-call overhead, capture and its
-  frozen window, first and cached warm restore, first call after restore). These
+  freezer time, first and cached warm restore, first call after restore, cold create
+  after a restart). These
   are not
   benchmarks. The session root keeps `prepared.json`, `image-e2e.json` and the
   service logs for inspection.
