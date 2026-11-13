@@ -12,6 +12,8 @@ mod phases;
 mod process;
 mod proxy;
 mod storage;
+mod mounts;
+mod overlay;
 
 use std::path::Path;
 
@@ -26,9 +28,15 @@ fn main() {
 }
 
 // Dispatch internal helpers or load and validate the selected service configuration. Load credentials
-// only for serving; preflight prints its checks and fails if prerequisites are missing.
+// only for serving; preflight prints prerequisite checks. Worker mount boundaries and active probes
+// are established before starting any threads, including the request runtime.
 fn start() -> Result<(), &'static str> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "internal-unmount" { return mounts::unmount(Path::new(&args[1])); }
+    if args.len() == 2 && args[0] == "internal-overlay-probe" {
+        if !overlay::probe(Path::new(&args[1]))? { std::process::exit(2); }
+        return Ok(());
+    }
     if args.len() == 3 && args[0] == "internal-erofs-mount" { return native::erofs_mount_helper(&args[1], &args[2]); }
     if args.first().is_some_and(|a| a == "internal-exec") { return process::exec_helper(&args[1..]); }
     if args.len() == 1 && args[0] == "internal-forward" { return network::forward_helper(true); }
@@ -61,7 +69,9 @@ fn start() -> Result<(), &'static str> {
             let config: config::WorkerConfig = config::load(Path::new(&args[2]))?;
             config.validate()?;
             let token = config.auth.load()?;
-            runtime()?.block_on(worker::run(config, token))
+            let report = native::preflight(config.native.as_ref());
+            let handle = engine::Handle::start(&config, report)?;
+            runtime()?.block_on(worker::run(config, token, handle))
         }
         _ => Err(USAGE),
     }

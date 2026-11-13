@@ -111,12 +111,14 @@ impl Handle {
     // Fail closed if disabled or preflight fails; otherwise reconcile and start admission, operation,
     // lower-mount, CPU-check and expiry workers. Work survives HTTP disconnects. Shutdown waits for
     // jobs, commands and per-sandbox cleanup, then removes shared mounts and the slot pool. Startup
-    // records the active EROFS probe separately from the read-only prerequisite checks.
+    // records active EROFS/overlay checks separately from read-only CLI prerequisites.
     pub fn start(config: &WorkerConfig, mut report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
         let native = if enabled {
             let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
             report.erofs = native.erofs.clone();
+            report.overlay_volatile = Some(native.volatile_overlay);
+            report.checks.push(crate::native::Check { name: "active_overlay_backing_features".into(), ok: true });
             Some(native)
         } else { None };
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),

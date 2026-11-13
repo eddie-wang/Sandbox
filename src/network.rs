@@ -3,7 +3,7 @@
 //! a create only attaches a fresh guest namespace and installs its template's
 //! rules; a release resets the slot instead of deleting it. Only the
 //! operator-provisioned bridge exists outside the owned slots.
-use std::{collections::BTreeSet, fs, path::{Path, PathBuf}, sync::PoisonError, time::Duration};
+use std::{collections::BTreeSet, fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}, sync::PoisonError, time::Duration};
 use crate::{model::NetworkPolicy, native::Native, phases::Phases, process::Result, storage};
 
 pub const GUEST: &str = "192.0.2.2";
@@ -119,13 +119,29 @@ impl Native {
             format!("route add default via {}", config.gateway)])?;
         self.ip_batch_in(None, &dir.join("host.ip"), &[format!("link set {link} master {}", config.bridge), format!("link set {link} up")])
     }
-    // Remove one pooled slot this worker owns: delete its namespace pin, wait for the kernel to destroy
+    // Remove an owned pin only after a real unmount with bounded busy retry; ip netns delete uses
+    // lazy detach, which cannot establish cleanup. Unexpected or stacked pin mounts fail closed.
+    fn remove_pin(&self, namespace: &str) -> Result<()> {
+        let path = Self::pin(namespace);
+        let mounts = crate::mounts::inventory()?;
+        let pins: Vec<_> = mounts.iter().filter(|m| m.point.starts_with(&path)).collect();
+        if !pins.is_empty() {
+            if pins.len() != 1 || pins[0].point != path || pins[0].filesystem != "nsfs" { return Err("unexpected_netns_mount"); }
+            self.unmount(&path)?;
+        }
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(meta) if meta.is_file() && meta.uid() == 0 => fs::remove_file(&path).map_err(|_| "netns_pin_remove_failed"),
+            _ => Err("unexpected_netns_pin"),
+        }
+    }
+    // Remove one pooled slot this worker owns: unmount its namespace pin, wait for the kernel to destroy
     // its links (the host link goes with them), then drop the ownership directory. An absent slot
     // succeeds; incomplete teardown keeps ownership and fails.
     fn destroy_slot(&self, index: usize) -> Result<()> {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner).remove(&index);
         let (slot, link) = self.slot_names(index);
-        if Path::new("/run/netns").join(&slot).exists() { self.command("ip", vec!["netns".into(), "delete".into(), slot])?; }
+        self.remove_pin(&slot)?;
         let start = std::time::Instant::now();
         while !link_absent(&link) {
             if start.elapsed() >= Duration::from_secs(5) { return Err("network_cleanup_incomplete"); }
@@ -245,7 +261,7 @@ impl Native {
         Ok(())
     }
     // Remove only network state backed by this sandbox's ownership marker: return its pooled slot to the
-    // pool (reset, not deleted) and delete its guest namespace pin. Unknown state or incomplete cleanup
+    // pool (reset, not deleted) and really unmount its guest pin. Unknown state or incomplete cleanup
     // remains an error.
     pub fn cleanup_network(&self, id: &str, index: Option<usize>) -> Result<()> {
         if !self.private(id).join("network-owned").exists() {
@@ -254,7 +270,7 @@ impl Native {
         // Called after helper and workload drainage, so no guest traffic remains.
         if let Some(index) = index.filter(|_| self.config.network.is_some()) { self.release_slot(index)?; }
         let guest = self.guest_name(id);
-        if Path::new("/run/netns").join(&guest).exists() { self.command("ip", vec!["netns".into(), "delete".into(), guest])?; }
+        self.remove_pin(&guest)?;
         if self.network_absent(id) { Ok(()) } else { Err("network_cleanup_incomplete") }
     }
 }

@@ -195,15 +195,23 @@ Every admitted create, restore, capture, delete and command produces a structure
 
 Creation and final record writes run with the background job, still before any owned resource is created and before a successful result. Already-mounted layers avoid the single mount queue but their identity is still checked. Host commands start through a fresh helper without copying the large worker memory map. Network commands enter only the target network environment and combine related link operations. The proxy reuses four socket-making threads, never guest connections.
 
-Disposable private overlays use the kernel's volatile option where supported, falling back to an ordinary overlay if refused. This avoids waiting for unrelated dirty host data during unmount. Capture reads the frozen file cache and makes the sealed layer durable before publishing it; it does not depend on making the disposable upper durable. Unpacked checkpoints sync their own files rather than the entire host filesystem. Cleanup waits for killed tasks, then tries ordinary runc delete before force deletion.
+Disposable private overlays use the volatile option only after a successful active probe on the actual upper backing directory. Startup checks directory-entry types, required extended attributes, copy-up/hardlinks, ordinary mounts and mount-option size. Only an unsupported volatile probe selects ordinary overlays; later mount errors fail closed without retrying a work directory. This avoids waiting for unrelated dirty host data during unmount. Capture reads the frozen file cache and makes the sealed layer durable before publishing it; it does not depend on making the disposable upper durable. Unpacked checkpoints sync their own files rather than the entire host filesystem. Cleanup waits for killed tasks, then tries ordinary runc delete before force deletion.
 
 Lazy-page restoration remains unimplemented: a small-image experiment is not enough to establish reliability under load, and the additional page-server lifetime would need its own correctness work. No new microVM runtime or comparison service is added. Local fixture measurements are not a two-node capacity claim.
+
+### Built resource and mount ownership
+
+runc alone creates and configures each sandbox's resource group from the execution specification, including memory, no swap, CPU, process count and whole-group out-of-memory killing. Restores create independent target groups even when CRIU ignores captured group reconstruction. Helper groups, command child groups and the expiry watchdog remain worker-owned; the driver is cgroupfs, not systemd.
+
+Before starting threads, the worker checks its operator-provided pod-private mount boundary and detaches the namespace-anchor propagation locally. It never changes node mount propagation. Mount inventory decodes escaped paths and optional fields. Teardown retries only busy errors for a bounded time and never treats lazy detachment as completed cleanup. Reservations and backing files stay owned until real cleanup succeeds. Hardlinks in sealed layers are qualified, but the unchanged index-off options can split lower hardlinks on copy-up; stable inode numbers are not promised.
 
 ### Where to look in the code
 
 | File | Plain-English responsibility |
 | --- | --- |
-| [`main.rs`](../src/main.rs) | Chooses controller, worker or read-only preflight mode. |
+| [`main.rs`](../src/main.rs) | Chooses the mode; establishes worker ownership and mount checks before threads. |
+| [`mounts.rs`](../src/mounts.rs) | Decodes mount inventory, verifies private propagation and retries busy unmounts. |
+| [`overlay.rs`](../src/overlay.rs) | Actively checks backing-directory features and bounds overlay mount options. |
 | [`config.rs`](../src/config.rs) | Loads and checks administrator settings and credential sources. |
 | [`http.rs`](../src/http.rs) | Checks management authentication and request size/time limits, and hands app traffic (proxy paths and proxy host names) to the proxy. |
 | [`proxy.rs`](../src/proxy.rs) | The reverse proxy: reads proxy host names and paths, streams requests and answers between hops, tunnels WebSockets, and opens the node's connection inside the sandbox's routing environment. |

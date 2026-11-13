@@ -139,7 +139,7 @@ Records are retained as tombstones; IDs are never reused.
 | --- | --- |
 | `GET /healthz` | `200 {"service":"worker" or "controller","live":true}`; not readiness |
 | `GET /v1/status` | Worker: configured budgets, reserved usage, CPU overcommit, admission/runtime status and `qualification:"unvalidated"`. Controller: cached validated nodes and freshness; `lifecycle_implemented:true` describes dispatch code, not runtime qualification. |
-| `GET /v1/preflight` | Worker only: cached read-only prerequisites, versions/compatibility fingerprint, plus worker-start EROFS probe result; authenticated |
+| `GET /v1/preflight` | Worker only: cached prerequisites, versions/compatibility fingerprint, plus worker-start EROFS and active overlay backing-directory results; authenticated |
 | `POST /v1/sandboxes` | Blocking create/restore; `201` with the sandbox view once running. No caller ID, rootfs/config/path fields |
 | `GET /v1/sandboxes/{id}` | `200` view: `sandbox_id`, `template_id`, `state`, static `error`, absolute Unix `expires_at` |
 | `DELETE /v1/sandboxes/{id}` | Blocking; `200` view after cleanup (`deleted`, or `failed` for a never-launched ID); `500 cleanup_failed` otherwise |
@@ -420,8 +420,12 @@ CLI preflight leaves `file_backed` null. `/v1/preflight` retains the startup sna
 and selects loop mounts for fallback validation. Loop exhaustion returns static
 `erofs_loop_devices_exhausted` (500, not a pre-launch failover refusal).
 
-`ready:true` means explicit experimental enablement, read-only prerequisites,
-EROFS mount selection and reconciliation passed. The API's **qualification remains unvalidated** because it
+`/v1/preflight` also records `active_overlay_backing_features` in its checks and
+`overlay_volatile` (a boolean after the active startup probe, null in read-only CLI
+preflight). It reports no active success for a disabled backend.
+
+Runtime `ready:true` means explicit experimental enablement, read-only prerequisites,
+private mount boundaries, active overlay checks, EROFS mount selection and reconciliation passed. The API's **qualification remains unvalidated** because it
 does not attest an installation from a separately run smoke.
 
 Controller polls at bounded fanout, with 64 KiB responses, total per-call deadlines

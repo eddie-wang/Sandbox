@@ -30,13 +30,13 @@ from smoke import eventually, exchange, exec_events, expect, port, request as sm
 
 
 # Runs the worker's read-only preflight for this config and returns the host
-# compatibility fingerprint a manifest must carry. Fails if any check fails.
+# compatibility fingerprint a manifest must carry. Fails before workload launch if any check fails.
 def preflight_compatibility(binary, worker_config):
     # Version checks and preflight do not install/load/configure anything.
     report = subprocess.run([binary, "preflight", "--config", str(worker_config)], capture_output=True, timeout=15)
     if report.returncode:
         print(report.stdout.decode(errors="replace"))
-        raise RuntimeError("preflight failed; no runtime mutation attempted")
+        raise RuntimeError("preflight failed; no workload launch attempted")
     return json.loads(report.stdout)["compatibility"]
 
 
@@ -211,8 +211,33 @@ def erofs_observation(root, status):
     return dict(status=status, loop_backings_total=len(loops), owned_loop_backings=owned, lower_sources=sources)
 
 
-# Run real fixture lifecycle, rejection, bounds, capture/restore and restart gates, plus 32 retained
-# distinct lowers, with at most three live containers. Check failed-step timing separately from kill.
+# Check mountinfo decoding with escaped and non-UTF-8 paths and optional propagation fields.
+# Reject shared propagation in preflight and never mistake a mounted descendant for clean state.
+def mount_inventory_gate(binary, root, worker_config):
+    parent = root / "mount-inventory-probe"
+    parent.mkdir(mode=0o700)
+    target = parent / os.fsdecode(b"space tab\tnewline\nbackslash\\nonutf8\xff")
+    target.mkdir(mode=0o700)
+    subprocess.run(["mount", "-t", "tmpfs", "-o", "size=1m", "tmpfs", str(target)], check=True, timeout=5)
+    try:
+        subprocess.run(["mount", "--make-shared", str(target)], check=True, timeout=5)
+        report = subprocess.run([binary, "preflight", "--config", str(worker_config)], capture_output=True, timeout=15)
+        assert report.returncode != 0
+        assert not {c["name"]: c["ok"] for c in json.loads(report.stdout)["checks"]}["private_worker_mount_boundary"]
+        refused = subprocess.run([binary, "internal-unmount", str(parent)], capture_output=True, timeout=5)
+        assert refused.returncode != 0 and b"unmount_failed" in refused.stderr, refused
+        # EINVAL on the ancestor must not erase the still-visible child mount.
+        assert os.path.ismount(target)
+    finally:
+        subprocess.run([binary, "internal-unmount", str(target)], check=True, timeout=5)
+        target.rmdir()
+        parent.rmdir()
+    subprocess.run([binary, "internal-unmount", str(parent)], check=True, timeout=5)
+    print("PASS mountinfo octal/non-UTF-8 paths, propagation fields and mounted-descendant refusal")
+
+
+# Run real lifecycle, rejection, bounds and restart gates with at most three live containers.
+# Check mount retries, active backing probes, OCI limits on cold/restored groups and sealed hardlinks.
 # --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
 def main():
@@ -311,6 +336,7 @@ fanout = 1
 node_id = "node-smoke"
 url = "http://127.0.0.1:{worker_port}"
 ''')
+    mount_inventory_gate(binary, root, worker_config)
     compatibility = preflight_compatibility(binary, worker_config)
     rootfs = root / "fixture-rootfs"
     rootfs.mkdir(mode=0o755)
@@ -570,6 +596,14 @@ url = "http://127.0.0.1:{worker_port}"
         # Omitted resources come from the cold template defaults (64 MiB, 1 vCPU).
         source = create()
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
+        assert (cgroup / source / "memory.oom.group").read_text().strip() == "1"
+        spec = json.loads((root / "private" / source / "config.json").read_text())
+        assert spec["linux"]["resources"]["unified"] == {"memory.oom.group": "1"}
+        active = expect(request(worker_port, "/v1/preflight", worker_token), 200)
+        assert isinstance(active["overlay_volatile"], bool)
+        assert {c["name"]: c["ok"] for c in active["checks"]}["active_overlay_backing_features"]
+        assert not (root / "private/.overlay-probe").exists()
+        observations["active_overlay_volatile"] = active["overlay_volatile"]
         assert int(execute(source, "process-group")) >= 0
         observations["read_only_process_group_query"] = True
         # PID 1 is the bind-mounted reaping init; the fixture init does not reap.
@@ -652,22 +686,36 @@ url = "http://127.0.0.1:{worker_port}"
         expect(request(controller_port, "/v1/sandboxes", token, dict(template_id="fixture", ttl_seconds=60), "POST"), 503, "no_capacity")
         observations["final_worker_admission_without_record_and_controller_no_capacity"] = True
         guest = Path(json.loads((root / "private" / third / "config.json").read_text())["linux"]["namespaces"][2]["path"])
-        # A test-owned open file in the sandbox root keeps its mount busy, so the blocking DELETE reports
-        # cleanup_failed; the reservation and ownership marker survive and cleanup is retried once the
-        # file is closed. A test-owned guest namespace FD does not delay the network release: deleting
-        # the slot's end of the veth pair removes the guest's end at once.
-        with open(guest, "rb") as held_guest, open(root / "private" / third / "rootfs" / "fixture", "rb"):
+        # An open pin FD must block real unmount (no lazy detach); the slot's veth is still removed.
+        # After releasing that FD, an open root file independently keeps cleanup reserved until closed.
+        with open(root / "private" / third / "rootfs" / "fixture", "rb"):
+            with open(guest, "rb") as held_guest:
+                expect(request(controller_port, f"/v1/sandboxes/{third}", token, method="DELETE"), 500, "cleanup_failed")
+                assert get(third)["state"] == "cleanup_failed" and (root / "private" / third / "network-owned").exists()
+                assert guest.exists(), "busy namespace pin was lazily detached"
+                held_links = json.loads(subprocess.check_output(["nsenter", f"--net=/proc/{os.getpid()}/fd/{held_guest.fileno()}", "ip", "-j", "link"], timeout=5))
+                assert [link["ifname"] for link in held_links] == ["lo"], held_links
+                if args.network:
+                    third_slot = slot_of(third)
+                    slot_reset(third_slot)
             expect(request(controller_port, f"/v1/sandboxes/{third}", token, method="DELETE"), 500, "cleanup_failed")
-            assert get(third)["state"] == "cleanup_failed" and (root / "private" / third / "network-owned").exists()
-            assert not guest.exists()
-            held_links = json.loads(subprocess.check_output(["nsenter", f"--net=/proc/{os.getpid()}/fd/{held_guest.fileno()}", "ip", "-j", "link"], timeout=5))
-            assert [link["ifname"] for link in held_links] == ["lo"], held_links
-            if args.network:
-                third_slot = slot_of(third)
-                slot_reset(third_slot)
+            assert not guest.exists() and (root / "private" / third / "network-owned").exists()
         eventually(lambda: get(third)["state"] == "deleted", timeout=15)
         remove(third)
         observations["cleanup_retry_after_root_holder_release"] = True
+        transient = create()
+        held_root = open(root / "private" / transient / "rootfs/fixture", "rb")
+        try:
+            deleting, deleted = in_background(lambda: request(controller_port, f"/v1/sandboxes/{transient}", token, method="DELETE"))
+            eventually(lambda: not (root / "runc" / transient).exists(), timeout=10)
+            time.sleep(0.3)
+            assert deleting.is_alive(), "busy mount was treated as cleaned"
+        finally:
+            held_root.close()
+        deleting.join(timeout=15)
+        expect(deleted["result"], 200)
+        gone(transient)
+        observations["transient_busy_unmount_retried_inline"] = True
         if args.network:
             # Released slots are reset, not deleted: the same slot namespace and host link remain.
             assert slot_identities() == pool_identities
@@ -777,6 +825,9 @@ url = "http://127.0.0.1:{worker_port}"
             assert fields["error"] == "0" and fields["established"] == "2", fields
             return int(fields["roundtrips"])
         execute(source, "write", "copied", "source-private")
+        source_files = root / "private" / source / "rootfs/workspace"
+        os.link(source_files / "copied", source_files / "hardlink")
+        assert (source_files / "copied").stat().st_ino == (source_files / "hardlink").stat().st_ino
         execute(source, "unlink", "removed")
         assert execute(isolated, "read", "copied") == "immutable-base"
         assert execute(isolated, "read", "removed") == "immutable-base"
@@ -1114,6 +1165,11 @@ url = "http://127.0.0.1:{worker_port}"
         modified = sealed.joinpath("copied").lstat()
         assert sealed.joinpath("copied").read_text() == "source-private" and (modified.st_uid, modified.st_gid, stat.S_IMODE(modified.st_mode)) == (0, 0, 0o666)
         assert os.getxattr(sealed / "copied", "user.sandbox-test") == b"base-xattr"
+        assert (sealed / "hardlink").stat().st_ino == modified.st_ino and modified.st_nlink == 2
+        assert execute(child, "read", "hardlink") == "source-private"
+        child_files = root / "private" / child / "rootfs/workspace"
+        assert (child_files / "copied").stat().st_ino == (child_files / "hardlink").stat().st_ino
+        observations["hardlink_preserved_in_sealed_layer"] = True
         assert os.getxattr(root / "private" / child / "rootfs" / "workspace" / "copied", "user.sandbox-test") == b"base-xattr"
         assert not (root / "private" / child / "upper" / "workspace" / "copied").exists(), "child upper must start empty"
         observations["sealed_layer"] = {"sha256": layer, "whiteout": True, "modified_owner_mode_xattr": True}
@@ -1121,6 +1177,10 @@ url = "http://127.0.0.1:{worker_port}"
         assert not any(p.name.endswith(".unpacking") for p in (root / "checkpoints").iterdir())
         execute(child, "write", "copied", "child-private")
         assert execute(source, "read", "copied") == "source-private"
+        # index=off intentionally permits lower hardlink identity to split on copy-up.
+        assert execute(child, "read", "hardlink") == "source-private"
+        assert (child_files / "copied").stat().st_ino != (child_files / "hardlink").stat().st_ino
+        observations["index_off_copy_up_splits_lower_hardlink"] = True
         observations["restored_namespace_identities"] = {}
         for namespace in ("pid", "mnt", "net", "ipc", "uts", "cgroup"):
             identities = [os.readlink(f"/proc/{pid}/ns/{namespace}") for pid in (host_pid(source), host_pid(child), os.getpid())]
@@ -1128,7 +1188,10 @@ url = "http://127.0.0.1:{worker_port}"
             observations["restored_namespace_identities"][namespace] = identities
         for sandbox in (source, child):
             assert str(host_pid(sandbox)) in (cgroup / sandbox / "cgroup.procs").read_text().split()
-            assert (cgroup / sandbox / "memory.max").read_text().strip() == "67108864"
+            for name, value in {"memory.max": "67108864", "memory.swap.max": "0", "memory.oom.group": "1",
+                                "cpu.max": "100000 100000", "pids.max": "64"}.items():
+                assert (cgroup / sandbox / name).read_text().strip() == value
+        observations["runc_cold_and_restore_cgroup_limits"] = True
         if args.network:
             observations["restored_listening_socket_and_fresh_egress"] = network_gate(child)
             observations["source_listening_socket_and_fresh_egress"] = network_gate(source)

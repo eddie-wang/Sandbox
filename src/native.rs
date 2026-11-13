@@ -13,6 +13,8 @@ pub struct Preflight {
     pub checks: Vec<Check>,
     pub compatibility: Option<Compatibility>,
     pub erofs: ErofsStatus,
+    // None in read-only CLI preflight; worker startup actively probes before advertising readiness.
+    pub overlay_volatile: Option<bool>,
 }
 
 pub struct Native {
@@ -21,8 +23,8 @@ pub struct Native {
     tools: BTreeMap<String, String>,
     pub search_path: String,
     pub helpers: process::Helpers,
-    // Whether sandbox overlays are mounted `volatile` (kernel 5.10 or later; see prepare).
-    volatile_overlay: bool,
+    // Result of the active backing-directory probe, chosen once under the root lock.
+    pub volatile_overlay: bool,
     // Chosen once by a tiny active probe under the root lock; never changed after a lower failure.
     pub erofs: ErofsStatus,
     // Layer digests whose shared lower this worker mounted and checked (see mount_lower); a create
@@ -132,13 +134,6 @@ const EXEC_GROUP_PREFIX: &str = "exec-";
 // failed, and whether its resource group could not be emptied and removed.
 pub struct ExecEnd { pub exit_code: Option<i32>, pub interrupted: bool, pub error: Option<&'static str>, pub cleanup_failed: bool }
 
-// Decide from the kernel release (for example "6.8.0-1-generic") whether to try the `volatile`
-// option, introduced in Linux 5.10. Mount refusal still falls back to an ordinary overlay.
-fn volatile_overlay_supported(release: &str) -> bool {
-    let mut numbers = release.trim().split(|c: char| !c.is_ascii_digit()).map(|n| n.parse::<u32>().ok());
-    matches!((numbers.next().flatten(), numbers.next().flatten()), (Some(major), Some(minor)) if (major, minor) >= (5, 10))
-}
-
 // Wait up to five seconds, checking every five milliseconds, until a sandbox's resource group holds no
 // process; fail if it stays populated or cannot be read.
 fn wait_unpopulated(cgroup: &Path) -> Result<()> {
@@ -235,7 +230,7 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
 
 // Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
 // creating runtime state. Collect compatibility fingerprints and report readiness only if every check
-// passes; qualification stays unvalidated. EROFS file backing is probed only by worker startup.
+// passes; qualification stays unvalidated. Active EROFS and overlay probes run only at startup.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
     let search_path = tool_search_path(&tools);
@@ -267,16 +262,9 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     add("seccomp_filter", status.lines().any(|l| l.starts_with("Seccomp:")));
     let root_ok = config.is_some_and(|c| storage::trusted_directory(Path::new(&c.root)).is_ok());
     add("trusted_existing_root", root_ok);
-    let filesystem_ok = config.is_some_and(|c| {
-        let Ok(path) = std::ffi::CString::new(c.root.as_bytes()) else { return false; };
-        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        if unsafe { libc::statfs(path.as_ptr(), info.as_mut_ptr()) } != 0 { return false; }
-        let info = unsafe { info.assume_init() };
-        // Restrict the initial upper/work path to ext4/XFS/Btrfs, not nested
-        // OverlayFS, NFS or a filesystem whose required semantics are unknown.
-        matches!(info.f_type as u64, 0xef53 | 0x58465342 | 0x9123683e)
-    });
-    add("upper_filesystem_supported_family", filesystem_ok);
+    // Feature support is established on the actual private backing directory during startup,
+    // not guessed from statfs or a kernel release. CLI preflight remains read-only.
+    add("private_worker_mount_boundary", config.is_some_and(|c| crate::mounts::private_tree(Path::new(&c.root)).is_ok()));
     let parent_ok = config.is_some_and(|c| {
         let p = Path::new(&c.cgroup_parent);
         storage::trusted_directory(p).is_ok() && p.join("cgroup.kill").exists()
@@ -301,14 +289,13 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     })();
     add("compatibility_fingerprint", compatibility.is_some());
     let erofs = ErofsStatus { file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };
-    Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs }
+    Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs, overlay_volatile: None }
 }
 
 impl Native {
-    // Require successful preflight and exclusive ownership of the runtime root. Verify tools, drain old
-    // helper processes before touching runtime state, create private storage directories (including
-    // the slot-pool ownership directory) and drop half-unpacked checkpoint cache entries. Unknown cache
-    // entries fail closed. Load verified-layer state and probe direct EROFS mounting once under the lock.
+    // Lock the root, drain old helpers, then verify pod-private mounts before starting threads.
+    // Create private storage and discard interrupted cache entries, rejecting unknown state.
+    // Probe EROFS and actual overlay features under the lock before advertising readiness.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -321,6 +308,7 @@ impl Native {
         // Drain old host-side commands before inspecting/removing ANY runtime or
         // staging state. The reserved name cannot be a valid sandbox ID.
         let helpers = process::Helpers::open(Path::new(&config.cgroup_parent).join(format!(".helpers-{}", storage::digest(config.root.as_bytes()))))?;
+        crate::mounts::prepare_boundary(root)?;
         for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc", "checkpoints", "slots"] { storage::private_dir(&root.join(dir))?; }
         for entry in fs::read_dir(root.join("checkpoints")).map_err(|_| "checkpoint_cache_scan_failed")? {
             let entry = entry.map_err(|_| "checkpoint_cache_scan_failed")?;
@@ -332,13 +320,56 @@ impl Native {
             }
         }
         let verified = load_verified(root);
-        let volatile_overlay = volatile_overlay_supported(&fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
-        let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, volatile_overlay, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
+        let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, volatile_overlay: false, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
             verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock };
+        native.volatile_overlay = native.probe_overlay()?;
         native.clear_erofs_probe()?;
         if !native.erofs.forced_loop { native.erofs.file_backed = Some(native.probe_file_erofs()?); }
         native.erofs.loop_devices = if native.erofs.file_backed == Some(true) { None } else { loop_capacity() };
         Ok(native)
+    }
+    // Probe actual private storage with bounded helper lifetime, including restart cleanup. Check the
+    // longest supported lower stack too; a configuration that cannot fit it fails before readiness.
+    fn probe_overlay(&self) -> Result<bool> {
+        let probe = self.root().join("private/.overlay-probe");
+        self.clear_overlay_probe(&probe)?;
+        let private = self.private(&"x".repeat(129));
+        crate::overlay::options(&vec![self.lower(&"0".repeat(64)).display().to_string(); storage::MAX_LAYERS + 1],
+            &private.join("upper"), &private.join("work"), true)?;
+        storage::exclusive_private_dir(&probe)?;
+        let result = self.helpers.run(&format!("/proc/{}/exe", std::process::id()),
+            &["internal-overlay-probe".into(), probe.display().to_string()], Duration::from_secs(self.config.command_timeout_seconds),
+            4096, false, &self.search_path, None).and_then(|out| match (out.interrupted, out.exit_code) {
+                (false, Some(0)) => Ok(true), (false, Some(2)) => Ok(false),
+                _ => { process::log_failure("overlay probe", "overlay_probe_failed", out.exit_code, &out.stderr); Err("overlay_probe_failed") }
+            });
+        self.clear_overlay_probe(&probe)?;
+        result
+    }
+    // Remove only an owned overlay probe whose mount has the exact expected source and directories.
+    // Retain backing files on unexpected mounts or incomplete helper/unmount cleanup.
+    fn clear_overlay_probe(&self, probe: &Path) -> Result<()> {
+        self.helpers.ensure_healthy()?;
+        let target = probe.join("mount");
+        let mounts = crate::mounts::inventory()?;
+        let owned: Vec<_> = mounts.iter().filter(|m| m.point.starts_with(probe)).collect();
+        if !owned.is_empty() {
+            if owned.len() != 1 || owned[0].point != target || owned[0].filesystem != "overlay" || owned[0].source != Path::new("overlay")
+                || ![format!("upperdir={}", probe.join("upper").display()), format!("workdir={}", probe.join("work").display()),
+                    format!("lowerdir={}", probe.join("lower").display())].iter().all(|o| owned[0].super_options.contains(o))
+            { return Err("unexpected_overlay_probe_mount"); }
+            self.unmount(&target)?;
+        }
+        storage::remove_private(probe)
+    }
+    // Unmount in a tracked deadline-bound helper with errno-specific busy retry, then prove nothing
+    // remains at or beneath the target. Never treat detached backing storage as reclaimed capacity.
+    pub(crate) fn unmount(&self, target: &Path) -> Result<()> {
+        process::checked(&format!("/proc/{}/exe", std::process::id()),
+            &["internal-unmount".into(), target.display().to_string()], self.config.command_timeout_seconds,
+            &self.search_path, &self.helpers, None)?;
+        if storage::mounted(target)? { return Err("mount_still_live"); }
+        Ok(())
     }
     // Remove only the known probe mount and private files, including a probe interrupted by restart.
     // Verify either source type before unmounting; an unexpected mount is never removed.
@@ -348,7 +379,7 @@ impl Native {
         let target = probe.join("mount");
         if storage::mounted(&target)? {
             storage::verify_lower(&target, &probe.join("image.erofs"))?;
-            self.command("umount", vec!["--internal-only".into(), target.display().to_string()])?;
+            self.unmount(&target)?;
         }
         storage::remove_private(&probe)
     }
@@ -695,22 +726,11 @@ impl Native {
         // is disposable (a crash or delete removes it; a capture seals it from the page cache), so a
         // volatile overlay skips syncing it: otherwise unmounting it syncs the whole host filesystem
         // that holds it, waiting behind unrelated write-back.
-        let volatile = if self.volatile_overlay { ",volatile" } else { "" };
-        let options = format!("nodev,nosuid,lowerdir={},upperdir={},workdir={},index=off,metacopy=off,redirect_dir=off,xino=off", lowers.join(":"), private.join("upper").display(), private.join("work").display());
-        let mount = |suffix: &str| self.command("mount", vec!["--internal-only".into(), "-t".into(), "overlay".into(), "overlay".into(), "-o".into(),
-            format!("{options}{suffix}"), private.join("rootfs").display().to_string()]);
-        match mount(volatile) {
-            // Vendor kernels/backing filesystems may not support volatile despite the release number.
-            // Retry only an exited mount failure, after all helpers drained and no mount was created.
-            Err("tool_failed") if !volatile.is_empty() && !storage::mounted(&private.join("rootfs"))? => {
-                eprintln!("sandboxd: volatile overlay unavailable; retrying ordinary overlay");
-                mount("")?;
-            }
-            result => result?,
-        }
+        let options = crate::overlay::options(&lowers, &private.join("upper"), &private.join("work"), self.volatile_overlay)?;
+        // A later mount failure never changes the probed mode or retries a possibly poisoned workdir.
+        self.command("mount", vec!["--internal-only".into(), "-t".into(), "overlay".into(), "overlay".into(), "-o".into(),
+            format!("nodev,nosuid,{options}"), private.join("rootfs").display().to_string()])?;
         phases.mark("overlay_mount");
-        self.cgroup(request)?;
-        phases.mark("cgroup");
         self.prepare_network(id, &manifest.network, network_slot, phases)?;
         self.write_spec(request, manifest)?;
         if manifest.oci_config_sha256.as_ref().is_some_and(|d| self.spec_digest(id).as_ref() != Ok(d)) { return Err("oci_config_mismatch"); }
@@ -722,20 +742,10 @@ impl Native {
         phases.mark("ensure_running");
         Ok(())
     }
-    // Create the sandbox's resource group with its memory (no swap, whole-group OOM kill), process
-    // and CPU limits.
-    fn cgroup(&self, request: &SandboxSpec) -> Result<()> {
-        let p = Path::new(&self.config.cgroup_parent).join(&request.sandbox_id);
-        fs::create_dir(&p).map_err(|_| "cgroup_create_failed")?;
-        for (name, value) in [("memory.max", (request.memory_mib * 1048576).to_string()), ("memory.swap.max", "0".into()),
-            ("memory.oom.group", "1".into()), ("pids.max", self.config.pids_max.to_string()), ("cpu.max", format!("{} 100000", request.vcpus as u64 * 100000))] {
-            fs::write(p.join(name), value).map_err(|_| "cgroup_limit_failed")?;
-        }
-        Ok(())
-    }
     // Write the CRIU settings and the runc execution specification: the read-only reaping init running
     // the template's argv unprivileged, private namespaces (joining the prepared guest network
-    // namespace), minimal devices, resource limits, masked kernel paths and the syscall policy.
+    // namespace), minimal devices, masked paths and syscall policy. runc alone creates/configures the
+    // sandbox cgroup (v1.3.6 specconv/CreateCgroupConfig); equal OCI memory/swap limits mean no swap.
     fn write_spec(&self, request: &SandboxSpec, manifest: &Manifest) -> Result<()> {
         let private = self.private(&request.sandbox_id);
         // Request-specific CRIU options are worker-authored. Administrator-owned
@@ -761,7 +771,8 @@ impl Native {
                     {"path":"/dev/random","type":"c","major":1,"minor":8,"fileMode":438,"uid":0,"gid":0},
                     {"path":"/dev/urandom","type":"c","major":1,"minor":9,"fileMode":438,"uid":0,"gid":0}
                 ],
-                "resources": {"memory":{"limit":request.memory_mib * 1048576, "swap":request.memory_mib * 1048576},
+                "resources": {"unified":{"memory.oom.group":"1"},
+                    "memory":{"limit":request.memory_mib * 1048576, "swap":request.memory_mib * 1048576},
                     "cpu":{"quota":request.vcpus as u64 * 100000,"period":100000}, "pids":{"limit":self.config.pids_max},
                     "devices":[{"allow":false,"access":"rwm"},
                         {"allow":true,"type":"c","major":1,"minor":3,"access":"rw"},
@@ -852,8 +863,8 @@ impl Native {
             .map_err(|e| if e == "runc_deadline_or_output_limit" { "checkpoint_interrupted" } else { "checkpoint_failed" })
     }
     // Restore captured processes, including established TCP connections, external Unix sockets and
-    // file locks, into the prepared sandbox without replacing its resource groups; the caller confirms
-    // it is running. The image directory is only read. A failure logs CRIU's error lines.
+    // file locks, into a new target group. runc v1.3.6 criuApplyCgroups applies/sets OCI resources even
+    // with CRIU manage-cgroups=ignore; never reuse the captured source group. Images stay read-only.
     pub fn restore(&self, id: &str, images: &Path) -> Result<()> {
         // Same restore-only options as the AgentENV container backend, plus the network lock method.
         fs::write(self.private(id).join("criu.conf"), "allow-uprobes\nmntns-compat-mode\nnetwork-lock nftables\n").map_err(|_| "criu_config_failed")?;
@@ -946,7 +957,7 @@ impl Native {
         phases.mark("network_release");
         let private = self.private(id);
         let rootfs = private.join("rootfs");
-        if storage::mounted(&rootfs)? { self.command("umount", vec!["--internal-only".into(), rootfs.display().to_string()])?; }
+        if storage::mounted(&rootfs)? { self.unmount(&rootfs)?; }
         phases.mark("rootfs_umount");
         storage::remove_private(&private)?;
         phases.mark("private_remove");
@@ -964,7 +975,7 @@ impl Native {
             if storage::mounted(&entry.path())? {
                 storage::verify_lower(&entry.path(), &self.layer_image(&entry.file_name().to_string_lossy()))?;
                 self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner).remove(&entry.file_name().to_string_lossy().into_owned());
-                self.command("umount", vec!["--internal-only".into(), entry.path().display().to_string()])?;
+                self.unmount(&entry.path())?;
             }
         }
         Ok(())

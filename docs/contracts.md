@@ -180,11 +180,11 @@ run on a bounded operation pool. Capture follows the AgentENV container backend 
    by a host tracing/security agent), `syncfs` the overlay and build an EROFS image
    of the upper directory with `mkfs.erofs` (uncompressed; overlay whiteouts,
    opaque-directory xattrs, ownership, modes and other xattrs kept). Disposable
-   uppers use OverlayFS `volatile` on supported kernels: this sync detects prior
+   uppers use OverlayFS `volatile` when the startup backing-directory probe succeeds: this sync detects prior
    write-back errors without flushing the upper filesystem. The seal reads frozen
    files through the page cache; the sealed image is synced before publication.
-   An unsupported volatile mount is retried as an ordinary overlay, preserving
-   correctness but losing the bounded-write-back latency benefit.
+   Only an unsupported volatile startup probe selects ordinary overlays. Later mount
+   failures fail closed without retrying or reusing potentially poisoned upper/work state.
 3. `runc checkpoint --leave-running --tcp-established --ext-unix-sk --file-locks`,
    with `network-lock nftables` and `skip-in-flight` (plus `allow-uprobes` when step
    2 found uprobes) in the per-container CRIU config.
@@ -223,7 +223,9 @@ asks runc to restore into the new container ID from the node's shared checkpoint
 cache, with `--tcp-established --ext-unix-sk --file-locks --manage-cgroups-mode
 ignore` and restore-only `allow-uprobes`, `mntns-compat-mode` and `network-lock
 nftables` (the AgentENV restore options plus the lock method). Cgroup restoration
-uses runc's target cgroup setup, not source-cgroup adoption. Unlinked open files and
+uses runc's target cgroup setup, not source-cgroup adoption. Adding OCI whole-group
+OOM configuration changes the normalized spec digest: warm templates captured before
+that change must be recaptured; they are not silently restored with a different spec. Unlinked open files and
 broader runtime state may be rejected.
 
 **Established TCP.** Connections are dumped and restored in TCP repair mode. Every
@@ -274,7 +276,10 @@ no record. Results are never stored,
 so records hold only lifecycle metadata. Tombstones are bounded by `max_records` and
 retained; no automatic pruning can silently reopen an ID.
 
-Network policy and cgroup limits precede runc launch and restore. A slot index is
+Network policy precedes runc launch and restore. runc alone creates/configures each
+sandbox cgroup from OCI memory/swap/CPU/pids/device limits and
+`linux.resources.unified["memory.oom.group"] = "1"`, before workloads execute.
+Equal OCI memory/swap limits disable swap; cgroupfs is used, never systemd. A slot index is
 reserved in the durable record before network side effects. Router slots are
 pre-created per worker root (`slots/<index>` ownership directories, default-deny
 base rules) and reset, not deleted, when a sandbox is released; restart and shutdown
@@ -332,12 +337,16 @@ must restart the worker with the same root/config promptly to reconcile them.
 ## Qualification
 
 Read-only preflight checks tools/versions, UID/capabilities, advertised filesystems,
-namespace/seccomp interfaces, supported upper filesystem family and an existing
+namespace/seccomp interfaces, the private worker mount boundary and an existing
 empty delegated cgroup domain with cpu/memory/pids enabled. It does **not** write an
 xattr probe, run `criu check`, create a mount/namespace, enable a controller or prove
-runtime behavior. Worker startup separately mounts and reads a tiny EROFS image
-once to select file backing or loop fallback, then removes the probe; the cached
-worker preflight and status record that result. XFS ftype/xattr details, EROFS options, actual seccomp compatibility,
+runtime behavior. Under the root lock, before request threads, worker startup probes
+actual upper backing-directory d_type, user/trusted xattrs, ordinary overlay copy-up
+and hardlinks, volatile support and mount-data size. It also mounts/reads a tiny
+EROFS image to select file backing or loop fallback. Probes must clean up before
+readiness; interrupted owned probes are cleaned on restart. The cached worker
+preflight records `active_overlay_backing_features` and `overlay_volatile` (null in
+read-only CLI preflight), plus EROFS mode. Actual seccomp compatibility,
 restore cgroup placement and lifecycle/isolation/cleanup claims require the
 privileged gate. The static-fixture local gate passed, including independently
 overlapping commands, final worker admission, rejected template compatibility/digest/

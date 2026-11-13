@@ -102,7 +102,9 @@ and mounts; no_new_privs and cgroups remain in force.
    netlink request from a same-binary helper inside the slot, after it checks that
    no guest link remains), so the next sandbox inherits no rules, flows or NAT
    mappings. A slot that cannot be reset is deleted instead (its host link removal
-   is awaited) and rebuilt later. Finally the guest pin is dropped. Failures retain
+   is awaited) and rebuilt later. Finally the owned nsfs pin is really unmounted
+   (bounded EBUSY-only retry), then its file is removed. An open pin FD keeps cleanup
+   pending; `ip netns delete` and lazy detach are not success criteria. Failures retain
    the marker, files and reservation for retry; no broad flush or unrelated
    interface cleanup occurs.
 7. Restart drains root-specific helper cgroups before any namespace/private/staging
@@ -116,7 +118,10 @@ The worker's short coordinator and bounded I/O pool are unchanged. Different
 sandboxes overlap; one sandbox's create/capture/delete do not race, and capture
 waits for no command (it is refused while one runs). Caller cancellation does not
 orphan an accepted job or command. Each mutating host process and its descendants
-joins an exclusive restart-discoverable helper cgroup before exec. Proxied app
+joins an exclusive restart-discoverable helper cgroup before exec. Before threads
+start, the worker verifies the operator's pod-private mount boundary and locally
+privatizes the netns anchor; `ip` may share that anchor only beneath its private
+parent. It never changes host mount propagation. Proxied app
 traffic needs no host process: the worker itself holds the connection.
 
 ## Capture and established connections

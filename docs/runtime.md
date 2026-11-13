@@ -39,10 +39,16 @@ An operator must separately provision and approve:
   administrator system CRIU configuration; request options do not replace host trust.
   For the smoke: Python 3, a C compiler with static libc, `nsenter`, and sandboxd.
   No rootfs or tool downloads are performed by the smoke.
-- A new dedicated administrator-owned root on ext4/XFS/Btrfs with correct OverlayFS
-  d_type/xattr semantics; XFS needs ftype=1. All ancestors must be owned by UID 0,
+- A new dedicated administrator-owned root with actual OverlayFS d_type and
+  user/trusted-xattr support; XFS needs ftype=1. Startup tests the backing directory,
+  not a filesystem-family allowlist or kernel release. All ancestors must be owned by UID 0,
   not group/other writable and not symlinks. Give the root private permissions.
   Supply operator disk capacity/quota; the worker does not implement disk quotas.
+- An operator-provided **pod-private mount namespace**: the covering mounts of the
+  worker root and `/run` must be private (neither shared nor slave). Provide a trusted
+  `/run/netns` directory inside this boundary. Startup never changes `/` or a host
+  ancestor; it rejects unsafe propagation, locally privatizes existing netns anchors
+  before threads, and lets `ip` share that anchor only inside the private parent.
 - An **existing, exclusive cgroup-v2 domain parent**, not the cgroup filesystem root.
   It must have no processes in `cgroup.procs`; `cgroup.subtree_control` must already
   contain `cpu memory pids`, and cgroup.kill/swap accounting must be available.
@@ -54,7 +60,11 @@ An operator must separately provision and approve:
 Neither `preflight` nor startup enables controllers, creates the parent, changes
 host networking/firewall/sysctls, installs software, loads modules or invokes sudo.
 Read-only preflight is deliberately not an active CRIU/xattr/kernel capability test.
-Its filesystem-family and interface checks need this real gate afterward.
+Startup separately qualifies actual backing directories with bounded, tracked probes:
+ordinary overlay, d_type, user/trusted xattrs, copy-up/hardlinks, volatile support and
+mount-data length. Its cached preflight reports `active_overlay_backing_features`
+and `overlay_volatile`; read-only CLI preflight leaves the latter null. Real process
+checkpoint, restore, isolation and cleanup still require the gates below.
 
 ### Administrator-staged tools
 
@@ -67,8 +77,10 @@ clears inherited environment (including loader variables) and gives runc/CRIU a
 PATH assembled only from verified tool directories. Every required helper's first
 executable resolution in that exact PATH must match the verified executable map;
 shadowing (including a candidate rejected during discovery) fails preflight closed.
-The same validated PATH is used for runtime and storage commands. Mount/umount use internal-only
-mode rather than filesystem helpers. API callers never select a host executable.
+The same validated PATH is used for runtime and storage commands. Mount uses internal-only
+mode rather than filesystem helpers. Unmount uses a tracked internal syscall helper,
+with containerd-style EBUSY-only retry (50 attempts, 50 ms apart), the normal command
+deadline and no lazy detach; errors retain backing files and reservations. API callers never select a host executable.
 The service does not create/populate a tools directory or install dependencies.
 
 If an administrator explicitly stages installed binaries, verify each source is a
@@ -79,6 +91,23 @@ The approved functional run needed such staging because the system binary ancest
 were not trusted by preflight. Fixed `/bin/sh` executable ownership was checked,
 but shell ancestry and dynamic-library integrity were **not established**. Staging
 is not a hardened-host qualification; production use needs a trusted system too.
+
+### Cluster deployment boundary
+
+Use the pod's private mount namespace, not the node's host mount namespace; do not
+use bidirectional/host-to-container propagation for the worker root or `/run`.
+Provision `/run/netns` in that pod namespace and retain the namespace across worker
+process restarts so reconciliation can see old pins/mounts. If the inherited mounts
+are shared, an operator entrypoint may make them private **inside the pod only**
+before launching the worker. Startup validates this instead of changing node mounts.
+The local gates use a disposable outer mount/network namespace for the same reason.
+
+Delegate one empty cgroup-v2 parent to the worker; run the worker outside it. runc's
+cgroupfs driver alone creates/configures sandbox children, including CRIU restore
+with manage-cgroups ignore. The worker retains helper and exec children, whole-tree
+kill and orphan cleanup. No in-pod systemd service is required. This change adds no
+conmon/CNI binary or package prerequisite; those are separate integrations. Root/tool
+trust and the existing verified-tool list remain unchanged.
 
 ## Bounded command plan
 
@@ -109,10 +138,16 @@ slower, which mainly shows in the first cold create of a large base).
 
 The script refuses without both opt-in and UID 0. It creates a unique owned session
 root under the already trusted directory and writes temporary configurations with
-random environment-only credentials. It runs read-only preflight before any runtime
-mutation; missing prerequisites abort. It builds an original static C fixture,
+random environment-only credentials. It checks mount-inventory decoding and shared-boundary rejection with a small owned
+temporary mount, then runs read-only preflight before workload launch; missing
+prerequisites abort. It builds an original static C fixture,
 creates a small EROFS image locally, publishes a digest-bound cold manifest, and
 starts real worker/controller processes on ephemeral loopback ports.
+
+Run this gate in an operator-prepared disposable outer mount/network namespace
+with private propagation and a namespace-local `/run/netns`; do not make `/` private
+in the host namespace to satisfy preflight. The network and image wrappers create
+their own disposable outer namespace.
 
 Hard validation budgets are **at most three simultaneously admitted containers,
 64 MiB, one vCPU quota and 64 pids each**; worker aggregate reservation cap 192 MiB,
@@ -153,7 +188,8 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    with cleanup frozen, a second DELETE waits and both return `deleted`; and a DELETE
    whose root unmount is blocked by a test-owned open file reports `cleanup_failed`,
    keeps the reservation and ownership marker, and is retried to `deleted` once the
-   file is closed (a test-owned FD on the guest namespace does not block it).
+   file is closed. A test-owned guest namespace FD likewise keeps its pin mounted
+   and cleanup reserved until closed; veth removal and slot reset happen first.
 2. Private write/copy-up and lower whiteout isolation between two cold sandboxes.
 3. Distinct PID/mount/network namespaces from each other and the host, only loopback
    in the sandbox, UID/GID 65534, empty effective caps, no_new_privs and an active
@@ -230,7 +266,10 @@ One capture source plus the batch means at most 33 live fixture containers. Each
 batch is deleted concurrently. Optional `--oci-layout` adds a Python image at
 128 MiB: `--image-concurrency` defaults to 2 plus its source (at most three live
 images); larger image batches need separate approval. The approved local bound is
-an owned cgroup with 4 GiB and 4096 pids. Every create/delete must succeed first try,
+an owned cgroup with 4 GiB and 4096 pids. `--fixture-concurrency 2` instead runs one-wide
+cold/warm and two-wide mixed/network/distinct-lower batches, with at most three live
+containers including the source. Use this bounded variant when approval is limited
+to three containers; it is not evidence for the default 32-wide gate. Every create/delete must succeed first try,
 with no host-tool failure and no leftovers. The gate checks histogram bounds and
 authentication, profiles per-phase times and measures 16-byte/1-MiB replies directly
 in the routing slot, through the worker and through the controller. These are
@@ -301,7 +340,7 @@ a command-thread/snapshot race that could return `running` for a cancelled exec.
 Every admitted lifecycle job or exec emits one `sandboxd: phases {…}` line with
 operation, sandbox ID, result, total milliseconds and completed phase durations.
 Create/restore separates admission wait, manifest, layer verification, lower and
-overlay mounts, cgroup, guest/slot network, OCI spec, runc and running verification.
+overlay mounts, guest/slot network, OCI spec, runc (including cgroup setup) and running verification.
 `first_ready` is elapsed time to the running result, not application readiness;
 uncompleted steps are recorded as `failed_step` before recovery or cleanup, not
 charged to `kill`. Capture records thaw/running checks as `recovery`. Capture and
@@ -311,10 +350,29 @@ carries the bounded cumulative histograms described in [api.md](api.md).
 CPU checks run off the admission coordinator, with bounded queues and definitive
 answers cached; transient failures are retried. Older manifests containing
 `compatibility.cpu_features_sha256` must be republished (strict parsing rejects
-them). Runtime overlays prefer `volatile`, falling back to ordinary overlays if
-unsupported. Capture still freezes and seals matching files/processes and syncs
+them). Runtime overlays use the startup-probed `volatile` mode; only EINVAL or
+EOPNOTSUPP from that tiny probe selects ordinary overlays, after an ordinary mount
+already succeeded. Permission/I/O/helper errors fail startup; later failed mounts
+never change mode or reuse a volatile work directory. Capture still freezes and seals matching files/processes and syncs
 the published layer. Lazy pages are not shipped: small-image experiments are not
 proof of reliable page-server ownership and restore under sustained load.
+
+### Mount and filesystem qualification
+
+Mountinfo paths are decoded as bytes, including octal escapes and non-UTF-8 names;
+optional propagation fields are parsed separately. EROFS reuse checks source and
+flags; namespace-pin removal checks nsfs ownership and unmounts without ip's lazy
+DELETE. Busy teardown retains reservation until a real unmount succeeds. The local
+runtime gate includes escaped mount paths, transient and persistent busy holders,
+all OCI limits on cold/restored groups, and sealed hardlink identity. With `index=off`,
+a lower hardlink pair may split on copy-up; with `xino=off`, inode/device numbers are
+not generally stable. The gate records this behavior rather than changing options
+or promising arbitrary file-identity compatibility.
+
+Behavioral references: runc v1.3.6 `specconv/CreateCgroupConfig`, `criuApplyCgroups`
+and `rootfsParentMountPrivate`; containerd v2.2.0 `core/mount/mount_unix.go` and overlay
+`NewSnapshotter`; Moby mountinfo v0.7.2; containers/storage v1.57.0 `checkSupportVolatile`.
+These small integrations do not import a runtime service or third-party source tree.
 
 ## Failure and cleanup procedure
 
@@ -410,8 +468,8 @@ exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
 socket creation, capture of a sandbox holding an established external TCP
 connection and restore of a child from it, source and child restored listening
 sockets/fresh egress, the pre-created slot pool (built at start, reset rather than
-deleted on release even while a test-owned FD holds the guest namespace, rebuilt on
-restart, removed at shutdown), cleanup retry after a held root mount is released,
+deleted on release even while a test-owned FD holds the guest namespace; the pin's
+real unmount waits for that FD; rebuilt on restart and removed at shutdown), cleanup retry after a held root mount is released,
 and the app proxy through the controller and worker: path and host forms, the
 management token absent from the forwarded request, Host and X-Forwarded-Host,
 authentication, an unapproved port (`403`), a returned redirect, a 20,000-byte

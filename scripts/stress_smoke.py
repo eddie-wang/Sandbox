@@ -64,8 +64,10 @@ print(json.dumps(dict(times=times, bytes=len(body))))
 """
 
 
-# Parse the gate's options and require explicit privileged opt-in.
+# Parse explicit privileged opt-in and optional two-wide fixture batches (at most three live guests).
+# Keep the default wider gate unchanged; small runs must not be reported as full stress qualification.
 def parse_args():
+    global BATCH, WIDE, MAX_SANDBOXES
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
     parser.add_argument("--binary", default="target/release/sandboxd")
@@ -73,12 +75,18 @@ def parse_args():
     parser.add_argument("--cgroup-parent", required=True, help="Existing empty delegated domain; cpu memory pids already enabled")
     parser.add_argument("--tools-dir", help="Optional existing administrator-staged trusted tool directory")
     parser.add_argument("--oci-layout", help="Optional OCI image layout of a Python image (for example python:3.12-slim) for the real-image batches")
+    parser.add_argument("--fixture-concurrency", type=int, choices=(2, 32), default=32,
+                        help="Largest fixture batch; 2 limits every fixture batch plus its source to three containers")
     parser.add_argument("--image-concurrency", type=int, choices=range(1, 33), default=2,
                         help="Real-image batch width, plus one source; default 2 keeps at most three live images")
     parser.add_argument("--platform", default="linux/" + {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine, os.uname().machine))
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--session", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.fixture_concurrency == 2:
+        BATCH, WIDE, MAX_SANDBOXES = 1, 2, 3
+        if args.image_concurrency > 2:
+            parser.error("two-wide fixture mode also bounds image batches to two plus their source")
     if not args.allow_privileged_runtime or os.geteuid() != 0:
         parser.error("requires explicit opt-in and administrator execution on an approved host")
     if not str(Path(args.cgroup_parent).resolve()).startswith("/sys/fs/cgroup/"):
@@ -88,7 +96,7 @@ def parse_args():
 
 # Outer phase: build the fixture (and image) layers in the host namespace, run the batches in a
 # disposable network/mount namespace and require the default namespace inventory to be unchanged.
-# Also build 32 distinct small bases for the lower-mount regression batch.
+# Also build one distinct small base per member of the largest lower-mount regression batch.
 def outer(args):
     session = Path(tempfile.mkdtemp(prefix="stress-", dir=Path(args.root).resolve(strict=True)))
     session.chmod(0o700)
@@ -162,7 +170,7 @@ def summary(values, digits=3):
 # Set up a worker and controller in the session root, run the create/restore/delete bursts and the
 # hop measurement, and require zero errors, no failed host tool, phase histograms in worker status,
 # no owned mounts or cgroups afterwards and no credentials in the logs. Check mount sources and
-# loop backing counts before and after the full-concurrency distinct-lower batch.
+# loop backing counts before/after the configured-width distinct-lower batch (two or 32).
 def lifecycle(args, root):
     prepared = json.loads((root / "stress-prepared.json").read_text())
 
@@ -293,9 +301,9 @@ url = "http://127.0.0.1:{worker_port}"
             profile[kind] = {name: summary(values, 2) for name, values in steps.items()}
         return profile
 
-    # Start every create of a batch at the same moment, then delete them all at once. Record error
-    # counts, timings and the step profile and return whether the batch was clean; every batch runs
-    # even after a failed one, so the gate reports all of them.
+    # Create/delete a batch concurrently without request retries and report every error and timing.
+    # In three-container mode, wait for advisory deletion usage to catch up between batches:
+    # unlike the default gate there are no spare slots to absorb a stale controller snapshot.
     def burst(name, templates):
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(templates)) as pool:
             created = list(pool.map(create_once, templates))
@@ -315,6 +323,10 @@ url = "http://127.0.0.1:{worker_port}"
         clean = not errors and len(running) == len(templates)
         for sandbox in running:
             clean &= not (root / "private" / sandbox).exists() and not (cgroup / sandbox).exists() and not (root / "runc" / sandbox).exists()
+        if MAX_SANDBOXES == 3 and clean:
+            remaining = expect(request(worker_port, "/v1/status", worker_token), 200)["usage"]["sandboxes"]
+            eventually(lambda: expect(request(controller_port, "/v1/status", token), 200)["nodes"][0]["status"]["usage"]["sandboxes"] == remaining,
+                       timeout=15)
         return clean
 
     # GET an app path of a sandbox through the controller's path-form proxy.
@@ -367,8 +379,8 @@ url = "http://127.0.0.1:{worker_port}"
         clean["mixed"] = burst("mixed", ["fixture", "warm"] * BATCH)
         assert delete_once(source)["error"] is None
         source = capture("fixture-net", "warm-net", FIXTURE_PORT, "/sized/16/97")
-        clean["cold-net-32"] = burst("cold-net-32", ["fixture-net"] * WIDE)
-        clean["warm-net-32"] = burst("warm-net-32", ["warm-net"] * WIDE)
+        clean["cold-net"] = burst(f"cold-net-{WIDE}", ["fixture-net"] * WIDE)
+        clean["warm-net"] = burst(f"warm-net-{WIDE}", ["warm-net"] * WIDE)
         assert delete_once(source)["error"] is None
         if "image" in prepared:
             source = capture("image", "image-warm", IMAGE_PORT)
@@ -388,10 +400,10 @@ url = "http://127.0.0.1:{worker_port}"
         print("HOPS " + json.dumps(observations["hops"]), flush=True)
         assert delete_once(bench["sandbox"])["error"] is None
         observations["erofs_before_distinct"] = erofs_observation(root, expect(request(worker_port, "/v1/status", worker_token), 200)["erofs"])
-        assert burst("distinct-lowers-32", [f"distinct-{index}" for index in range(WIDE)]), "distinct EROFS lower mounts failed"
+        assert burst(f"distinct-lowers-{WIDE}", [f"distinct-{index}" for index in range(WIDE)]), "distinct EROFS lower mounts failed"
         observations["erofs_after_distinct"] = erofs_observation(root, expect(request(worker_port, "/v1/status", worker_token), 200)["erofs"])
-        assert len(observations["erofs_after_distinct"]["lower_sources"]) - len(observations["erofs_before_distinct"]["lower_sources"]) == 32
-        print("PASS 32 distinct EROFS bases mounted for simultaneous first-use creates; backing counts " + json.dumps(observations["erofs_after_distinct"]), flush=True)
+        assert len(observations["erofs_after_distinct"]["lower_sources"]) - len(observations["erofs_before_distinct"]["lower_sources"]) == WIDE
+        print(f"PASS {WIDE} distinct EROFS bases mounted for simultaneous first-use creates; backing counts " + json.dumps(observations["erofs_after_distinct"]), flush=True)
         status = expect(request(worker_port, "/v1/status", worker_token, timeout=4), 200)
         assert all(status["phases"].get(f"{op}.total", {}).get("count", 0) > 0 for op in ("create", "restore", "delete", "capture")), sorted(status["phases"])
         assert 0 < len(status["phases"]) <= 160

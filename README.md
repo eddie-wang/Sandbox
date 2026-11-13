@@ -164,10 +164,18 @@ RBAC, built-in TLS or Internet-facing connection defense.
   exec trampoline rather than copying the worker's address space. Network setup
   batches ip commands without copying the mount namespace. A bounded connector
   pool makes proxy sockets; guest connections are still never reused.
-- Disposable sandbox overlays use `volatile` where supported, falling back to an
-  ordinary overlay on mount refusal. Capture seals frozen cached files and durably
-  publishes the sealed layer; checkpoint-cache sync touches only extracted files.
+- Startup actively probes the upper backing directory for directory-entry types,
+  required xattrs, copy-up/hardlinks and ordinary/volatile overlay mounts. It caches
+  volatile support, bounds mount-data length and never retries a later failed mount
+  with weaker options. Capture seals frozen cached files and durably publishes the
+  sealed layer; checkpoint-cache sync touches only extracted files.
   Lazy-page restore is not enabled or supported.
+- runc alone creates/configures sandbox cgroups from OCI memory/swap/CPU/pids and
+  whole-group OOM limits, including restored copies; helpers and per-exec groups
+  remain worker-owned. The driver is cgroupfs, not systemd.
+- Worker startup verifies pod-private mount propagation before threads start.
+  Mount inventory decodes escaped paths and propagation fields; overlay/lower and
+  netns-pin teardown retries only busy unmounts, never lazy-detaches as success.
 - Deletion kills the owned cgroup, deletes runc state, unmounts only the private
   overlay and removes private files. Failed cleanup remains reserved and
   retryable. Restart terminates/reconciles prior workloads rather than adopting

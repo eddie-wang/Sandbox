@@ -280,22 +280,19 @@ pub fn sync_tree(root: &Path) -> Result<()> {
 // Check mount inventory for a mount at or beneath the supplied path, failing if the inventory cannot
 // be read.
 pub fn mounted(path: &Path) -> Result<bool> {
-    let text = fs::read_to_string("/proc/self/mountinfo").map_err(|_| "mountinfo_unavailable")?;
-    let target = path.to_str().ok_or("invalid_mount_path")?;
-    // Configured roots and generated names exclude whitespace and mountinfo escapes.
-    Ok(text.lines().any(|l| l.split_whitespace().nth(4).is_some_and(|p| p == target || p.starts_with(&format!("{target}/")))))
+    Ok(crate::mounts::inventory()?.iter().any(|m| m.point.starts_with(path)))
 }
 
 // Require an EROFS mount with read-only, nodev and nosuid flags and the expected image: either a
 // direct file source or a loop device whose backing file matches. Both forms survive reconciliation.
 pub fn verify_lower(path: &Path, image: &Path) -> Result<()> {
-    let text = fs::read_to_string("/proc/self/mountinfo").map_err(|_| "mountinfo_unavailable")?;
-    let target = path.to_str().ok_or("invalid_mount_path")?;
-    let fields: Vec<_> = text.lines().find(|l| l.split_whitespace().nth(4) == Some(target)).ok_or("lower_not_mounted")?.split_whitespace().collect();
-    let separator = fields.iter().position(|f| *f == "-").ok_or("invalid_mountinfo")?;
-    if fields.get(separator + 1) != Some(&"erofs") || !["ro", "nodev", "nosuid"].iter().all(|v| fields[5].split(',').any(|f| f == *v)) { return Err("unexpected_lower_mount"); }
-    if fields.get(separator + 2).copied() == image.to_str() { return Ok(()); }
-    let backing = fs::read_to_string(format!("/sys/dev/block/{}/loop/backing_file", fields[2])).map_err(|_| "unexpected_lower_device")?;
+    let mounts = crate::mounts::inventory()?;
+    let mut matching = mounts.iter().filter(|m| m.point == path);
+    let mount = matching.next().ok_or("lower_not_mounted")?;
+    if matching.next().is_some() || mount.filesystem != "erofs"
+        || !["ro", "nodev", "nosuid"].iter().all(|v| mount.options.iter().any(|o| o == v)) { return Err("unexpected_lower_mount"); }
+    if mount.source == image { return Ok(()); }
+    let backing = fs::read_to_string(format!("/sys/dev/block/{}/loop/backing_file", mount.device)).map_err(|_| "unexpected_lower_device")?;
     let backing = backing.trim();
     if backing != image.to_str().ok_or("invalid_image_path")? && format!("/{backing}") != image.display().to_string() { return Err("unexpected_lower_image"); }
     Ok(())

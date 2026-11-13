@@ -231,16 +231,10 @@ async fn status(State(handle): State<Handle>) -> Result<Json<crate::model::Worke
     Ok(Json(status))
 }
 
-// Initialize preflight and lifecycle ownership away from request handling, then serve protected
-// management routes and the path-form app proxy; accepted connections send without Nagle delay. On a
-// termination signal, stop admission and cancel live work, finish serving, then wait for engine-owned
-// cleanup before returning.
-pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str> {
+// Serve protected management and app routes using ownership established before request threads.
+// On termination stop admission, cancel live work, finish serving and wait for owned cleanup.
+pub async fn run(config: WorkerConfig, token: String, handle: Handle) -> Result<(), &'static str> {
     let server = config.server.clone();
-    let handle = tokio::task::spawn_blocking(move || {
-        let report = crate::native::preflight(config.native.as_ref());
-        Handle::start(&config, report)
-    }).await.map_err(|_| "runtime_initialization_failed")??;
     let router = Router::new()
         .route("/healthz", get(|| async { Json(Health { service: "worker", live: true }) }))
         .route("/v1/status", get(status))
