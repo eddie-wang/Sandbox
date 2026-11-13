@@ -28,9 +28,11 @@ pub struct OperationDeadlines {
     pub margin_ms: u64,
 }
 impl Default for OperationDeadlines {
+    // Use default outcome waits: two minutes for create and delete, five for capture, 30 s margin.
     fn default() -> Self { Self { create_ms: 120_000, capture_ms: 300_000, delete_ms: 120_000, margin_ms: 30_000 } }
 }
 impl OperationDeadlines {
+    // Check that each outcome wait and the exec/HTTP margin are within their allowed ranges.
     fn valid(&self) -> bool {
         (1_000..=1_800_000).contains(&self.create_ms) && (1_000..=3_600_000).contains(&self.capture_ms)
             && (1_000..=1_800_000).contains(&self.delete_ms) && (1_000..=300_000).contains(&self.margin_ms)
@@ -49,6 +51,7 @@ impl Default for ApplicationHttpLimits {
     fn default() -> Self { Self { max_body_bytes: 8192, max_response_bytes: 65536, max_timeout_ms: 30000 } }
 }
 impl ApplicationHttpLimits {
+    // Check the configured application HTTP body, response and deadline ceilings against hard bounds.
     fn valid(&self) -> bool {
         (1..=16384).contains(&self.max_body_bytes) && (1..=8388608).contains(&self.max_response_bytes)
             && (1..=600000).contains(&self.max_timeout_ms)
@@ -70,8 +73,8 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    // Reject out-of-range request limits or an enlarged application body without enough JSON envelope
-    // space.
+    // Reject out-of-range request limits, application HTTP ceilings or outcome waits, or an enlarged
+    // application body without enough JSON envelope space.
     fn validate(&self) -> Result<(), &'static str> {
         if !(1..=1_024).contains(&self.max_in_flight)
             || !(100..=30_000).contains(&self.request_timeout_ms)
@@ -97,7 +100,8 @@ impl ServerConfig {
         Duration::from_millis(self.request_timeout_ms)
     }
 
-    // Longest outcome wait of a route. Short routes use only request_timeout_ms.
+    // Return the longest outcome wait of a blocking route (create, delete, exec, HTTP, capture), or
+    // nothing for short routes, which use only request_timeout_ms.
     pub fn route_wait(&self, method: &axum::http::Method, path: &str) -> Option<Duration> {
         use axum::http::Method;
         let d = &self.operation_deadlines;
@@ -281,6 +285,7 @@ impl NetworkConfig {
     }
 }
 
+// Use 16 parallel operation workers unless configured.
 fn default_concurrent_operations() -> usize { 16 }
 
 impl NativeConfig {
@@ -309,8 +314,9 @@ impl NativeConfig {
 }
 
 impl WorkerConfig {
-    // Validate worker identity, capacity and runtime settings. Require HTTP result reservations, network
-    // slots and restore concurrency to fit their enclosing budgets.
+    // Validate server limits, worker identity, capacity and native runtime settings, and require exactly
+    // one runtime. Require network slots to cover sandbox capacity and restore slots to fit the
+    // operation pool.
     pub fn validate(&self) -> Result<(), &'static str> {
         self.server.validate()?;
         if !valid_id(&self.node_id) || !self.capacity.valid() {

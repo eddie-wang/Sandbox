@@ -76,6 +76,8 @@ def eventually(check, timeout=5):
 class RoutingDouble:
     """Worker-protocol double for controller placement/routing only. Not a runtime."""
 
+    # Start a loopback HTTP server that answers worker status, create, get, exec and delete calls for
+    # one node ID. The mode selects accept, busy, drop, template, fail or hang behavior for creates.
     def __init__(self, node_id, token):
         self.node_id, self.token = node_id, token
         self.mode, self.ready, self.peer_closed = "accept", True, False
@@ -84,9 +86,11 @@ class RoutingDouble:
         double = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Suppress routine request logging from the routing double.
             def log_message(self, *args):
                 pass
 
+            # Send a JSON response with the given status.
             def reply(self, status, body):
                 data = json.dumps(body).encode()
                 self.send_response(status)
@@ -95,6 +99,8 @@ class RoutingDouble:
                 self.end_headers()
                 self.wfile.write(data)
 
+            # Check the worker token and answer one routing call from the double's records and mode. In
+            # hang mode, hold a create open until the controller closes its connection.
             def handle_any(self, method):
                 if self.headers.get("Authorization") != "Bearer " + double.token:
                     return self.reply(401, {"error": {"code": "unauthorized", "message": "test double"}})
@@ -150,12 +156,15 @@ class RoutingDouble:
                         return self.reply(200, dict(exit_code=0, stdout=double.node_id, stderr="", interrupted=False, error=None, sandbox_state="running"))
                     return self.reply(404, {"error": {"code": "not_found", "message": "test double"}})
 
+            # Handle a GET request.
             def do_GET(self):
                 self.handle_any("GET")
 
+            # Handle a POST request.
             def do_POST(self):
                 self.handle_any("POST")
 
+            # Handle a DELETE request.
             def do_DELETE(self):
                 self.handle_any("DELETE")
 
@@ -164,11 +173,14 @@ class RoutingDouble:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
+    # Stop the double's HTTP server and release its port.
     def close(self):
         self.server.shutdown()
         self.server.server_close()
 
 
+# Return a worker configuration with no native runtime for the given port, node ID, concurrency limit
+# and request deadline.
 def worker_config(port_number, node="node-a", limit=32, timeout=800):
     return f'''node_id = "{node}"
 runtimes = ["runc_criu"]
@@ -188,8 +200,8 @@ max_concurrent_restores = 2
 
 
 # Launch local services and check authentication, input bounds, fail-closed readiness and stale-owner
-# routing. Exercise overload and shutdown without containers; clean up processes and check logs for
-# leaked tokens.
+# routing. Check controller placement, ID routing and failover against routing doubles, and overload
+# and shutdown, all without containers; clean up processes and check logs for leaked tokens.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/sandboxd")
@@ -452,14 +464,17 @@ command_timeout_seconds = 10
                 placing = start("controller", placing_text)
                 eventually(lambda: request(placing_port, "/healthz")[0] == 200)
 
+                # Return the placement controller's worker observations indexed by node ID.
                 def placed_nodes():
                     status = expect(request(placing_port, "/v1/status", controller_token), 200)
                     return {n["node_id"]: n for n in status["nodes"]}
 
+                # Wait until both doubles are fresh with the expected sandbox counts and readiness.
                 def settle(expected):
                     eventually(lambda: all(n["fresh"] and n["status"]["usage"]["sandboxes"] == expected[k] and n["status"]["admission_ready"] == doubles[i].ready
                                            for i, (k, n) in enumerate(sorted(placed_nodes().items()))), timeout=5)
 
+                # Create through the placement controller, require the given status and return the body.
                 def place(code=201):
                     status, body = request(placing_port, "/v1/sandboxes", controller_token, spec, "POST")
                     assert status == code, f"expected HTTP {code}, got {status}: {body}"

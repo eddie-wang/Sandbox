@@ -363,11 +363,10 @@ class Rootfs:
                 self.metadata(path, member)
 
 
-# Same as AgentENV's fresh-rootfs preparation (resolv.conf replaced, a localhost
-# /etc/hosts when the image has none). Images often ship a build-time resolv.conf
-# (or a symlink into a runtime directory) and no /etc/hosts. Sandboxes have no DNS
-# resolver, so lookups go to loopback and fail fast instead of waiting on blocked
-# egress; localhost resolves from files.
+# Replaces the image's resolv.conf (often a build-time file or symlink) with a
+# loopback-only one and adds a localhost /etc/hosts when it is missing, empty or a
+# symlink, as AgentENV's fresh-rootfs preparation does. Sandboxes have no DNS, so
+# lookups fail fast at loopback instead of waiting on blocked egress.
 def prepare_resolver(rootfs):
     etc = rootfs.directory(["etc"])
     resolv = os.path.join(etc, "resolv.conf")
@@ -597,7 +596,8 @@ url = "http://127.0.0.1:{worker_port}"
         return expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, timeout=4), 200)
 
     # Blocking create through the controller. Only a definitive no_capacity
-    # (advisory usage lag) is retried; a transport error never is.
+    # (advisory usage lag) is retried; a transport error never is. Returns the
+    # running sandbox ID and the elapsed seconds.
     def create(template_id):
         deadline = time.monotonic() + 30
         started = time.monotonic()
@@ -767,7 +767,7 @@ url = "http://127.0.0.1:{worker_port}"
     print("IMAGE E2E PASSED on this host only; not a capacity, isolation or performance qualification")
 
 
-# Dispatches to the outer or inner phase.
+# Dispatches to fetch-only mode, the outer phase or the inner phase.
 def main():
     args = parse_args()
     if args.fetch_only:

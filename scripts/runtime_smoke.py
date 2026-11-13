@@ -64,6 +64,10 @@ def write_template(root, manifest):
     return template
 
 
+# Run the privileged lifecycle gate on this host: build the fixture template, start a real worker and
+# controller, and drive cold create, exec, rejections, disconnects, capture, warm restore, bounds, TTL
+# and worker-restart cleanup through the blocking API. With --network, also check policy networking
+# and application HTTP. Retain the root and observations, then require no owned state to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-privileged-runtime", action="store_true")
@@ -74,6 +78,7 @@ def main():
     parser.add_argument("--cgroup-parent", required=True, help="Existing empty delegated domain; cpu memory pids already enabled")
     parser.add_argument("--tools-dir", help="Optional existing administrator-staged trusted tool directory")
     args = parser.parse_args()
+    # Send a management request with a long default client deadline.
     def request(*call, timeout=None, **named):
         # Blocking calls wait for real outcomes; the client deadline exceeds the
         # services' route deadlines so their own timeout errors are observable.
@@ -212,15 +217,20 @@ url = "http://127.0.0.1:{worker_port}"
         eventually(lambda: request(worker_port if role == "worker" else controller_port, "/healthz", timeout=4)[0] == 200, timeout=15)
         return proc
 
+    # Wait until the controller reports a fresh observation of the worker.
     def fresh():
         eventually(lambda: expect(request(controller_port, "/v1/status", token, timeout=4), 200)["nodes"][0]["fresh"], timeout=15)
 
+    # Return the controller's current view of a sandbox.
     def get(sandbox):
         return expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, timeout=4), 200)
 
+    # Require that the sandbox's private directory, cgroup and runc state are all gone.
     def gone(sandbox):
         assert not (root / "private" / sandbox).exists() and not (cgroup / sandbox).exists() and not (root / "runc" / sandbox).exists()
 
+    # Send one create through the controller, remember any returned sandbox ID for cleanup and return
+    # the status and body.
     def create_call(body):
         # Only definitive "no capacity" (advisory usage lag) is retried. A transport
         # error is never retried: it could create a second sandbox.
@@ -234,6 +244,8 @@ url = "http://127.0.0.1:{worker_port}"
                 ids.append(payload["sandbox_id"])
             return code, payload
 
+    # Create a running sandbox through the controller and record its create time. Check that a direct
+    # worker retry with the same ID is idempotent and a changed reuse is rejected; return the ID.
     def create(template_id="fixture", ttl=120, **resources):
         body = dict(template_id=template_id, ttl_seconds=ttl, **resources)
         started = time.monotonic()
@@ -247,6 +259,7 @@ url = "http://127.0.0.1:{worker_port}"
         expect(request(worker_port, "/v1/sandboxes", worker_token, dict(body, sandbox_id=sandbox, ttl_seconds=ttl + 1), "POST"), 409, "idempotency_conflict")
         return sandbox
 
+    # Run a command through the controller and return the raw status and result.
     def exec_call(sandbox, argv, timeout_ms=3000, max_output_bytes=8192):
         return request(controller_port, f"/v1/sandboxes/{sandbox}/exec", token, dict(argv=argv, timeout_ms=timeout_ms, max_output_bytes=max_output_bytes), "POST")
 
@@ -256,12 +269,15 @@ url = "http://127.0.0.1:{worker_port}"
         assert result["exit_code"] == 0 and not result["interrupted"] and result["error"] is None and result["sandbox_state"] == "running", result
         return result["stdout"]
 
+    # Make an application HTTP call through the controller and return the raw status and result.
     def http_call(sandbox, body):
         return request(controller_port, f"/v1/sandboxes/{sandbox}/http", token, body, "POST")
 
+    # Ask the controller to capture a sandbox as a template and return the raw status and result.
     def capture(sandbox, template_id):
         return request(controller_port, f"/v1/sandboxes/{sandbox}/capture", token, dict(template_id=template_id, runtime="runc_criu"), "POST")
 
+    # Copy the first 64 KiB of each CRIU log of a sandbox into a private diagnostics directory.
     def diagnostics(sandbox, label):
         # The known generic fixture has no workload credentials. Retain bounded,
         # private CRIU diagnostics before cleanup removes them.
@@ -274,6 +290,8 @@ url = "http://127.0.0.1:{worker_port}"
             target.write_bytes(data)
             target.chmod(0o600)
 
+    # Capture a sandbox, saving CRIU logs on failure, and require success with the source still running
+    # and the template published.
     def captured(sandbox, template_id):
         code, result = capture(sandbox, template_id)
         if code != 200:
@@ -282,23 +300,26 @@ url = "http://127.0.0.1:{worker_port}"
         assert len(result["generation"]) == 32 and (root / "templates" / template_id / "manifest.json").exists()
         return result
 
-    # Request deletion, wait for the deleted state and verify private files and the sandbox resource group
-    # are gone.
+    # Delete through the controller, require the blocking reply to report deleted and verify private
+    # files, runc state and the sandbox resource group are gone.
     def remove(sandbox):
         result = expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, method="DELETE"), 200)
         assert result["state"] == "deleted"
         gone(sandbox)
 
+    # Start a call on a background thread and return the thread and a box that receives its result.
     def in_background(call):
         box = {}
         thread = threading.Thread(target=lambda: box.setdefault("result", call()), daemon=True)
         thread.start()
         return thread, box
 
+    # Report whether a command is currently running in the sandbox's exec cgroup.
     def exec_cgroup_populated(sandbox):
         events = cgroup / sandbox / "exec" / "cgroup.events"
         return events.exists() and "populated 1" in events.read_text()
 
+    # Send a raw exec request to the controller and close the connection once the command is running.
     def disconnect_mid_exec(sandbox, body):
         # Send a complete request, wait until the command is really running, then
         # close the client connection without reading the response.
@@ -308,6 +329,7 @@ url = "http://127.0.0.1:{worker_port}"
                          f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode() + data)
             eventually(lambda: exec_cgroup_populated(sandbox), timeout=10)
 
+    # Kill the worker abruptly, start a new one on the same root and wait for a fresh observation.
     def kill_and_restart_worker():
         nonlocal worker
         worker.kill()
@@ -458,9 +480,9 @@ url = "http://127.0.0.1:{worker_port}"
         # Examine links only inside owned netns; never change interfaces/rules.
         links = subprocess.run(["nsenter", "-t", str(a), "-n", "ip", "-j", "link", "show"], check=True, capture_output=True, timeout=5)
         assert sorted(link["ifname"] for link in json.loads(links.stdout)) == (["eth0", "lo"] if args.network else ["lo"])
-        # Inspect owned network state and exercise allowed/denied TCP, path-MTU discovery and application
-        # HTTP. Optionally check malformed and bounded HTTP failures while requiring the sandbox to remain
-        # running.
+        # Record owned network state and exercise allowed/denied TCP, path-MTU discovery and application
+        # HTTP. With full, also check authentication, invalid and unapproved requests and bounded HTTP
+        # failures while requiring the sandbox to remain running. Return True.
         def network_gate(sandbox, full=False):
             config_json = json.loads((root / "private" / sandbox / "config.json").read_text())
             guest = Path(config_json["linux"]["namespaces"][2]["path"]).name

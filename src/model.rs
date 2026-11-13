@@ -76,6 +76,7 @@ impl WorkerStatus {
     }
 }
 
+// Accept omitted resources, or memory and CPU counts within the supported ranges.
 fn valid_resources(memory_mib: Option<u64>, vcpus: Option<u32>) -> bool {
     memory_mib.is_none_or(|m| (1..=1_048_576).contains(&m)) && vcpus.is_none_or(|v| (1..=4_096).contains(&v))
 }
@@ -94,9 +95,11 @@ pub struct CreateSpec {
 }
 
 impl CreateSpec {
+    // Check the template ID, any supplied resources and the time-to-live range.
     pub fn valid(&self) -> bool {
         valid_id(&self.template_id) && valid_resources(self.memory_mib, self.vcpus) && (1..=86_400).contains(&self.ttl_seconds)
     }
+    // Build the worker create request carrying the controller-generated sandbox ID.
     pub fn with_id(self, sandbox_id: String) -> CreateRequest {
         CreateRequest { sandbox_id, template_id: self.template_id, memory_mib: self.memory_mib, vcpus: self.vcpus, ttl_seconds: self.ttl_seconds }
     }
@@ -114,11 +117,14 @@ pub struct CreateRequest {
 }
 
 impl CreateRequest {
+    // Require an owner-prefixed sandbox ID, then check the template ID, any supplied resources and the
+    // time-to-live range.
     pub fn valid(&self) -> bool {
         sandbox_owner(&self.sandbox_id).is_some() && valid_id(&self.template_id)
             && valid_resources(self.memory_mib, self.vcpus) && (1..=86_400).contains(&self.ttl_seconds)
     }
-    // An identical retry may omit values that were resolved from the template.
+    // Decide whether this create repeats the saved one. An identical retry may omit values that were
+    // resolved from the template.
     pub fn matches(&self, spec: &SandboxSpec) -> bool {
         self.sandbox_id == spec.sandbox_id && self.template_id == spec.template_id && self.ttl_seconds == spec.ttl_seconds
             && self.memory_mib.is_none_or(|m| m == spec.memory_mib) && self.vcpus.is_none_or(|v| v == spec.vcpus)
@@ -137,6 +143,7 @@ pub struct SandboxSpec {
 }
 
 impl SandboxSpec {
+    // Check a saved record's owner-prefixed ID, template ID, resolved resources and time to live.
     pub fn valid(&self) -> bool {
         sandbox_owner(&self.sandbox_id).is_some() && valid_id(&self.template_id)
             && valid_resources(Some(self.memory_mib), Some(self.vcpus)) && (1..=86_400).contains(&self.ttl_seconds)
@@ -161,7 +168,8 @@ impl ExecRequest {
             && (1..=MAX_EXEC_TIMEOUT_MS).contains(&self.timeout_ms)
             && (1..=1_048_576).contains(&self.max_output_bytes)
     }
-    // Worst-case JSON result: lossy UTF-8 and escaping expand raw bytes up to 6x.
+    // Return the largest valid JSON exec result: lossy UTF-8 and escaping expand raw output bytes up
+    // to 6x, plus room for the other fields.
     pub fn max_result_bytes(&self) -> usize { self.max_output_bytes as usize * 6 + 8192 }
 }
 
@@ -244,6 +252,8 @@ impl HttpRequest {
         self.valid() && self.body.len() <= limits.max_body_bytes && self.max_response_bytes <= limits.max_response_bytes
             && self.timeout_ms <= limits.max_timeout_ms
     }
+    // Return the largest valid JSON HTTP result: escaping expands raw response bytes up to 6x, plus
+    // room for the status and content type.
     pub fn max_result_bytes(&self) -> usize { self.max_response_bytes as usize * 6 + 8192 }
 }
 #[derive(Clone, Deserialize, Serialize)]

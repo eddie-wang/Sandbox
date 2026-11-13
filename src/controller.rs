@@ -44,9 +44,12 @@ struct Controller {
 }
 
 impl Controller {
-    // The owner waits `wait` for its outcome; one request_timeout_ms of slack lets
-    // it report its own operation_timeout before this forward gives up.
+    // Return how long a forward to the owner may take: the owner's own outcome wait plus one
+    // request_timeout_ms of slack, so the owner reports its own operation_timeout before this
+    // forward gives up.
     fn operation_timeout(&self, wait: Duration) -> Duration { wait + self.server.timeout() }
+    // Return the cached view of every configured worker, marking it fresh only if its last poll
+    // succeeded within the freshness window.
     async fn snapshot(&self) -> Vec<NodeView> {
         let nodes = self.nodes.read().await;
         let now = Instant::now();
@@ -87,6 +90,8 @@ const PRE_LAUNCH_REJECTIONS: &[&str] = &["busy", "admission_exhausted", "record_
 const MAX_CREATE_ATTEMPTS: usize = 3;
 const MAX_SANDBOX_VIEW_BYTES: usize = 65_536;
 
+// Return 32 random hex characters for the local part of a new sandbox ID, or a 503 error if the
+// kernel cannot supply randomness without blocking.
 fn random_local_id() -> Result<String, ApiError> {
     let mut bytes = [0u8; 16];
     // Nonblocking after kernel entropy initialization; never reads a file.
@@ -102,6 +107,10 @@ fn with_sandbox_id(status: StatusCode, mut body: Value, sandbox_id: &str) -> Res
     (status, Json(body)).into_response()
 }
 
+// Validate a client create, rank fresh workers and try up to three of them, each with a newly
+// generated owner-prefixed ID, within one shared deadline. Move on only after a definitive pre-launch
+// rejection; any other answer is final and names the ID when the outcome is uncertain. Return 422
+// if every candidate answered template_unavailable, otherwise 503 no_capacity.
 async fn create(State(c): State<Controller>, input: Result<Json<CreateSpec>, JsonRejection>) -> Result<Response, ApiError> {
     let spec = http::json(input)?;
     if !spec.valid() { return Err(http::invalid_input()); }
@@ -140,24 +149,30 @@ async fn create(State(c): State<Controller>, input: Result<Json<CreateSpec>, Jso
     Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "no_capacity", "No fresh, ready worker admitted the sandbox"))
 }
 
+// Read the sandbox ID from the route and return it with the owner node named in its prefix.
 fn path_id(path: Result<Path<String>, PathRejection>) -> Result<(String, String), ApiError> {
     let Path(id) = path.map_err(|_| http::invalid_input())?;
     let owner = sandbox_owner(&id).ok_or_else(http::invalid_input)?.to_owned();
     Ok((id, owner))
 }
+// Pass the owner's status and JSON body back to the client, or the forwarding error.
 fn reply(result: Result<(StatusCode, Value), Forward>) -> Result<Response, ApiError> {
     let (status, body) = result.map_err(Forward::error)?;
     Ok((status, Json(body)).into_response())
 }
+// Read a sandbox's state from its owner within the short read deadline.
 async fn get_sandbox(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
     let (id, owner) = path_id(path)?;
     reply(forward(&c, &owner, reqwest::Method::GET, &format!("/v1/sandboxes/{id}"), None, c.short_wait, MAX_SANDBOX_VIEW_BYTES).await)
 }
+// Forward a delete to the owner and wait for its final outcome within the delete deadline.
 async fn delete(State(c): State<Controller>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
     let (id, owner) = path_id(path)?;
     let wait = Duration::from_millis(c.server.operation_deadlines.delete_ms);
     reply(forward(&c, &owner, reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"), None, c.operation_timeout(wait), MAX_SANDBOX_VIEW_BYTES).await)
 }
+// Validate a command and forward it to the owner, waiting for its own timeout plus the margin and
+// accepting a reply up to the largest possible exec result.
 async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
@@ -166,6 +181,8 @@ async fn exec(State(c): State<Controller>, path: Result<Path<String>, PathReject
     let limit = request.max_result_bytes();
     reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
 }
+// Check an application HTTP request against the configured limits and forward it to the owner,
+// waiting for its own timeout plus the margin and accepting a reply up to the largest valid result.
 async fn application_http(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
@@ -174,6 +191,7 @@ async fn application_http(State(c): State<Controller>, path: Result<Path<String>
     let limit = request.max_result_bytes();
     reply(forward(&c, &owner, reqwest::Method::POST, &format!("/v1/sandboxes/{id}/http"), Some(serde_json::to_value(request).map_err(|_| http::invalid_input())?), c.operation_timeout(wait), limit).await)
 }
+// Check the new template ID and forward the capture to the owner within the capture deadline.
 async fn capture(State(c): State<Controller>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let (id, owner) = path_id(path)?;
     let request = http::json(input)?;
@@ -189,10 +207,13 @@ enum Forward {
     Lost(ApiError),
 }
 impl Forward {
+    // Return the client-facing error, whether or not the request reached the owner.
     fn error(self) -> ApiError { match self { Self::NotSent(e) | Self::Lost(e) => e } }
 }
 
-// `timeout` covers the whole owner exchange; `limit` is the largest valid result body.
+// Send an authenticated request to the owner only if it has a fresh observation, and read its JSON
+// reply up to `limit` bytes. `timeout` covers the whole exchange. Fail as NotSent when nothing left
+// this controller, or as Lost when the owner may have acted (timeout, dropped or oversized reply).
 async fn forward(c: &Controller, owner: &str, method: reqwest::Method, path: &str, body: Option<Value>, timeout: Duration, limit: usize) -> Result<(StatusCode, Value), Forward> {
     let endpoint = c.endpoints.iter().find(|e| e.node_id == owner).ok_or(Forward::NotSent(http::invalid_input()))?;
     let nodes = c.snapshot().await;

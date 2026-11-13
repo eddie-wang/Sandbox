@@ -74,9 +74,9 @@ def pmtu_peer():
                     pass
 
 
-# Require explicit privileged opt-in and run fixtures inside a disposable network and mount namespace.
-# Exercise lifecycle networking against local peers, then clean owned resources and compare the outer
-# inventory.
+# Require explicit privileged opt-in and run fixtures inside a disposable network and mount namespace
+# (or act as the PMTU peer when asked). Exercise lifecycle networking against local peers, then clean
+# owned resources and compare the outer inventory.
 def main():
     if sys.argv[1:] == ["--pmtu-peer"]:
         return pmtu_peer()

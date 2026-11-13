@@ -194,6 +194,8 @@ impl Native {
         self.template_usable(&m)?;
         Ok(m)
     }
+    // Require the template's network policy to be operator-approved and its process limit to match this
+    // worker's configuration.
     fn template_usable(&self, m: &Manifest) -> Result<()> {
         self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
@@ -217,6 +219,10 @@ impl Native {
         }
         storage::verify_lower(&lower, &image)
     }
+    // Build a sandbox: private directories, extracted warm upper and images, an overlay root on the
+    // verified shared lower, its resource group, network and execution specification. Then start it
+    // cold or restore it from the checkpoint and confirm it runs. Partial state is left for the
+    // caller's cleanup.
     pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         let id = &request.sandbox_id;
         let private = self.private(id);
@@ -247,6 +253,8 @@ impl Native {
         else { self.runc_checked(vec!["run".into(), "--detach".into(), "--bundle".into(), private.display().to_string(), id.clone()])?; }
         self.ensure_running(id)
     }
+    // Create the sandbox's resource group with its memory (no swap, whole-group OOM kill), process
+    // and CPU limits.
     fn cgroup(&self, request: &SandboxSpec) -> Result<()> {
         let p = Path::new(&self.config.cgroup_parent).join(&request.sandbox_id);
         fs::create_dir(&p).map_err(|_| "cgroup_create_failed")?;
@@ -256,6 +264,9 @@ impl Native {
         }
         Ok(())
     }
+    // Write the CRIU settings and the runc execution specification: unprivileged init, private
+    // namespaces (joining the prepared guest network when networked), minimal devices, resource limits,
+    // masked kernel paths and the syscall policy.
     fn write_spec(&self, request: &SandboxSpec, manifest: &Manifest) -> Result<()> {
         let private = self.private(&request.sandbox_id);
         // Request-specific CRIU options are worker-authored. Administrator-owned
@@ -339,6 +350,8 @@ impl Native {
             "--file-locks".into(), "--manage-cgroups-mode".into(), "ignore".into(), id.into()]).map_err(|_| "restore_failed")?;
         self.ensure_running(id)
     }
+    // Restore a capture source from its fresh images, recreating its resource group if needed, unless the
+    // sandbox was cancelled or expired.
     pub fn restore_source(&self, request: &SandboxSpec, images: &Path, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
         if !Path::new(&self.config.cgroup_parent).join(&request.sandbox_id).exists() { self.cgroup(request)?; }
         if expires_at <= crate::engine::now() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return Err("sandbox_cancelled_or_expired"); }
@@ -351,9 +364,12 @@ impl Native {
         if !self.root().join("runc").join(id).exists() { return Ok(()); }
         self.runc_checked(vec!["delete".into(), id.into()]).map_err(|_| "checkpoint_source_delete_failed")
     }
+    // Create the fixed child resource group for the sandbox's one running exec.
     pub fn create_exec_cgroup(&self, id: &str) -> Result<()> {
         fs::create_dir(Path::new(&self.config.cgroup_parent).join(id).join(EXEC_CGROUP)).map_err(|_| "exec_cgroup_create_failed")
     }
+    // Kill everything in the exec resource group, wait up to five seconds for it to empty, then remove
+    // it. A missing group is already clean.
     pub fn cleanup_exec_cgroup(&self, id: &str) -> Result<()> {
         let path = Path::new(&self.config.cgroup_parent).join(id).join(EXEC_CGROUP);
         if !path.exists() { return Ok(()); }
@@ -365,6 +381,9 @@ impl Native {
         }
         fs::remove_dir(path).map_err(|_| "exec_cgroup_remove_failed")
     }
+    // Tear down everything a sandbox owns: kill its processes and exec group, delete runc state, wait
+    // for and remove its resource group, remove its network, unmount its root and delete private files.
+    // Stop at the first failure so the caller can retry.
     pub fn cleanup(&self, id: &str) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
@@ -409,6 +428,8 @@ impl Native {
     }
 }
 
+// Return the syscall policy: allow everything except the io_uring calls (ENOSYS) and MPTCP sockets
+// (EPROTONOSUPPORT), which CRIU cannot checkpoint.
 fn seccomp() -> Value {
     // Same pattern as the AgentENV container backend: default-allow, with
     // CRIU checkpointability guards only. CRIU cannot dump io_uring instances or

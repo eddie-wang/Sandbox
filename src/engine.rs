@@ -26,6 +26,7 @@ pub struct Record {
 impl Record {
     // Keep capacity reserved until the record is deleted or failed.
     pub fn reserved(&self) -> bool { !matches!(self.state.as_str(), "deleted" | "failed") }
+    // Return the public view of this sandbox: IDs, state, error and expiry time.
     pub fn view(&self) -> SandboxView {
         SandboxView { sandbox_id: self.request.sandbox_id.clone(), template_id: self.request.template_id.clone(),
             state: self.state.clone(), error: self.error.clone(), expires_at: self.expires_at }
@@ -63,14 +64,17 @@ struct Flight { slot: usize, restore: bool, template: Option<String>, cancelled:
 struct Lower { manifest: storage::Manifest, done: mpsc::Sender<Result<()>> }
 // Return seconds since the Unix epoch, falling back to zero if the clock is earlier.
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
-// Hash the serialized request to recognize identical operation retries.
+// Hash a value's serialized form; used to stamp the template network policy into the saved
+// execution specification.
 pub fn fingerprint<T: Serialize>(input: &T) -> String { storage::digest(&serde_json::to_vec(input).expect("serialize validated input")) }
+// Send a result to a waiting request, if any, ignoring a requester that already gave up.
 fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = reply { let _ = reply.send(result); } }
 
 impl Handle {
     // Return an unavailable handle if the runtime is disabled or preflight fails. Otherwise reconcile
-    // durable state before starting bounded operation workers, serialized admission and expiry monitoring;
-    // accepted jobs continue independently of HTTP connections.
+    // durable state, then start the lower-mount thread, bounded operation workers, serialized admission
+    // and expiry/exit monitoring; accepted jobs continue independently of HTTP connections.
+    // Shutdown waits for in-flight jobs and one cleanup attempt per remaining sandbox.
     pub fn start(config: &WorkerConfig, report: Preflight) -> Result<Self> {
         let enabled = config.native.as_ref().is_some_and(|c| c.enabled) && report.ready;
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
@@ -201,6 +205,9 @@ impl Engine {
     }
     // Find the first operation worker slot not assigned to an in-flight job.
     fn idle_slot(&self) -> Option<usize> { (0..self.pool.len()).find(|slot| !self.flights.values().any(|f| f.slot == *slot)) }
+    // Hand a job to the chosen idle operation worker and record it as in flight with a cancel flag. A
+    // delete takes over the waiting DELETE reply. If the worker cannot take the job, mark the sandbox
+    // cleanup_failed, close admission and fail the reply.
     fn launch(&mut self, id: &str, action: Action, slot: usize, reply: Option<Reply>) {
         let restore = matches!(action, Action::Create | Action::Capture(..));
         let template = match &action { Action::Capture(r, _) => Some(r.template_id.clone()), _ => None };
@@ -219,6 +226,9 @@ impl Engine {
         }
         self.publish();
     }
+    // Save a finished job's record, turning it into a pending delete if deletion, expiry or ill health
+    // arrived meanwhile, and deliver its outcome with the current state. Answer a waiting DELETE once the
+    // sandbox is gone, and delete a new sandbox whose create reply could not be delivered.
     fn complete(&mut self, slot: usize, mut record: Record, outcome: Result<Outcome>) {
         if self.native.helpers.ensure_healthy().is_err() { self.healthy = false; }
         let id = record.request.sandbox_id.clone();
@@ -268,6 +278,10 @@ impl Engine {
             _ => unreachable!(),
         }
     }
+    // Admit a create. A known ID returns its state for an identical retry (conflict or busy otherwise).
+    // Reject without writing a record when records, operation or restore slots, the template, its
+    // resources, leftover resource names, capacity or network slots do not allow it. Otherwise save a
+    // creating record and launch the job.
     fn create(&mut self, request: CreateRequest, reply: Reply) {
         let id = request.sandbox_id.clone();
         if let Some(r) = self.records.get(&id) {
@@ -308,6 +322,9 @@ impl Engine {
             Ok(()) => self.launch(&id, Action::Create, slot, Some(reply)),
         }
     }
+    // Start an exec, HTTP call or capture on a running sandbox, rejecting it at once if the sandbox is
+    // missing, busy, not running or no slot is free. A capture also needs a restore slot and an unused
+    // template name, and is saved as capturing first.
     fn operation(&mut self, id: &str, action: Action, reply: Reply) {
         let Some(record) = self.records.get(id) else { let _ = reply.send(Err("sandbox_not_found")); return; };
         // Conflicting same-sandbox work is rejected immediately, never queued.
@@ -323,6 +340,9 @@ impl Engine {
         }
         self.launch(id, action, slot, Some(reply));
     }
+    // Mark a sandbox for deletion and cancel its in-flight job; maintenance launches the cleanup. An
+    // already gone sandbox is answered at once, a second waiting DELETE gets sandbox_busy, and the
+    // first waits for the cleanup result.
     fn request_delete(&mut self, id: &str, reply: Option<Reply>) {
         let Some(record) = self.records.get_mut(id) else { answer(reply, Err("sandbox_not_found")); return; };
         if !record.reserved() { let view = record.view(); answer(reply, Ok(Outcome::Sandbox(view))); return; }
@@ -406,6 +426,8 @@ impl Runner<'_> {
     fn active(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Relaxed) || self.record.expires_at <= now() { Err("sandbox_cancelled_or_expired") } else { Ok(()) }
     }
+    // Run one job on this operation worker and return its outcome; a delete succeeds only if cleanup
+    // finished.
     fn perform(&mut self, action: Action) -> Result<Outcome> {
         match action {
             Action::Create => self.create(), Action::Http(r) => self.http(r), Action::Exec(r) => self.exec(r),
@@ -419,6 +441,8 @@ impl Runner<'_> {
         self.record.state = if result.is_ok() { "deleted" } else { "cleanup_failed" }.into();
         if let Err(e) = result { self.record.error = Some(e.into()); }
     }
+    // Verify the template, wait for its shared lower mount, then prepare and start or restore the
+    // sandbox. On failure, clean up and record it as failed (or cleanup_failed).
     fn create(&mut self) -> Result<Outcome> {
         let result = (|| -> Result<()> {
             self.active()?;
@@ -439,6 +463,9 @@ impl Runner<'_> {
             }
         }
     }
+    // Run one command with runc exec in the sandbox's exec cgroup, bounded by its timeout (capped by
+    // the remaining TTL) and output limit, then kill and remove that cgroup. A bound violation or any
+    // error deletes the whole sandbox.
     fn exec(&mut self, request: ExecRequest) -> Result<Outcome> {
         let id = self.record.request.sandbox_id.clone();
         let file = self.native.private(&id).join("exec.json");
@@ -460,6 +487,8 @@ impl Runner<'_> {
             Err(e) => { self.delete(); Err(e) }
         }
     }
+    // Make one application HTTP call to the sandbox under its template network policy, capped by the
+    // remaining TTL. A failure fails only this call, not the sandbox.
     fn http(&mut self, request: HttpRequest) -> Result<Outcome> {
         let policy = self.active().and_then(|_| self.record.network_policy.as_ref().ok_or("network_policy_unavailable"))?;
         self.native.application_http(&self.record.request.sandbox_id, &request, policy, self.record.expires_at.saturating_sub(now()).saturating_mul(1000)).map(Outcome::Http)
@@ -471,6 +500,10 @@ impl Runner<'_> {
         self.native.forget_stopped(&self.record.request.sandbox_id)?;
         self.native.restore_source(&self.record.request, images, self.record.expires_at, &self.cancelled)
     }
+    // Capture a running sandbox as a new warm template: require no active TCP, checkpoint and stop the
+    // source, archive its upper layer and process images, write the manifest, restore the source and
+    // publish the template. Delete the source if it cannot be recovered; succeed only if both
+    // publication and recovery did.
     fn capture(&mut self, request: CaptureRequest, generation: String) -> Result<Outcome> {
         let id = self.record.request.sandbox_id.clone();
         // The admission coordinator reserves the template name among in-flight

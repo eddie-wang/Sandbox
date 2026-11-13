@@ -37,8 +37,9 @@ static int read_file(const char *path) {
     return 0;
 }
 /* Dispatch the smoke workload modes: persistent counter/mappings and optional HTTP service, file */
-/* operations, isolation and TCP checks, or deliberate delay/output/descendant cases. Return each */
-/* check's result; init and stress modes keep running until stopped. */
+/* operations, process-group, isolation and syscall-guard checks, TCP connect and path-MTU transfer, */
+/* or deliberate delay/output/descendant cases. Return each check's result; init and stress modes */
+/* keep running until stopped. */
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
     if (!strcmp(argv[1], "process-group")) {

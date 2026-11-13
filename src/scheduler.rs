@@ -1,11 +1,9 @@
 use crate::{controller::NodeView, model::CreateSpec};
 
-// Advisory only. A snapshot is not a reservation; worker-side atomic admission remains required.
-// The controller does not read templates: a worker that lacks a compatible template
-// (including architecture) rejects before launch and the controller tries the next.
-// Omitted resources default to the template's values and count as zero here.
-// Returns fresh, ready, compatible candidates: least projected load first, then
-// fewer active restores, then node ID.
+// Return fresh, ready candidates with room: least projected load first, then fewer active restores,
+// then node ID. Advisory only: a snapshot is not a reservation; worker admission stays atomic.
+// Templates are not read here: a worker lacking a compatible one (including architecture) rejects
+// before launch and the controller tries the next. Omitted resources count as zero here.
 pub fn rank<'a>(nodes: &'a [NodeView], request: &CreateSpec) -> Vec<&'a str> {
     let mut candidates: Vec<_> = nodes.iter().filter_map(|node| {
         let status = node.status.as_ref()?;

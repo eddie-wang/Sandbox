@@ -59,6 +59,7 @@ pub fn json<T>(input: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     input.map(|Json(value)| value).map_err(|_| invalid_input())
 }
 
+// Wrap routes with authentication, request limits and deadlines, and a JSON 404 for unknown routes.
 // `hops` is 1 on a worker and 2 on the controller: each forwarding layer gets one
 // extra request_timeout_ms so the inner layer reports its own timeout first.
 pub fn protect(router: Router, config: &ServerConfig, token: String, hops: u32) -> Router {
@@ -77,7 +78,8 @@ pub fn protect(router: Router, config: &ServerConfig, token: String, hops: u32) 
 }
 
 // Require a single matching bearer token except for public health reads. Limit concurrent requests,
-// body size and handling time, then disable response caching.
+// body size and body-read time; blocking routes may run for their outcome wait plus one
+// request_timeout_ms per hop, others for request_timeout_ms. Then disable response caching.
 async fn guard(State(limits): State<Limits>, request: Request, next: Next) -> Response {
     let public_health = request.method() == Method::GET && request.uri().path() == "/healthz";
     if !public_health {

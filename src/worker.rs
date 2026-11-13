@@ -12,7 +12,8 @@ fn id(handle: &Handle, input: Result<Path<String>, PathRejection>) -> Result<Str
     if sandbox_owner(&id) != Some(node.as_str()) { return Err(http::invalid_input()); }
     Ok(id)
 }
-// Static engine/runtime codes. Unlisted runtime failures are 500 with their static code.
+// Map an engine/runtime error code to its HTTP status and fixed message. Unlisted runtime failures
+// are 500 with their static code.
 fn failure(code: &'static str) -> ApiError {
     let (status, message) = match code {
         "sandbox_not_found" => (StatusCode::NOT_FOUND, "Sandbox does not exist"),
@@ -35,9 +36,10 @@ fn failure(code: &'static str) -> ApiError {
     };
     ApiError(status, code, message)
 }
-// Waits for the real outcome. Dropping this future (client disconnect or an
-// expired wait) never cancels the job: the engine owns it and discards the reply,
-// except that an undelivered create is deleted (`create_response_lost`).
+// Hand work to the engine and wait up to `wait` for its real outcome, then turn it into the HTTP
+// response. Dropping this future (client disconnect or an expired wait) never cancels the job: the
+// engine owns it and discards the reply, except that an undelivered create is deleted
+// (`create_response_lost`).
 async fn call(handle: &Handle, wait: Duration, work: impl FnOnce(Reply) -> Work) -> Result<Response, ApiError> {
     let sender = handle.sender.as_ref().ok_or_else(unavailable)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -55,23 +57,29 @@ async fn call(handle: &Handle, wait: Duration, work: impl FnOnce(Reply) -> Work)
         Outcome::Captured(result) => Json(result).into_response(),
     })
 }
+// Turn a millisecond count into a duration.
 fn millis(ms: u64) -> Duration { Duration::from_millis(ms) }
+// Accept a controller create only for a valid request whose ID names this worker, and wait for it
+// to finish.
 async fn create(State(handle): State<Handle>, input: Result<Json<CreateRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let request = http::json(input)?;
     let node = handle.snapshot.read().map_err(|_| unavailable())?.status.node_id.clone();
     if !request.valid() || sandbox_owner(&request.sandbox_id) != Some(node.as_str()) { return Err(http::invalid_input()); }
     call(&handle, millis(handle.deadlines.create_ms), |reply| Work::Create(request, reply)).await
 }
+// Return a sandbox's current state from the published snapshot without contacting the engine.
 async fn get_sandbox(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
     let id = id(&handle, path)?;
     let snapshot = handle.snapshot.read().map_err(|_| unavailable())?;
     let record = snapshot.records.get(&id).ok_or(ApiError(StatusCode::NOT_FOUND, "sandbox_not_found", "Sandbox does not exist"))?;
     Ok(Json(record.view()).into_response())
 }
+// Ask the engine to delete a sandbox and wait for the cleanup result.
 async fn delete(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>) -> Result<Response, ApiError> {
     let id = id(&handle, path)?;
     call(&handle, millis(handle.deadlines.delete_ms), |reply| Work::Delete(id, reply)).await
 }
+// Validate a command and wait for its result for its own timeout plus the margin.
 async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<ExecRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -79,6 +87,8 @@ async fn exec(State(handle): State<Handle>, path: Result<Path<String>, PathRejec
     let wait = millis(request.timeout_ms + handle.deadlines.margin_ms);
     call(&handle, wait, |reply| Work::Exec(id, request, reply)).await
 }
+// Check an application HTTP request against the configured limits and wait for its result for its
+// own timeout plus the margin.
 async fn application_http(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<HttpRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -86,6 +96,7 @@ async fn application_http(State(handle): State<Handle>, path: Result<Path<String
     let wait = millis(request.timeout_ms + handle.deadlines.margin_ms);
     call(&handle, wait, |reply| Work::Http(id, request, reply)).await
 }
+// Check the new template ID and wait for the capture outcome within the capture deadline.
 async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRejection>, input: Result<Json<CaptureRequest>, JsonRejection>) -> Result<Response, ApiError> {
     let id = id(&handle, path)?;
     let request = http::json(input)?;
@@ -94,7 +105,8 @@ async fn capture(State(handle): State<Handle>, path: Result<Path<String>, PathRe
 }
 
 // Initialize preflight and lifecycle ownership away from request handling, then serve protected
-// management routes. On shutdown, stop serving and wait for engine-owned cleanup before returning.
+// management routes. On a termination signal, stop admission and cancel live work, finish serving,
+// then wait for engine-owned cleanup before returning.
 pub async fn run(config: WorkerConfig, token: String) -> Result<(), &'static str> {
     let server = config.server.clone();
     let handle = tokio::task::spawn_blocking(move || {

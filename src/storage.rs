@@ -117,8 +117,8 @@ pub fn verify(path: &Path, expected: &Artifact, max: u64) -> Result<()> {
     if actual.sha256 != expected.sha256 || actual.bytes != expected.bytes { Err("artifact_digest_mismatch") } else { Ok(()) }
 }
 
-// Bounded manifest-only checks (digest sidecar, strict fields, exact host
-// compatibility), cheap enough for admission. Artifact digests are not read.
+// Load a template manifest with bounded manifest-only checks (digest sidecar, strict fields, exact
+// host compatibility), cheap enough for admission. Artifact digests are not read.
 pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Result<Manifest> {
     if !valid_id(id) { return Err("invalid_template_id"); }
     let dir = root.join("templates").join(id);
@@ -146,6 +146,8 @@ pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Re
     Ok(m)
 }
 
+// Load a template manifest, then fully hash its base layer and any warm upper and checkpoint archives
+// against their recorded digests and sizes.
 pub fn load(root: &Path, id: &str, compatibility: &Compatibility, max: u64) -> Result<Manifest> {
     let m = load_manifest(root, id, compatibility)?;
     let dir = root.join("templates").join(id);
