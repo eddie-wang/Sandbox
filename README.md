@@ -98,6 +98,11 @@ RBAC, built-in TLS or Internet-facing connection defense.
   slots for CNI DEL retries, never for new admission; shutdown removes the pool.
   Isolated sandboxes also get a worker-owned guest namespace, with only loopback.
   The operator provisions a stable-MAC bridge, gateway and exclusive address pool.
+  In `[native.network]`, choose exactly one of `addresses` (explicit list) or `slots`
+  (1–256), optionally with `first_address`. Slots expand in ascending order within
+  `gateway/prefix`, starting after the gateway by default, skipping gateway/egress
+  targets and excluding network/broadcast addresses; a range that runs out is rejected.
+  Either pool must cover `capacity.max_sandboxes`; see [network configuration](docs/network.md).
   Guest veth/address/routes now use standalone **CNI ptp + static IPAM** inside the
   router slot, never the shared pod namespace. The default-drop boundary precedes
   ADD; cached config/results drive reverse DEL, including partial failures and

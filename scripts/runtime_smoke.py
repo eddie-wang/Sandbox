@@ -440,7 +440,7 @@ def tmpfs_erofs_gate(binary, root, worker_config, env, worker_token, manifest):
 
 # Run real lifecycle, tmpfs-root startup, sparse-archive and restart gates (at most three containers).
 # Check mounts/storage, OCI limits, syscall policy on cold/restored copies, conmon and CNI ownership.
-# --network adds policy networking and the app proxy with a small-call latency bound.
+# --network uses a generated slot address pool, policy networking and the app proxy latency bound.
 # Retain the root and observations; require no owned state to remain.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -515,7 +515,8 @@ command_timeout_seconds = 30
 bridge = "sb-test-br"
 gateway = "198.18.0.1"
 prefix = 24
-addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
+slots = 3
+first_address = "198.18.0.10"
 egress = [{ip="198.18.0.1", port=18080}, {ip="198.19.0.2", port=18080}, {ip="198.19.0.3", port=18080}]
 service_ports = [8080]
 ''')
@@ -548,7 +549,9 @@ url = "http://127.0.0.1:{worker_port}"
         oversized = root / "oversized-mtu.toml"
         oversized.write_text(worker_config.read_text().replace("[native.network]", "[native.network]\nmtu = 9000"))
         report = subprocess.run([str(binary), "preflight", "--config", str(oversized)], capture_output=True, timeout=15)
-        assert report.returncode != 0 and not {c["name"]: c["ok"] for c in json.loads(report.stdout)["checks"]}["operator_bridge_mtu"]
+        network_report = json.loads(report.stdout)
+        assert network_report["network_addresses"] == ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
+        assert report.returncode != 0 and not {c["name"]: c["ok"] for c in network_report["checks"]}["operator_bridge_mtu"]
         oversized.unlink()
     rootfs = root / "fixture-rootfs"
     rootfs.mkdir(mode=0o755)

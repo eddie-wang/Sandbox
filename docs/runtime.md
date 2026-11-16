@@ -624,6 +624,15 @@ errors in cold/restored processes; it is not a general security qualification.
 Opt-in networking additionally requires an operator-provisioned bridge with a
 **stable, explicitly assigned MAC**, its configured IPv4 gateway address/prefix,
 and an exclusive pool of unused addresses sufficient for worker sandbox capacity.
+Set exactly one of `[native.network].addresses` (explicit list, order preserved) or
+`slots` (1–256). The slots form expands once at load time from `first_address`, or
+the first usable address after the gateway by default, in ascending order within
+`gateway/prefix`. It skips the gateway and egress targets, excludes network and
+broadcast addresses, and fails if the range runs out; it never wraps. An explicit
+`first_address` must be inside that subnet, not network/broadcast, and requires
+`slots`. Both forms retain the same validation and must cover `capacity.max_sandboxes`.
+CLI and authenticated HTTP preflight expose the resolved `network_addresses` list
+(`null` without networking); this is not proof the addresses are unused.
 The worker preflight inspects bridge kind and address/prefix, validates pool/policy
 bounds, and never provisions or repairs host networking. Operator routing beyond
 that bridge and address allocation exclusivity are deployment prerequisites, not
@@ -650,7 +659,9 @@ inventories are compared. Existing `/run/netns` is required. Only three containe
 64 MiB/one vCPU/64 pids each, remain the limit. No additional installed helper is
 needed; the existing verified `ip` enters namespaces for same-binary helpers.
 
-The network variant retains relevant previous lifecycle cases and adds positive
+The network variant configures `slots = 3` and `first_address = "198.18.0.10"`,
+checks the expanded preflight list, and uses those addresses throughout the gate.
+It retains relevant previous lifecycle cases and adds positive
 exact destination/port, denied other destination/port/sibling, no IPv6/UDP/raw
 socket creation, capture of a sandbox holding an established external TCP
 connection and restore of a child from it, source and child restored listening

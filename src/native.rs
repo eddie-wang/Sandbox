@@ -19,6 +19,8 @@ pub struct Preflight {
     pub checks: Vec<Check>,
     pub compatibility: Option<Compatibility>,
     pub erofs: ErofsStatus,
+    // Resolved operator pool in slot-index order; reporting it does not probe address availability.
+    pub network_addresses: Option<Vec<std::net::Ipv4Addr>>,
     // None in read-only CLI preflight; worker startup actively probes before advertising readiness.
     pub overlay_volatile: Option<bool>,
 }
@@ -254,8 +256,8 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
 }
 
 // Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
-// creating runtime state, including CNI protocol support and the configured link MTU. Only x86-64 has
-// a resolved syscall policy. Required checks determine readiness; root filesystem advice does not.
+// creating runtime state; report the resolved address pool and check CNI protocol support and MTU.
+// Only x86-64 has a resolved syscall policy. Required checks determine readiness, not filesystem advice.
 // Active EROFS/overlay probes run only at startup.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
@@ -333,7 +335,8 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
             "The native.root filesystem was detected; only the active startup probe establishes file-backed EROFS support."
         }) });
     let erofs = ErofsStatus { root_filesystem, file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };
-    Preflight { ready: checks.iter().filter(|c| !c.advisory).all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs, overlay_volatile: None }
+    Preflight { ready: checks.iter().filter(|c| !c.advisory).all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs,
+        network_addresses: config.and_then(|c| c.network.as_ref()).map(|n| n.addresses.clone()), overlay_volatile: None }
 }
 
 impl Native {

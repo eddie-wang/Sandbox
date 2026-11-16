@@ -385,8 +385,97 @@ max_concurrent_restores = 2
 '''
 
 
-# Launch local services and check authentication, input bounds, proxy host/path routing, fail-closed
-# readiness and stale-owner routing. Check controller placement, ID routing, failover and the
+# Check pool expansion through read-only preflight, including exact ordering and validation failures.
+# Native execution stays disabled and the nonexistent tool directory prevents host tool discovery.
+def network_config_gate(binary, root, environment):
+    base = worker_config(0).replace("max_sandboxes = 32", "max_sandboxes = 3") + '''[native]
+enabled = false
+root = "/sandbox-smoke-unavailable"
+cgroup_parent = "/sys/fs/cgroup/sandbox-smoke-unavailable"
+tools_dir = "/sandbox-smoke-unavailable/tools"
+cpu_overcommit = 1
+pids_max = 64
+max_records = 8
+max_artifact_bytes = 67108864
+command_timeout_seconds = 30
+[native.network]
+bridge = "sandbox0"
+gateway = "198.18.0.1"
+prefix = 24
+egress = []
+service_ports = [8080]
+'''
+    config = root / "network-config.toml"
+
+    # Run the real parser and validator; a valid disabled configuration still reports non-readiness.
+    # Never accept a failed validation as a preflight report or expose a test token in diagnostics.
+    def check(pool, expected=None, error=None, replacements=()):
+        text = base + pool + "\n"
+        for old, new in replacements:
+            text = text.replace(old, new)
+        config.write_text(text)
+        result = subprocess.run([binary, "preflight", "--config", str(config)], env=environment,
+                                capture_output=True, timeout=3)
+        assert result.returncode != 0, "disabled native runtime must not be ready"
+        assert environment["SANDBOX_WORKER_TOKEN"].encode() not in result.stdout + result.stderr
+        if error is not None:
+            assert not result.stdout and error.encode() in result.stderr, (pool, result.stdout, result.stderr)
+        else:
+            assert result.stdout, (pool, result.stderr)
+            report = json.loads(result.stdout)
+            assert not report["ready"] and report["network_addresses"] == expected, report
+            assert not next(c["ok"] for c in report["checks"] if c["name"] == "explicitly_enabled")
+
+    check("slots = 3", ["198.18.0.2", "198.18.0.3", "198.18.0.4"])
+    check('slots = 3\nfirst_address = "198.18.0.10"', ["198.18.0.10", "198.18.0.11", "198.18.0.12"])
+    check('slots = 3\nfirst_address = "198.18.0.1"', ["198.18.0.2", "198.18.0.3", "198.18.0.4"])
+    check('slots = 3\nfirst_address = "198.18.0.10"', ["198.18.0.10", "198.18.0.12", "198.18.0.13"],
+          replacements=[('gateway = "198.18.0.1"', 'gateway = "198.18.0.11"')])
+    check("slots = 3", ["198.18.0.2", "198.18.0.4", "198.18.0.5"],
+          replacements=[("egress = []", 'egress = [{ip="198.18.0.3", port=443}]')])
+    check('slots = 3\nfirst_address = "198.18.0.254"', ["198.18.0.254", "198.18.0.255", "198.18.1.0"],
+          replacements=[("prefix = 24", "prefix = 23")])
+    check("slots = 1", ["198.18.0.2"], replacements=[("max_sandboxes = 3", "max_sandboxes = 1"),
+                                                     ("max_concurrent_restores = 2", "max_concurrent_restores = 1")])
+    check("slots = 256", [f"198.18.0.{i}" for i in range(2, 256)] + ["198.18.1.0", "198.18.1.1"],
+          replacements=[("prefix = 24", "prefix = 23")])
+    explicit = 'addresses = ["198.18.0.12", "198.18.0.10", "198.18.0.11"]'
+    check(explicit, ["198.18.0.12", "198.18.0.10", "198.18.0.11"])
+    choice_error = "configure exactly one of native.network.addresses or native.network.slots"
+    for pool in ("", explicit + "\nslots = 3", "addresses = []\nslots = 3", 'first_address = "198.18.0.10"'):
+        check(pool, error=choice_error)
+    check(explicit + '\nfirst_address = "198.18.0.10"', error="first_address requires slots")
+    for slots in (0, 257):
+        check(f"slots = {slots}", error="slots must be between 1 and 256")
+    check("slots = 2", error="network slots must cover sandbox capacity")
+    check("slots = 3", error="slot address range exhausted", replacements=[("prefix = 24", "prefix = 30")])
+    check('slots = 3\nfirst_address = "198.18.0.253"', error="slot address range exhausted")
+    check("slots = 3", error="slot address range exhausted",
+          replacements=[('gateway = "198.18.0.1"', 'gateway = "198.18.0.254"')])
+    check('slots = 3\nfirst_address = "198.18.0.252"', error="slot address range exhausted",
+          replacements=[("egress = []", 'egress = [{ip="198.18.0.253", port=443}]')])
+    for first in ("198.18.0.0", "198.18.0.255", "198.18.1.10", "0.0.0.0", "255.255.255.255"):
+        check(f'slots = 3\nfirst_address = "{first}"', error="first address must be inside the gateway subnet")
+    for prefix in (0, 7, 31, 32, 255):
+        check("slots = 3", error="invalid native network policy or address pool",
+              replacements=[("prefix = 24", f"prefix = {prefix}")])
+    for gateway in ("198.18.0.0", "224.0.0.1"):
+        check("slots = 3", error="invalid native network policy or address pool",
+              replacements=[('gateway = "198.18.0.1"', f'gateway = "{gateway}"')])
+    for pool in ('addresses = []', 'addresses = ["198.18.0.2", "198.18.0.2", "198.18.0.3"]',
+                 'addresses = ["198.18.0.1", "198.18.0.2", "198.18.0.3"]',
+                 'addresses = ["198.18.0.0", "198.18.0.255", "198.18.1.1"]'):
+        check(pool, error="invalid native network policy or address pool")
+    check(explicit, error="invalid native network policy or address pool",
+          replacements=[("egress = []", 'egress = [{ip="198.18.0.10", port=443}]')])
+    for pool in ('slots = "3"', "slots = -1", "slots = 3\nunknown = 1",
+                 'slots = 3\nfirst_address = ' + json.dumps(environment["SANDBOX_WORKER_TOKEN"])):
+        check(pool, error="invalid configuration: check fields and types")
+    print("PASS network slots: exact expansion, gateway/egress skip, subnet bounds, explicit-list compatibility and config errors")
+
+
+# Launch services and check network pool configuration, authentication, input bounds and proxy routing.
+# Check fail-closed readiness, stale-owner routing, controller placement, ID routing, failover and the
 # controller's proxy and streaming-exec hop against routing doubles, and overload and shutdown, all
 # without containers; clean up processes and check logs for leaked tokens.
 def main():
@@ -503,6 +592,7 @@ url = "http://127.0.0.1:{second_port}"
             for setting in ("create_ms = 999", "capture_ms = 3600001", "delete_ms = 0", "margin_ms = 300001", "unknown_ms = 1000"):
                 invalid_config("worker", worker_config(worker_port).replace("[auth]", "[server.operation_deadlines]\n" + setting + "\n[auth]"))
                 invalid_config("controller", controller_text.replace("[auth]", "[server.operation_deadlines]\n" + setting + "\n[auth]"))
+            network_config_gate(binary, root, environment)
             print("PASS strict configuration and credential-source validation")
 
             worker = start("worker", worker_config(worker_port))

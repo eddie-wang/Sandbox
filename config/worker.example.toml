@@ -18,6 +18,11 @@ env = "SANDBOX_WORKER_TOKEN"
 # In its [native] section, erofs_loop_fallback = false is the default; put native.root
 # on a node-local disk filesystem such as xfs or ext4, not container overlay/tmpfs.
 # Set erofs_loop_fallback = true only to opt into extra EROFS loop-device use.
+# Optional native.network requires an operator-provisioned stable-MAC bridge/gateway.
+# Use exactly one of addresses = ["198.18.0.10", ...] or slots = 32 (1..256).
+# With slots, first_address = "198.18.0.10" is optional; default starts after gateway.
+# Expansion stays in gateway/prefix, skips gateway/egress IPs, excludes network/broadcast,
+# and rejects a range that runs out. Either pool must cover max_sandboxes; see docs/network.md.
 # These numbers are unrelated to the unresolved capacity qualification budget.
 [capacity]
 memory_mib = 8192

@@ -54,6 +54,22 @@ ends and CNI veth ends are set explicitly; guest and CNI-host MTUs are checked
 before launch. The layout fingerprint includes this MTU. External routing and avoiding pool overlap with other workers/peers are
 operator responsibilities. The worker never repairs global routing/firewall/sysctls.
 
+Configure exactly one pool form in `[native.network]`: an explicit `addresses` list
+(its order is retained), or `slots = N` (1–256) with optional `first_address`.
+For example, `gateway = "198.18.0.1"`, `prefix = 24`, `slots = 3` expands to
+`["198.18.0.2", "198.18.0.3", "198.18.0.4"]`; `first_address = "198.18.0.10"`
+instead starts at `.10`. Without `first_address`, allocation starts immediately
+after the gateway, never wrapping to earlier addresses. With it, allocation starts
+at that address (which must be a host address inside the gateway subnet). Expansion
+is ascending, skips the gateway and configured egress target IPs, and never uses the
+network or broadcast address. Exhausting the subnet before filling all slots is a
+configuration error. `first_address` without `slots`, both pool forms, or neither
+form are errors too. The expanded vector receives the same policy/pool validation
+as an explicit list and must cover `capacity.max_sandboxes`; no host address
+availability is inferred. CLI and authenticated HTTP preflight report
+`network_addresses` in slot-index order (`null` without networking).
+This is startup configuration only: slot construction, CNI and nftables are unchanged.
+
 Manifest v5 contains the policy. `isolated` creates no external links: the worker
 still creates and owns the sandbox's guest netns (same ownership marker, names,
 cleanup and restart reconciliation as networked sandboxes), but brings up only

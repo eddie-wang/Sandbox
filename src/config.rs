@@ -276,17 +276,84 @@ pub struct NativeConfig {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "NetworkConfigInput")]
 pub struct NetworkConfig {
     pub bridge: String,
-    #[serde(default = "default_network_mtu")]
     pub mtu: u32,
     pub gateway: std::net::Ipv4Addr,
     pub prefix: u8,
     pub addresses: Vec<std::net::Ipv4Addr>,
     pub egress: Vec<crate::model::TcpDestination>,
     pub service_ports: Vec<u16>,
+    // Keep semantic errors for validate(), without exposing TOML parser diagnostics or input values.
+    #[serde(skip)]
+    address_pool_error: Option<&'static str>,
 }
+
+// Preserve field presence while decoding; downstream code sees only the resolved address vector.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkConfigInput {
+    bridge: String,
+    #[serde(default = "default_network_mtu")]
+    mtu: u32,
+    gateway: std::net::Ipv4Addr,
+    prefix: u8,
+    addresses: Option<Vec<std::net::Ipv4Addr>>,
+    slots: Option<usize>,
+    first_address: Option<std::net::Ipv4Addr>,
+    egress: Vec<crate::model::TcpDestination>,
+    service_ports: Vec<u16>,
+}
+
+impl From<NetworkConfigInput> for NetworkConfig {
+    // Resolve exactly one pool form once at load time. Leave any semantic error for the normal
+    // configuration validation path, which reports static messages without echoing input.
+    fn from(input: NetworkConfigInput) -> Self {
+        let pool = match (&input.addresses, input.slots) {
+            (Some(_), None) if input.first_address.is_some() => Err("native.network.first_address requires slots"),
+            (Some(addresses), None) => Ok(addresses.clone()),
+            (None, Some(slots)) => input.expand_slots(slots),
+            _ => Err("configure exactly one of native.network.addresses or native.network.slots"),
+        };
+        let (addresses, address_pool_error) = match pool {
+            Ok(addresses) => (addresses, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        Self { bridge: input.bridge, mtu: input.mtu, gateway: input.gateway, prefix: input.prefix,
+            addresses, egress: input.egress, service_ports: input.service_ports, address_pool_error }
+    }
+}
+
+impl NetworkConfigInput {
+    // Walk ascending offsets within the gateway subnet, starting after the gateway by default.
+    // Skip gateway and egress targets; never wrap, use network/broadcast addresses or leave the subnet.
+    fn expand_slots(&self, slots: usize) -> Result<Vec<std::net::Ipv4Addr>, &'static str> {
+        if !(1..=256).contains(&slots) { return Err("native.network.slots must be between 1 and 256"); }
+        if !(8..=30).contains(&self.prefix) { return Err("invalid native network policy or address pool"); }
+        let mask = u32::MAX << (32 - self.prefix);
+        let network = u32::from(self.gateway) & mask;
+        let broadcast = network | !mask;
+        let mut next = match self.first_address {
+            Some(ip) => u32::from(ip),
+            None => u32::from(self.gateway).checked_add(1).ok_or("native.network slot address range exhausted")?,
+        };
+        if next <= network || next >= broadcast {
+            return Err(if self.first_address.is_some() {
+                "native.network first address must be inside the gateway subnet, not network or broadcast"
+            } else { "native.network slot address range exhausted" });
+        }
+        let mut addresses = Vec::with_capacity(slots);
+        while addresses.len() < slots {
+            if next >= broadcast { return Err("native.network slot address range exhausted"); }
+            let ip = std::net::Ipv4Addr::from(next);
+            if ip != self.gateway && !self.egress.iter().any(|e| e.ip == ip) { addresses.push(ip); }
+            next += 1;
+        }
+        Ok(addresses)
+    }
+}
+
 impl NetworkConfig {
     // Check bridge naming, explicit MTU, pool size and permissions. Require distinct usable pool
     // addresses in the gateway subnet, excluding the gateway and egress targets.
@@ -317,7 +384,8 @@ fn default_concurrent_execs() -> usize { 64 }
 fn default_execs_per_sandbox() -> usize { 8 }
 
 impl NativeConfig {
-    // Reject unsafe paths, invalid networking and out-of-range resource, record, command or copy-pool limits.
+    // Reject unsafe paths, pool expansion errors, invalid networking and out-of-range resource,
+    // record, command or copy-pool limits.
     fn validate(&self) -> Result<(), &'static str> {
         for path in [&self.root, &self.cgroup_parent].into_iter().chain(self.tools_dir.iter()) {
             if !path.starts_with('/') || path.len() > 256
@@ -328,7 +396,10 @@ impl NativeConfig {
                 return Err("native paths must be clean absolute paths");
             }
         }
-        if self.network.as_ref().is_some_and(|n| !n.valid()) { return Err("invalid native network policy or address pool"); }
+        if let Some(network) = &self.network {
+            if let Some(error) = network.address_pool_error { return Err(error); }
+            if !network.valid() { return Err("invalid native network policy or address pool"); }
+        }
         if self.root == "/" || !self.cgroup_parent.starts_with("/sys/fs/cgroup/")
             || !(1..=16).contains(&self.cpu_overcommit)
             || !(16..=65536).contains(&self.pids_max)

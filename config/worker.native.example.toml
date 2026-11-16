@@ -57,11 +57,17 @@ command_timeout_seconds = 30   # 10..300, each host tool invocation
 # Optional operator-provisioned network. Omit for fully isolated templates only.
 # The bridge needs a stable explicitly assigned MAC and this gateway/prefix.
 # Reserve unused addresses exclusively for this worker; at least max_sandboxes.
+# Use exactly one of slots (1..256) or addresses; first_address requires slots.
+# Default first address is after gateway; expansion skips gateway/egress IPs,
+# excludes network/broadcast, stays in gateway/prefix and fails if it runs out.
 # The worker creates only owned veths/netns and slot-local routes/NAT/filter state.
 # [native.network]
 # bridge = "sandbox0"
 # gateway = "198.18.0.1"
 # prefix = 24
+# slots = 3
+# first_address = "198.18.0.10"
+# Alternatively omit slots/first_address and list the pool explicitly:
 # addresses = ["198.18.0.10", "198.18.0.11", "198.18.0.12"]
 # egress = [{ip = "198.51.100.20", port = 8443}]
 # service_ports = [8080]   # app proxy reaches only template-approved ports of these
