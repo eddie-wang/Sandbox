@@ -417,16 +417,30 @@ cannot exceed that pool. Commands run outside the pool, bounded per sandbox and 
 worker. Deletes cancel active work and commands, then perform per-sandbox serialized
 cleanup; another sandbox's long command/restore does not block admission or an
 available operation slot.
-`erofs` records `file_backed` (`true` after a successful worker-start probe, `false`
-for an unsupported kernel, `null` before probing or when forced off), `forced_loop`
-and `loop_devices`. The latter is null in file-backed mode; otherwise status reads
+`erofs` records `root_filesystem`, `file_backed`, `forced_loop` and `loop_devices`.
+`root_filesystem` is the string from `statfs(native.root)`: `overlay`, `tmpfs`, `ramfs`,
+`xfs`, `ext4` (the shared ext2/ext3/ext4 magic), `btrfs`, or an unknown magic as
+`0x...`; `unavailable` means no native root was configured or statfs failed.
+`file_backed` is `true` after a successful worker-start probe, `false` after ENOTBLK
+with explicitly enabled loop fallback, and `null` before probing or when forced off.
+`loop_devices` is null in file-backed mode; otherwise status reads
 an advisory snapshot of `device_nodes`, `free_nodes`, `unknown_nodes` and
 `scan_truncated` off the request thread. Only existing visible loop block nodes are
 counted; no devices are allocated, and free nodes are not a reservation. Read-only
 CLI preflight leaves `file_backed` null. `/v1/preflight` retains the startup snapshot;
 `/v1/status` refreshes loop counts. `SANDBOX_EROFS_FORCE_LOOP=1` disables the probe
-and selects loop mounts for fallback validation. Loop exhaustion returns static
+and selects loop mounts for fallback validation, regardless of `native.erofs_loop_fallback`.
+That configuration setting defaults to false: an ENOTBLK startup probe then refuses
+startup with static `erofs_file_backed_unavailable` and an operator-facing log;
+true permits the existing loop behavior with a warning. Other probe failures do not
+select fallback. Loop exhaustion returns static
 `erofs_loop_devices_exhausted` (500, not a pre-launch failover refusal).
+
+CLI and HTTP preflight include a `worker_root_filesystem` check with `advisory:true`
+and a plain-English `message`. Its `ok` is false for overlay/tmpfs/ramfs or an
+unavailable filesystem, but it never changes `ready`; only non-advisory checks
+(`advisory:false`) determine readiness. An advisory success is not a mount-support
+guarantee. HTTP preflight caches the startup report and does not run new probes.
 
 `/v1/preflight` also records `active_overlay_backing_features` in its checks and
 `overlay_volatile` (false for ext4-backed ordinary overlays, null in read-only CLI

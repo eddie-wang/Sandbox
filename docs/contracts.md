@@ -70,8 +70,9 @@ protections. There is no user-supplied archive or executable host path.
 
 Lower mounts are shared by digest and are read-only, nodev/nosuid. Only these shared
 EROFS images prefer file-backed mounts, selected by a tiny startup probe under the
-worker root lock. Unsupported kernels use the standard loop facility; a failed
-individual image never triggers fallback. Both forms verify mount flags and the
+worker root lock. An ENOTBLK probe requires `native.erofs_loop_fallback = true`
+to use the standard loop facility (or the forced-loop test switch); otherwise
+startup fails with `erofs_file_backed_unavailable`. A failed individual image never triggers fallback. Both forms verify mount flags and the
 image source before reuse or restart cleanup. EROFS file-backed base mounts remain loop-free.
 Each sandbox gets its own ext4 image and private loop device, with `upper` and `work`
 inside `upperfs`. OverlayFS uses `lowerdir=<base>` and

@@ -20,10 +20,14 @@ An operator must separately provision and approve:
 
 - Root/host authority, including mount/namespaces, ptrace, cgroup, mknod, ownership,
   UID/GID/capability setup and resource-limit capabilities. A rootless/containerized
-  shell with missing capabilities is not enough.
+  shell with missing capabilities is not enough. Container-runtime deployments require
+  privileged/host-authorized pods (or a host service), not ordinary unprivileged pods;
+  host networking alone does not grant the required authority.
 - EROFS and OverlayFS **already available** in the kernel. File-backed EROFS needs
   Linux 6.12+ with `CONFIG_EROFS_FS_BACKED_BY_FILE`; older kernels need available
-  loop device nodes for legacy shared lowers. Every writable upper requires loop-control,
+  loop device nodes and explicit `native.erofs_loop_fallback = true` for legacy shared lowers.
+  File backing also depends on the filesystem storing the image, not just the kernel.
+  Every writable upper requires loop-control,
   ext4, device-node creation and direct I/O, tested actively at startup. No module loading or package installation
   is done by the service/script.
 - Trusted standard `runc`, **`conmon` 2.1.10**, `criu`, `mount`, `umount`, GNU `tar`/`cp`, `mkfs.erofs`, `mkfs.ext4`, `ip`,
@@ -38,13 +42,16 @@ An operator must separately provision and approve:
   egress support. GNU tar also invokes its
   fixed `/bin/sh`, and dynamic binaries depend on system libraries/loaders. Review
   administrator system CRIU configuration; request options do not replace host trust.
-  For the smoke: Python 3, a C compiler with static libc, `nsenter`, sandboxd and
-  `strace` with syscall fault injection (qualified with 6.8). The runtime gate uses
-  path-filtered faults on its own worker threads, never on runtime children.
+  For the runtime, image and stress gates: **Python 3.11+** (standard-library `tomllib`),
+  a C compiler with static libc, `nsenter`, sandboxd and `strace` with syscall fault
+  injection (qualified with 6.8). The runtime gate uses path-filtered faults on its
+  own worker threads and startup probe helpers, never on workload runtime children.
   No rootfs or tool downloads are performed by the smoke.
-- A new dedicated administrator-owned root with actual OverlayFS d_type and
-  user/trusted-xattr support; XFS needs ftype=1. Startup tests the backing directory,
-  not a filesystem-family allowlist or kernel release. All ancestors must be owned by UID 0,
+- A new dedicated administrator-owned `native.root` on a **node-local disk filesystem
+  such as xfs or ext4**, not the container's overlay root, tmpfs or ramfs. File-backed
+  EROFS can fail with ENOTBLK on those filesystems. The root needs actual OverlayFS
+  d_type and user/trusted-xattr support; XFS needs ftype=1. Startup tests the backing
+  directory, not a filesystem-family allowlist or kernel release. All ancestors must be owned by UID 0,
   not group/other writable and not symlinks. Give the root private permissions.
   Supply operator disk capacity/quota; each writable ext4 image bounds private writes, but shared artifacts/cache still need operator quotas.
 - An operator-provided **pod-private mount namespace**: the covering mounts of the
@@ -69,6 +76,17 @@ private ext4/loop direct I/O, ordinary overlay, d_type, user/trusted xattrs, cop
 mount-data length. Its cached preflight reports `active_overlay_backing_features`
 and `overlay_volatile`; read-only CLI preflight leaves the latter null. Real process
 checkpoint, restore, isolation and cleanup still require the gates below.
+
+Both read-only CLI/HTTP preflight and worker status report `erofs.root_filesystem`
+from `statfs(native.root)`. The `worker_root_filesystem` preflight row is advisory:
+its warning on overlay/tmpfs/ramfs never changes `ready`, and even xfs/ext4 does not
+prove file-backed EROFS support. Startup's active EROFS probe is authoritative. On
+ENOTBLK, startup refuses with `erofs_file_backed_unavailable` unless
+`native.erofs_loop_fallback = true` (default false). Opt-in logs a warning and uses
+one visible loop device per retained shared lower; pods may expose very few.
+Other mount errors still fail closed. `SANDBOX_EROFS_FORCE_LOOP=1` remains a test-only
+probe bypass that implies loop use even when the setting is false. Neither option
+relaxes writable ext4 direct-I/O requirements or any other prerequisite.
 
 ### Administrator-staged tools
 
@@ -97,6 +115,13 @@ but shell ancestry and dynamic-library integrity were **not established**. Stagi
 is not a hardened-host qualification; production use needs a trusted system too.
 
 ### Cluster deployment boundary
+
+Run on an explicitly privileged/host-authorized pod or host service; ordinary pods
+cannot run this native container runtime. Mount node-local xfs/ext4 storage into the
+pod and put `native.root` there, including its EROFS images, writable images and
+checkpoints. Do not leave it on the image's overlay root or a memory-backed volume.
+The opt-in `native.erofs_loop_fallback` is a limited-device fallback, not a substitute
+for host authority, disk capacity or the writable upper's direct-I/O support.
 
 Use the pod's private mount namespace, not the node's host mount namespace; do not
 use bidirectional/host-to-container propagation for the worker root or `/run`.
@@ -209,7 +234,18 @@ not cloned. See [network details](network.md) for the route composition.
 
 ## Gate assertions
 
-The script fails rather than substituting a fake runtime/result. It exercises:
+The script fails rather than substituting a fake runtime/result. Before its main
+lifecycle cases, the isolated runtime gate mounts a bounded disposable tmpfs root:
+read-only preflight warns without changing readiness; omitted/false fallback refuses
+startup on the pure tmpfs root before probing writable storage. True fallback and
+the forced-loop switch each run one small container with
+one verified loop-backed EROFS lower. Only `private/` is bind-mounted from test-owned
+disk storage to preserve the existing writable-upper direct-I/O requirement; the
+root and EROFS image remain on tmpfs. A worker killed during its writable startup
+probe leaves real overlay/ext4 mounts and a loop; a subsequent default-false ENOTBLK
+refusal must reclaim that old probe before exiting. The gate verifies probe, loop,
+mount, namespace and cgroup cleanup, then checks the normal disk-root run reports its actual filesystem
+and file-backed EROFS. It also exercises:
 
 1. Actual EROFS/shared-lower and private OverlayFS blocking cold creates through the
    controller, which assigns the returned ID (template-default and explicit resources);

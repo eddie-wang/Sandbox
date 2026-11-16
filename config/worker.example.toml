@@ -14,7 +14,10 @@ env = "SANDBOX_WORKER_TOKEN"
 # Secret files are operator-managed and must not be committed.
 
 # In this disabled configuration these are illustrative budgets, not measured usage.
-# Native mode performs worker reservation and kernel enforcement; see the separate example.
+# Native mode performs worker reservation and kernel enforcement; see worker.native.example.toml.
+# In its [native] section, erofs_loop_fallback = false is the default; put native.root
+# on a node-local disk filesystem such as xfs or ext4, not container overlay/tmpfs.
+# Set erofs_loop_fallback = true only to opt into extra EROFS loop-device use.
 # These numbers are unrelated to the unresolved capacity qualification budget.
 [capacity]
 memory_mib = 8192

@@ -58,7 +58,7 @@ RBAC, built-in TLS or Internet-facing connection defense.
 - Administrator-provisioned immutable EROFS bases are content-addressed, verified
   once per node and mounted read-only. Their verified file identities survive
   worker restarts. File-backed EROFS bases remain loop-free on supported kernels;
-  the existing startup-selected legacy loop fallback remains available for bases.
+  put `native.root` on node-local xfs/ext4; EROFS loop fallback requires `native.erofs_loop_fallback = true`.
 - Every cold and restored sandbox has an **ext4 image containing OverlayFS upper/work**,
   on its own autoclearing direct-I/O loop device. The cold template's `writable_mib`
   defaults to 1024 MiB (1 GiB, including metadata), a per-sandbox capacity limit

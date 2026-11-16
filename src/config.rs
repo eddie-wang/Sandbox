@@ -252,6 +252,9 @@ pub struct WorkerConfig {
 pub struct NativeConfig {
     pub enabled: bool,
     pub root: String,
+    // Allow shared EROFS lowers to use loop devices only after an ENOTBLK startup probe.
+    #[serde(default)]
+    pub erofs_loop_fallback: bool,
     pub cgroup_parent: String,
     #[serde(default)]
     pub tools_dir: Option<String>,

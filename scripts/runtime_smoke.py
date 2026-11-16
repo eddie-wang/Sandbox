@@ -18,9 +18,11 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import tarfile
 import time
+import tomllib
 
 import socket
 import stat
@@ -30,15 +32,30 @@ import threading
 from smoke import eventually, exchange, exec_events, expect, port, request as smoke_request
 
 
-# Runs the worker's read-only preflight for this config and returns the host
-# compatibility fingerprint a manifest must carry. Fails before workload launch if any check fails.
+# Compare the worker's filesystem name with an independent statfs query through stat(1).
+# Ext2/3/4 share a magic number and are reported as ext4; other magic numbers stay hexadecimal.
+def filesystem_name(root):
+    magic = int(subprocess.check_output(["stat", "-f", "-c", "%t", str(root)], text=True, timeout=5).strip(), 16)
+    return {0x794c7630: "overlay", 0x01021994: "tmpfs", 0x858458f6: "ramfs", 0x58465342: "xfs",
+            0xEF53: "ext4", 0x9123683E: "btrfs"}.get(magic, f"0x{magic:x}")
+
+
+# Run read-only preflight, verify the root filesystem report and return manifest compatibility.
+# Required checks must pass; the root filesystem row is advisory even when it warns about risk.
 def preflight_compatibility(binary, worker_config):
     # Version checks and preflight do not install/load/configure anything.
     report = subprocess.run([binary, "preflight", "--config", str(worker_config)], capture_output=True, timeout=15)
     if report.returncode:
         print(report.stdout.decode(errors="replace"))
         raise RuntimeError("preflight failed; no workload launch attempted")
-    return json.loads(report.stdout)["compatibility"]
+    report = json.loads(report.stdout)
+    root = tomllib.loads(worker_config.read_text())["native"]["root"]
+    assert report["erofs"]["root_filesystem"] == filesystem_name(root), report
+    assert report["erofs"]["file_backed"] is None, report
+    row = next(c for c in report["checks"] if c["name"] == "worker_root_filesystem")
+    assert row["advisory"] and row["message"], row
+    assert report["ready"] == all(c["ok"] for c in report["checks"] if not c["advisory"]), report
+    return report["compatibility"]
 
 
 # Moves a built EROFS image into the worker's digest-named layer store and
@@ -252,7 +269,176 @@ def mount_inventory_gate(binary, root, worker_config):
     print("PASS mountinfo octal/non-UTF-8 paths, propagation fields and mounted-descendant refusal")
 
 
-# Run real lifecycle, sparse-archive integrity, ready-copy ownership and restart gates (at most three containers).
+# Kill a real worker during its active writable probe, leaving its owned overlay/ext4 mounts and loop.
+# Stop only the startup probe's unmount syscall; no workload has launched. Drain the tracer after
+# killing the worker and let the caller exercise restart cleanup rather than removing the residue.
+def interrupt_overlay_probe(binary, worker_config, env, root):
+    probe = root / "private/.overlay-probe"
+    trace = worker_config.parent / "tmpfs-interrupted-overlay.trace"
+    log = worker_config.parent / "tmpfs-interrupted-overlay.log"
+    # Keep a Popen handle to the eventual worker PID while attaching the tracer before exec.
+    bootstrap = "import os,signal,sys; os.kill(os.getpid(), signal.SIGSTOP); os.execv(sys.argv[1], sys.argv[1:])"
+    with log.open("wb") as output:
+        worker = subprocess.Popen([sys.executable, "-c", bootstrap, binary, "worker", "--config", str(worker_config)],
+                                  env=env, stdout=output, stderr=subprocess.STDOUT)
+    tracer = None
+    try:
+        eventually(lambda: "T (stopped)" in Path(f"/proc/{worker.pid}/status").read_text(), timeout=5)
+        with log.open("ab") as output:
+            tracer = subprocess.Popen(["strace", "-f", "-I", "1", "-qq", "-y", "-o", str(trace),
+                "-e", "trace=umount2", "-P", str(probe / "upperfs/mount"),
+                "-e", "inject=umount2:error=EBUSY:signal=SIGSTOP:when=1", "-p", str(worker.pid)],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+        eventually(lambda: f"TracerPid:\t{tracer.pid}\n" in Path(f"/proc/{worker.pid}/status").read_text(), timeout=5)
+        worker.send_signal(signal.SIGCONT)
+        eventually(lambda: "INJECTED" in trace.read_text() and "stopped by SIGSTOP" in trace.read_text(), timeout=15)
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
+        if tracer is not None:
+            try:
+                tracer.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                tracer.terminate()
+                try:
+                    tracer.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    tracer.kill()
+                    tracer.wait(timeout=5)
+                    raise RuntimeError("startup probe tracer did not drain")
+    assert worker.returncode == -signal.SIGKILL, log.read_text()
+    targets = {str(probe / "upperfs"): "ext4", str(probe / "upperfs/mount"): "overlay"}
+    mounts = {}
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split()
+        if fields[4] in targets:
+            mounts[fields[4]] = fields[fields.index("-") + 1]
+    assert mounts == targets, mounts
+    node = (probe / "loop").stat()
+    assert stat.S_ISBLK(node.st_mode) and os.major(node.st_rdev) == 7
+    loop = "loop" + str(os.minor(node.st_rdev))
+    backing = loop_backings()[loop]
+    assert backing.endswith("/.overlay-probe/writable.ext4"), backing
+    return dict(worker_exit=worker.returncode, mounts_before_restart=mounts, loop=loop, backing=backing)
+
+
+# Exercise real ENOTBLK on tmpfs: fresh/refused restart cleanup, opt-in and forced loops.
+# Bind only private upper storage from disk because its direct-I/O loops require disk backing.
+# Keep logs outside tmpfs, run one small container at a time, and remove only owned mounts/groups.
+def tmpfs_erofs_gate(binary, root, worker_config, env, worker_token, manifest):
+    config = tomllib.loads(worker_config.read_text())
+    cgroup = Path(config["native"]["cgroup_parent"])
+    worker_port = int(config["server"]["listen"].rsplit(":", 1)[1])
+    probe = root / "tmpfs-root"
+    private = root / "tmpfs-private"
+    probe.mkdir(mode=0o700)
+    private.mkdir(mode=0o700)
+    digest = hashlib.sha256(str(probe).encode()).hexdigest()
+    prefix = "sb-" + digest[:16] + "-"
+    owned_groups = [cgroup / (kind + digest) for kind in (".helpers-", ".monitors-")]
+    text = worker_config.read_text().split("\n[native.network]")[0]
+    text = text.replace(f"root = {json.dumps(str(root))}", f"root = {json.dumps(str(probe))}")
+    text = text.replace("upper_pool_size = 2", "upper_pool_size = 0").replace("max_sandboxes = 3", "max_sandboxes = 1")
+    text = text.replace("max_concurrent_restores = 2", "max_concurrent_restores = 1").replace("memory_mib = 192", "memory_mib = 64")
+    test_env = dict(env)
+    test_env.pop("SANDBOX_EROFS_FORCE_LOOP", None)
+    observations = {}
+    bound = False
+    subprocess.run(["mount", "-t", "tmpfs", "-o", "size=128m,mode=700", "tmpfs", str(probe)], check=True, timeout=5)
+    try:
+        test_config = root / "tmpfs-worker.toml"
+        for setting in ("default", "false"):
+            test_config.write_text(text if setting == "default" else text.replace("[native]", "[native]\nerofs_loop_fallback = false"))
+            before = sorted(p.name for p in probe.iterdir())
+            preflight_compatibility(binary, test_config)
+            report = json.loads(subprocess.check_output([binary, "preflight", "--config", str(test_config)], timeout=15))
+            assert before == sorted(p.name for p in probe.iterdir()), "read-only preflight wrote state"
+            row = next(c for c in report["checks"] if c["name"] == "worker_root_filesystem")
+            assert report["ready"] and not row["ok"] and row["advisory"] and "loop" in row["message"], report
+            log = root / f"tmpfs-refused-{setting}.log"
+            with log.open("wb") as output:
+                result = subprocess.run([binary, "worker", "--config", str(test_config)], env=test_env, stdout=output, stderr=subprocess.STDOUT, timeout=90)
+            error = log.read_text()
+            assert result.returncode != 0 and "erofs_file_backed_unavailable" in error, error
+            assert all(word in error for word in ("tmpfs", "node-local", "xfs", "ext4", "overlay", "native.erofs_loop_fallback = true")), error
+            assert not (probe / "erofs-probe").exists() and not (probe / "private/.overlay-probe").exists()
+            observations[setting] = dict(exit_code=result.returncode, erofs=report["erofs"], advisory=row)
+        # Refusal above used a pure tmpfs root. Successful loop mode still needs disk-backed uppers.
+        assert not any((probe / "private").iterdir()), "refused startup left private probe state"
+        subprocess.run(["mount", "--bind", str(private), str(probe / "private")], check=True, timeout=5)
+        bound = True
+        test_config.write_text(text)
+        interrupted = interrupt_overlay_probe(binary, test_config, dict(test_env, SANDBOX_EROFS_FORCE_LOOP="1"), probe)
+        log = root / "tmpfs-restart-refused.log"
+        with log.open("wb") as output:
+            refused = subprocess.run([binary, "worker", "--config", str(test_config)], env=test_env,
+                                     stdout=output, stderr=subprocess.STDOUT, timeout=90)
+        assert refused.returncode == 1 and "erofs_file_backed_unavailable" in log.read_text(), log.read_text()
+        assert not (probe / "private/.overlay-probe").exists() and not (probe / "erofs-probe").exists()
+        assert not any(line.split()[4].startswith(str(probe / "private/.overlay-probe"))
+                       for line in Path("/proc/self/mountinfo").read_text().splitlines())
+        eventually(lambda: loop_backings().get(interrupted["loop"]) != interrupted["backing"], timeout=5)
+        observations["interrupted_overlay_restart"] = dict(interrupted, restart_exit=refused.returncode,
+            error="erofs_file_backed_unavailable", probe_removed=True, mounts_removed=True, loop_released=True)
+        print("PASS interrupted startup overlay/ext4 probe: refused ENOTBLK restart reclaims both mounts, loop and probe files")
+        image = probe / "fixture.erofs"
+        shutil.copyfile(root / "layers" / (manifest["base"]["sha256"] + ".erofs"), image)
+        write_template(probe, dict(manifest, base=publish_layer(probe, image), writable_mib=64,
+                                   init_argv=["/fixture", "init"], network={"mode": "isolated"}))
+        for mode in ("fallback", "forced"):
+            test_config.write_text(text.replace("[native]", "[native]\nerofs_loop_fallback = " + ("true" if mode == "fallback" else "false")))
+            run_env = test_env if mode == "fallback" else dict(test_env, SANDBOX_EROFS_FORCE_LOOP="1")
+            log = root / f"tmpfs-{mode}.log"
+            with log.open("wb") as output:
+                worker = subprocess.Popen([binary, "worker", "--config", str(test_config)], env=run_env, stdout=output, stderr=subprocess.STDOUT)
+            sandbox = f"node-smoke.tmpfs-{mode}"
+            try:
+                eventually(lambda: expect(smoke_request(worker_port, "/v1/status", worker_token), 200)["admission_ready"], timeout=30)
+                status = expect(smoke_request(worker_port, "/v1/status", worker_token), 200)["erofs"]
+                active = expect(smoke_request(worker_port, "/v1/preflight", worker_token), 200)
+                assert active["ready"] and active["erofs"]["root_filesystem"] == status["root_filesystem"] == "tmpfs", active
+                assert status["forced_loop"] == (mode == "forced"), status
+                assert status["file_backed"] is (False if mode == "fallback" else None), status
+                result = expect(smoke_request(worker_port, "/v1/sandboxes", worker_token,
+                    dict(sandbox_id=sandbox, template_id="fixture", ttl_seconds=60), "POST", timeout=90), 201)
+                assert result["state"] == "running", result
+                observed = erofs_observation(probe, status)
+                assert len(observed["lower_sources"]) == len(observed["owned_loop_backings"]) == 1, observed
+                observations[mode] = observed
+                result = expect(smoke_request(worker_port, f"/v1/sandboxes/{sandbox}", worker_token, method="DELETE", timeout=90), 200)
+                assert result["state"] == "deleted" and not (cgroup / sandbox).exists(), result
+            finally:
+                if worker.poll() is None:
+                    worker.terminate()
+                    try:
+                        worker.wait(timeout=180)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+                        worker.wait(timeout=5)
+                        raise RuntimeError("tmpfs worker shutdown failed; retained state requires reconciliation")
+            assert worker.returncode == 0, log.read_text()
+            assert "Warning:" in log.read_text() and "loop devices" in log.read_text(), log.read_text()
+    finally:
+        (root / "tmpfs-erofs.json").write_text(json.dumps(observations, indent=2))
+        # Never unmount over a live worker mount or remove a populated group after a failure.
+        points = [line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()]
+        assert not any(p.startswith(str(probe) + "/") and p != str(probe / "private") for p in points), points
+        assert not any(p.name.startswith(prefix) for p in Path("/run/netns").iterdir()), "tmpfs netns remain"
+        for group in owned_groups:
+            if group.exists():
+                assert "populated 0" in (group / "cgroup.events").read_text() and not any(p.is_dir() for p in group.iterdir()), group
+                group.rmdir()
+        eventually(lambda: not any(("/" + p.lstrip("/")).startswith((str(probe) + "/", str(private) + "/")) for p in loop_backings().values()), timeout=5)
+        if bound:
+            subprocess.run([binary, "internal-unmount", str(probe / "private")], check=True, timeout=5)
+        subprocess.run([binary, "internal-unmount", str(probe)], check=True, timeout=5)
+        probe.rmdir()
+        private.rmdir()
+    print("PASS tmpfs root: advisory preflight, default/explicit refusal, opted-in and forced EROFS loops, complete cleanup")
+
+
+# Run real lifecycle, tmpfs-root startup, sparse-archive and restart gates (at most three containers).
 # Check mounts/storage, OCI limits, syscall policy on cold/restored copies, conmon and CNI ownership.
 # --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
@@ -382,6 +568,8 @@ url = "http://127.0.0.1:{worker_port}"
                              ({"mode":"tcp_allowlist", "egress":[{"ip":"198.18.0.1","port":18080}, {"ip":"198.19.0.2","port":18080}, {"ip":"198.19.0.3","port":18080}], "service_ports":[8080]} if args.network else {"mode": "isolated"}),
                              memory_mib=64, vcpus=1, pids_max=64)
     write_template(root, manifest)
+    if not args.network:
+        tmpfs_erofs_gate(binary, root, worker_config, env, worker_token, manifest)
     for mode in ("monitor-exit", "monitor-oom", "exit-now"):
         write_template(root, dict(manifest, template_id=mode, init_argv=["/fixture", mode]))
     # A non-directory at the fixed working path makes runc create fail, unlike a program's own exit.
@@ -1766,6 +1954,10 @@ url = "http://127.0.0.1:{worker_port}"
         print("PASS worker crash during exec/capture/proxy: host-helper drain and cleanup before ready; retained-template restore")
         erofs = expect(request(worker_port, "/v1/preflight", worker_token), 200)["erofs"]
         assert erofs["forced_loop"] == (os.environ.get("SANDBOX_EROFS_FORCE_LOOP") == "1"), erofs
+        assert erofs["root_filesystem"] == filesystem_name(root), erofs
+        assert erofs["file_backed"] is (None if erofs["forced_loop"] else True), erofs
+        status_erofs = expect(request(worker_port, "/v1/status", worker_token), 200)["erofs"]
+        assert status_erofs["root_filesystem"] == erofs["root_filesystem"] and status_erofs["file_backed"] == erofs["file_backed"], status_erofs
         observations["erofs_before"] = dict(before_worker_loop_backings_total=len(loop_before), **erofs_observation(root, erofs))
         # After restart has cleared earlier lowers, retain 32 distinct mounts while deleting each
         # sandbox. This stays within three live containers and does not add the normal suite's

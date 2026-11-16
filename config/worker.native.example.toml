@@ -34,7 +34,10 @@ max_concurrent_restores = 1
 
 [native]
 enabled = true
+# Use a node-local disk filesystem such as xfs or ext4, not container overlay/tmpfs.
 root = "/var/lib/sandbox"
+# Opt in only if file-backed EROFS is unavailable and enough loop devices are provisioned.
+erofs_loop_fallback = false
 cgroup_parent = "/sys/fs/cgroup/sandbox"
 # Optional existing administrator-staged tools; fixed basenames, never API paths.
 # tools_dir = "/var/lib/sandbox-tools"

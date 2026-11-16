@@ -5,7 +5,13 @@ use serde_json::{Value, json};
 use crate::{config::NativeConfig, model::{ErofsStatus, LoopCapacity, SandboxSpec}, phases::Phases, process::{self, Result}, storage::{self, Artifact, Compatibility, FileIdentity, Manifest}};
 
 #[derive(Clone, Serialize)]
-pub struct Check { pub name: String, pub ok: bool }
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub advisory: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<&'static str>,
+}
 #[derive(Clone, Serialize)]
 pub struct Preflight {
     pub ready: bool,
@@ -96,6 +102,23 @@ pub fn loop_capacity() -> Option<LoopCapacity> {
         }
     }
     Some(capacity)
+}
+
+// Read the filesystem containing the configured worker root without creating anything. Ext2/3/4
+// share one magic number; report it as ext4. Unknown magic numbers remain visible as hexadecimal.
+fn root_filesystem(root: &Path) -> Option<String> {
+    let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).ok()?;
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut info) } != 0 { return None; }
+    Some(match info.f_type as u64 {
+        0x794c7630 => "overlay".into(),
+        0x01021994 => "tmpfs".into(),
+        0x858458f6 => "ramfs".into(),
+        0x58465342 => "xfs".into(),
+        0xef53 => "ext4".into(),
+        0x9123683e => "btrfs".into(),
+        magic => format!("0x{magic:x}"),
+    })
 }
 
 // Mount an image directly, without util-linux's implicit loop allocation. Like composefs, only
@@ -232,12 +255,13 @@ fn tool_search_path(tools: &BTreeMap<String, String>) -> Result<String> {
 
 // Inspect host prerequisites, trusted tools, configured bridge and delegated resources without
 // creating runtime state, including CNI protocol support and the configured link MTU. Only x86-64 has
-// a resolved syscall policy. All checks must pass; active EROFS/overlay probes run only at startup.
+// a resolved syscall policy. Required checks determine readiness; root filesystem advice does not.
+// Active EROFS/overlay probes run only at startup.
 pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
     let tools = tools(config);
     let search_path = tool_search_path(&tools);
     let mut checks = Vec::new();
-    let mut add = |name: &str, ok: bool| checks.push(Check { name: name.to_owned(), ok });
+    let mut add = |name: &str, ok: bool| checks.push(Check { name: name.to_owned(), ok, advisory: false, message: None });
     add("linux", std::env::consts::OS == "linux");
     add("supported_architecture", std::env::consts::ARCH == "x86_64");
     add("namespaces", ["pid", "mnt", "net", "ipc", "uts", "cgroup"].iter().all(|n| Path::new("/proc/self/ns").join(n).exists()));
@@ -298,14 +322,25 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
                 config.and_then(|c| c.network.as_ref()).map_or(1500, |n| n.mtu)) })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
-    let erofs = ErofsStatus { file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };
-    Preflight { ready: checks.iter().all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs, overlay_volatile: None }
+    let root_filesystem = config.and_then(|c| root_filesystem(Path::new(&c.root))).unwrap_or_else(|| "unavailable".into());
+    let risky_root = matches!(root_filesystem.as_str(), "overlay" | "tmpfs" | "ramfs");
+    checks.push(Check { name: "worker_root_filesystem".into(), ok: !risky_root && root_filesystem != "unavailable", advisory: true,
+        message: Some(if risky_root {
+            "File-backed EROFS may fail on overlay, tmpfs or ramfs; place native.root on a node-local disk filesystem such as xfs or ext4, not the container's overlay root or tmpfs. Opting into native.erofs_loop_fallback consumes loop devices."
+        } else if root_filesystem == "unavailable" {
+            "The native.root filesystem could not be inspected or native is not configured; no file-backed EROFS support is established."
+        } else {
+            "The native.root filesystem was detected; only the active startup probe establishes file-backed EROFS support."
+        }) });
+    let erofs = ErofsStatus { root_filesystem, file_backed: None, forced_loop: std::env::var_os("SANDBOX_EROFS_FORCE_LOOP").is_some_and(|v| v == "1"), loop_devices: loop_capacity() };
+    Preflight { ready: checks.iter().filter(|c| !c.advisory).all(|c| c.ok), qualification: "unvalidated", checks, compatibility, erofs, overlay_volatile: None }
 }
 
 impl Native {
     // Lock the root, drain old helpers and open durable monitor ownership before starting threads.
-    // Verify private storage and discard interrupted checkpoint, scratch and idle-copy entries.
-    // Probe EROFS and actual overlay features under the lock before advertising readiness.
+    // Reclaim interrupted writable probes and discard old checkpoint, scratch and idle-copy entries.
+    // Require opt-in for EROFS loop fallback before probing writable storage, so ENOTBLK gets its
+    // own actionable error even when the backing filesystem cannot support direct-I/O uppers.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
         let root = Path::new(&config.root);
@@ -340,10 +375,20 @@ impl Native {
         let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, monitors, volatile_overlay: false, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
             verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), upper_pool: crate::upper::UpperPool::default(), _lock: lock };
         native.clear_upper_pool()?;
-        native.volatile_overlay = native.probe_overlay()?;
+        native.clear_overlay_probe(&native.root().join("private/.overlay-probe"))?;
         native.clear_erofs_probe()?;
-        if !native.erofs.forced_loop { native.erofs.file_backed = Some(native.probe_file_erofs()?); }
+        if !native.erofs.forced_loop {
+            native.erofs.file_backed = Some(native.probe_file_erofs()?);
+            if native.erofs.file_backed == Some(false) && !native.config.erofs_loop_fallback {
+                eprintln!("sandboxd: File-backed EROFS is unavailable on native.root filesystem {}; place native.root on a node-local disk filesystem such as xfs or ext4 (not the container's overlay root or tmpfs), or set native.erofs_loop_fallback = true.", native.erofs.root_filesystem);
+                return Err("erofs_file_backed_unavailable");
+            }
+        }
+        if native.erofs.file_backed != Some(true) {
+            eprintln!("sandboxd: Warning: EROFS on native.root filesystem {} is using loop devices because loop fallback was enabled or SANDBOX_EROFS_FORCE_LOOP=1; available loop devices can limit shared lower mounts.", native.erofs.root_filesystem);
+        }
         native.erofs.loop_devices = if native.erofs.file_backed == Some(true) { None } else { loop_capacity() };
+        native.volatile_overlay = native.probe_overlay()?;
         Ok(native)
     }
     // Probe ext4-backed ordinary overlays with bounded helper lifetime and restart cleanup. Reject
@@ -407,7 +452,7 @@ impl Native {
         }
         storage::remove_private(&probe)
     }
-    // Try the known tiny plain image once. Only an unsupported-kernel answer selects loop fallback;
+    // Try the known tiny plain image once. Only ENOTBLK permits opting into loop fallback;
     // every other failure stops startup, and cleanup is required even after a failed mount.
     fn probe_file_erofs(&self) -> Result<bool> {
         let probe = self.root().join("erofs-probe");

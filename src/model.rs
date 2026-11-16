@@ -47,6 +47,7 @@ pub struct RuntimeCapability {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErofsStatus {
+    pub root_filesystem: String,
     pub file_backed: Option<bool>,
     pub forced_loop: bool,
     pub loop_devices: Option<LoopCapacity>,

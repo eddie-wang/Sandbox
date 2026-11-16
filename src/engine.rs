@@ -117,7 +117,7 @@ impl Handle {
             let native = Arc::new(Native::open(config.native.clone().ok_or("native_config_missing")?, report.clone())?);
             report.erofs = native.erofs.clone();
             report.overlay_volatile = Some(native.volatile_overlay);
-            report.checks.push(crate::native::Check { name: "active_overlay_backing_features".into(), ok: true });
+            report.checks.push(crate::native::Check { name: "active_overlay_backing_features".into(), ok: true, advisory: false, message: None });
             Some(native)
         } else { None };
         let status = WorkerStatus { schema_version: 1, node_id: config.node_id.clone(), architecture: std::env::consts::ARCH.to_owned(), os: std::env::consts::OS.to_owned(),
