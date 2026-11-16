@@ -10,7 +10,7 @@ IPv4 TCP allowlists and the streaming app proxy (path and host forms, binary and
 chunked bodies) inside a disposable outer test netns, restored listening
 sockets/fresh connections, and the existing lifecycle cases: cold create, capture
 without stopping the source, independent warm restore (including an established
-loopback TCP connection) from a sealed EROFS layer and a once-per-node checkpoint
+loopback TCP connection) from a cloned ext4 upper and a once-per-node checkpoint
 cache, chained capture of a restored child, deletion of a source whose dump was
 stopped at its deadline, layer verification kept across worker restarts, a reaping PID 1, concurrent, streamed and killed commands whose bounds stop
 only themselves, private writes/whiteouts, blocking inline results, cleanup after
@@ -55,18 +55,24 @@ RBAC, built-in TLS or Internet-facing connection defense.
 
 ## Real-runtime design
 
-- Administrator-provisioned immutable EROFS base images plus EROFS layers sealed by
-  captures, all content-addressed and mounted once per node as shared read-only
-  lowers. The create job hashes a layer the first time this worker uses it (two
-  creates of the same new layer hash it once; others never wait behind a hash) and
-  saves the result with the image file's identity, so it is trusted again after a
-  worker restart until the file changes; **ordinary private
-  OverlayFS upper/work directories**, a fresh empty upper per sandbox, no
-  per-container block devices or storage daemon. Shared EROFS mounts prefer direct
-  file backing (Linux 6.12+ with `CONFIG_EROFS_FS_BACKED_BY_FILE`), selected by a tiny
-  startup probe. Unsupported kernels use loop devices; status reports their free
-  visible nodes, and exhaustion returns `erofs_loop_devices_exhausted`. See
-  [runtime selection and its forced-loop validation switch](docs/runtime.md#erofs-mount-selection).
+- Administrator-provisioned immutable EROFS bases are content-addressed, verified
+  once per node and mounted read-only. Their verified file identities survive
+  worker restarts. File-backed EROFS bases remain loop-free on supported kernels;
+  the existing startup-selected legacy loop fallback remains available for bases.
+- Every cold and restored sandbox has an **ext4 image containing OverlayFS upper/work**,
+  on its own autoclearing direct-I/O loop device. The cold template's `writable_mib`
+  defaults to 1024 MiB (1 GiB, including metadata), a per-sandbox capacity limit
+  large enough for a 450 MiB upper. Cold images copy a once-formatted scratch image,
+  following containerd blockfile. Allocation uses loop-control and private device
+  nodes rather than requiring a large static `/dev/loopN` inventory. No storage
+  daemon is added. Warm templates pack the frozen copy and process images together
+  with GNU sparse tar: SHA-256 covers the whole archive, not logical image holes.
+  A bounded hot-template pool (`native.upper_pool_size`, default 32, zero disables)
+  refills mounted warm copies in the background, with synchronous fallback on misses.
+  Idle copies count toward private storage; restart discards them before readiness.
+  Disposable copies use ext4 no-log-flush shutdown before normal unmount on deletion.
+  See [storage contracts](docs/contracts.md) for format, copying,
+  durability, ownership and teardown details.
 - Native runc + CRIU, isolated PID/mount/network/IPC/UTS/cgroup namespaces, UID/GID
   65534, empty capabilities, `no_new_privs` and cgroup-v2 memory/swap/CPU/pids
   limits installed before launch. Seccomp uses the generated Docker default
@@ -120,21 +126,18 @@ RBAC, built-in TLS or Internet-facing connection defense.
   operator overcommit factor, rather than assuming each idle quota consumes a
   physical CPU.
 - Capture follows the AgentENV container backend and does not stop the source:
-  `runc pause`, check overlay write-back errors and seal the upper from the page
-  cache into a durable EROFS layer (ownership, xattrs,
-  whiteouts kept), `runc checkpoint --leave-running` with `--tcp-established
-  --ext-unix-sk --file-locks`, `runc resume`; then archive the images and atomically
-  publish the layer, manifest and digests. On failure the source is thawed and kept
-  if it runs, otherwise deleted; a dump stopped at its deadline or output limit is
-  handled the same way but reported as `checkpoint_interrupted`, so the caller can
-  delete a source the killed dump may have degraded. Children mount the sealed
-  layer(s) above the base (captures of warm children chain up to 16 layers) and
-  restore from CRIU images unpacked once per node per manifest digest, synced
-  before they are trusted, and shared read-only. File
-  identity and independent restore are explicit qualification gates, exercised by
-  open upper/lower descriptors, mappings and a loopback TCP connection in the real
-  fixture. That fixture passed; arbitrary open-file/application states and other
-  host configurations are **not assumed compatible**.
+  `runc pause`, freeze the private ext4 filesystem, sparse/reflink-copy its image,
+  thaw the filesystem, `runc checkpoint --leave-running` with `--tcp-established
+  --ext-unix-sk --file-locks`, then `runc resume`. The image and process checkpoint
+  are published atomically with their manifest. Children copy that image over the
+  unchanged EROFS base; chained captures retain inode tables without adding lowers.
+  CRIU and ext4 images are verified/cached once per manifest per node. Normal
+  delete and killed-worker reconciliation unmount without lazy detach, release
+  the owned loop and remove its image. Failed captures thaw before source recovery.
+  The upper inode/hardlink and retained SQLite DELETE-connection gates are explicit.
+  **Device numbers still differ**: SQLite lock sharing between retained and newly
+  opened connections remains a tested limitation, not a fidelity pass. Arbitrary
+  application state and other hosts are not assumed compatible.
 - Local immutable template repository with bounded artifact verification and
   exact kernel/architecture/runc/CRIU/init/config compatibility. CPU compatibility
   is CRIU's own check, not a feature fingerprint (AgentENV has none): a capture
@@ -176,11 +179,11 @@ RBAC, built-in TLS or Internet-facing connection defense.
   exec trampoline rather than copying the worker's address space. Network setup
   uses CNI for guest links and batches uplink ip commands without copying the mount namespace. A bounded connector
   pool makes proxy sockets; guest connections are still never reused.
-- Startup actively probes the upper backing directory for directory-entry types,
-  required xattrs, copy-up/hardlinks and ordinary/volatile overlay mounts. It caches
-  volatile support, bounds mount-data length and never retries a later failed mount
-  with weaker options. Capture seals frozen cached files and durably publishes the
-  sealed layer; checkpoint-cache sync touches only extracted files.
+- Startup actively probes ext4, loop direct I/O and the upper backing directory's
+  directory-entry types, xattrs, copy-up/hardlinks and ordinary overlay mounts.
+  Volatile overlays are disabled; ext4 freeze must capture all writes. Each upper
+  has its own filesystem, so unmount does not sync unrelated host filesystems.
+  Mount-data length remains bounded and failures do not select weaker options.
   Lazy-page restore is not enabled or supported.
 - runc alone creates/configures sandbox cgroups from OCI memory/swap/CPU/pids and
   whole-group OOM limits, including restored copies; helpers, monitors and per-exec

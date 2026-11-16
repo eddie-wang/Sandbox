@@ -15,6 +15,7 @@ mod proxy;
 mod storage;
 mod mounts;
 mod overlay;
+mod upper;
 mod monitor;
 
 use std::path::Path;
@@ -29,7 +30,7 @@ fn main() {
     }
 }
 
-// Dispatch internal helpers (including standalone CNI) or validate service configuration. Load credentials
+// Dispatch internal helpers (including disposable-upper shutdown) or validate configuration. Load credentials
 // only for serving; preflight prints prerequisite checks. Worker mount boundaries and active probes
 // are established before starting any threads, including the request runtime.
 fn start() -> Result<(), &'static str> {
@@ -38,6 +39,15 @@ fn start() -> Result<(), &'static str> {
     if args.len() == 2 && args[0] == "internal-overlay-probe" {
         if !overlay::probe(Path::new(&args[1]))? { std::process::exit(2); }
         return Ok(());
+    }
+    if args.len() == 3 && args[0] == "internal-upper" {
+        let private = Path::new(&args[2]);
+        return match args[1].to_str() {
+            Some("mount") => upper::mount(private), Some("freeze") => upper::freeze(private, true),
+            Some("thaw") => upper::freeze(private, false), Some("detach") => upper::detach(private),
+            Some("discard") => upper::discard(private),
+            _ => Err("invalid_upper_operation"),
+        };
     }
     if args.len() == 3 && args[0] == "internal-erofs-mount" { return native::erofs_mount_helper(&args[1], &args[2]); }
     if args.first().is_some_and(|a| a == "internal-cni") { return cni::exec(&args[1..]); }

@@ -264,6 +264,8 @@ pub struct NativeConfig {
     pub max_concurrent_execs: usize,
     #[serde(default = "default_execs_per_sandbox")]
     pub max_execs_per_sandbox: usize,
+    #[serde(default = "default_upper_pool_size")]
+    pub upper_pool_size: usize,
     pub max_artifact_bytes: u64,
     pub command_timeout_seconds: u64,
     #[serde(default)]
@@ -301,6 +303,9 @@ impl NetworkConfig {
 // Use Ethernet's usual MTU unless the operator selects a smaller underlay-safe value.
 fn default_network_mtu() -> u32 { 1500 }
 
+// Keep up to 32 prepared copies of the most recently requested warm template; zero disables prewarming.
+fn default_upper_pool_size() -> usize { 32 }
+
 // Use 16 parallel operation workers unless configured.
 fn default_concurrent_operations() -> usize { 16 }
 // Allow 64 running commands per worker unless configured.
@@ -309,8 +314,7 @@ fn default_concurrent_execs() -> usize { 64 }
 fn default_execs_per_sandbox() -> usize { 8 }
 
 impl NativeConfig {
-    // Reject unsafe native paths, invalid network settings and out-of-range resource, record or command
-    // limits.
+    // Reject unsafe paths, invalid networking and out-of-range resource, record, command or copy-pool limits.
     fn validate(&self) -> Result<(), &'static str> {
         for path in [&self.root, &self.cgroup_parent].into_iter().chain(self.tools_dir.iter()) {
             if !path.starts_with('/') || path.len() > 256
@@ -326,6 +330,7 @@ impl NativeConfig {
             || !(1..=16).contains(&self.cpu_overcommit)
             || !(16..=65536).contains(&self.pids_max)
             || !(1..=100000).contains(&self.max_records)
+            || self.upper_pool_size > 32
             || !(1..=64).contains(&self.max_concurrent_operations)
             || !(1..=1024).contains(&self.max_concurrent_execs)
             || !(1..=64).contains(&self.max_execs_per_sandbox)

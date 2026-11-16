@@ -8,7 +8,7 @@ forms), exec, reaping PID 1, marker write, a streamed long-running command, two
 concurrent commands, a WebSocket echo server run by a streaming command and reached
 through the proxy, kill, bounded commands that stop without stopping the sandbox,
 per-call overhead (proxy call, direct call inside the sandbox, exec round trip),
-warm capture (the worker freezes the source, seals its upper into an EROFS layer,
+warm capture (the worker freezes the source, clones its private ext4 filesystem,
 checkpoints it leaving it running and thaws it; a probe shows the source answering
 except while it is stopped), two independent child restores (the second reuses
 the node's checkpoint cache), HTTP and marker checks in the children, source/child
@@ -45,7 +45,7 @@ import threading
 import time
 
 from network_smoke import inventory, run
-from runtime_smoke import checkpoint_cache, watch_frozen, cold_manifest, preflight_compatibility, publish_layer, write_template
+from runtime_smoke import loop_backings, upper_observation, checkpoint_cache, watch_frozen, cold_manifest, preflight_compatibility, publish_layer, write_template
 from smoke import eventually, exchange, expect, port, request as smoke_request
 
 INDEX_TYPES = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
@@ -88,6 +88,54 @@ while True:
 """
 
 
+# The default HTTP fixture keeps a stock DELETE-journal SQLite connection alive across capture.
+# Lock probes roll back without changing pages; admitted second writers are a tested limitation.
+SQLITE_SERVER = """import http.server, json, os, sqlite3, sys
+path = '/workspace/history.sqlite'
+connection = sqlite3.connect(path, timeout=0)
+assert connection.execute('pragma journal_mode=delete').fetchone()[0] == 'delete'
+connection.execute('create table if not exists history (value text)')
+connection.execute("insert into history values ('captured')")
+connection.commit()
+cached_inode, cached_device = os.stat(path).st_ino, os.stat(path).st_dev
+class Handler(http.server.SimpleHTTPRequestHandler):
+    # Serve bounded SQLite observations, otherwise keep the normal directory-listing server.
+    def do_GET(self):
+        if not self.path.startswith('/sqlite/'):
+            return super().do_GET()
+        result = {}
+        try:
+            if self.path.startswith('/sqlite/write/'):
+                value = self.path.rsplit('/', 1)[-1]
+                assert value in ('source', 'first', 'second')
+                connection.execute('insert into history values (?)', (value,))
+                connection.commit()
+            if self.path == '/sqlite/locks':
+                connection.execute('begin immediate')
+                new = sqlite3.connect(path, timeout=0)
+                try:
+                    new.execute('begin immediate')
+                    result['second_writer_admitted'] = True
+                except sqlite3.Error as error:
+                    result.update(second_writer_admitted=False, lock_error=error.sqlite_errorcode)
+                finally:
+                    new.rollback()
+                    new.close()
+                    connection.rollback()
+            result.update(rows=[r[0] for r in connection.execute('select value from history')],
+                cached_inode=cached_inode, inode=os.stat(path).st_ino,
+                cached_device=cached_device, device=os.stat(path).st_dev)
+        except sqlite3.Error as error:
+            result.update(error=str(error), error_code=error.sqlite_errorcode, error_name=error.sqlite_errorname)
+        body = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+http.server.HTTPServer(('0.0.0.0', int(sys.argv[1])), Handler).serve_forever()
+"""
+
+
 class UnpackError(Exception):
     pass
 
@@ -105,7 +153,7 @@ def parse_args():
     parser.add_argument("--fetch-only", action="store_true", help="Fetch --image into --oci-layout and stop (no privilege needed)")
     parser.add_argument("--platform", default="linux/" + {"x86_64": "amd64", "aarch64": "arm64"}.get(host_platform.machine(), host_platform.machine()))
     parser.add_argument("--port", type=int, default=8000, help="Service port of the in-container HTTP server (the next port serves the WebSocket check)")
-    parser.add_argument("--init-argv", help="JSON argv of the workload; default: python3 -m http.server PORT --bind 0.0.0.0")
+    parser.add_argument("--init-argv", help="JSON argv of the workload; default: Python HTTP server with retained SQLite fidelity fixture")
     parser.add_argument("--no-image-env", action="store_true", help="Do not pass the image config Env to the workload via env(1)")
     parser.add_argument("--keep-image-resolver", action="store_true", help="Keep the image's /etc/resolv.conf and /etc/hosts as shipped")
     parser.add_argument("--http-path", default="/")
@@ -428,7 +476,7 @@ def prepare_resolver(rootfs):
 
 
 # Unpacks the selected image into a new rootfs, builds an uncompressed EROFS base
-# with mkfs.erofs and publishes it. Returns a description saved for the inner phase.
+# with mkfs.erofs and publishes it. Default Python init retains a SQLite connection for fidelity checks.
 def prepare_image(args, session):
     if args.oci_tar:
         layout = session / "oci-layout"
@@ -473,7 +521,7 @@ def prepare_image(args, session):
     image_config = config.get("config") or {}
     env = [e for e in image_config.get("Env") or [] if "=" in e and not e.startswith("-")]
     search_path = next((e.split("=", 1)[1] for e in env if e.startswith("PATH=")), "/usr/local/bin:/usr/bin:/bin")
-    argv = json.loads(args.init_argv) if args.init_argv else ["python3", "-m", "http.server", str(args.port), "--bind", "0.0.0.0"]
+    argv = json.loads(args.init_argv) if args.init_argv else ["python3", "-c", SQLITE_SERVER, str(args.port)]
     program = argv[0] if argv[0].startswith("/") else rootfs.which(argv[0], search_path)
     if not program:
         raise UnpackError(f"{argv[0]} not found on the image PATH")
@@ -558,7 +606,7 @@ def inner(args):
 
 
 # Runs the real worker and controller and drives the image workflow through the
-# controller API. Prints PASS lines with informational timings.
+# controller API, including joint sparse archives, retained SQLite writes and lock-sharing limitations.
 def lifecycle(args, session):
     prepared = json.loads((session / "prepared.json").read_text())
     binary = str(Path(args.binary).resolve())
@@ -854,6 +902,8 @@ url = "http://127.0.0.1:{worker_port}"
         assert not (session / "private" / sandbox).exists(), "private state remains"
         assert not (session / "runc" / sandbox).exists(), "runc state remains"
         assert not (cgroup / sandbox).exists(), "cgroup remains"
+        image = str(session / "private" / sandbox / "writable.ext4")
+        eventually(lambda: not any(("/" + p.lstrip("/")).startswith(image) for p in loop_backings().values()), timeout=5)
 
     try:
         worker = start("worker", worker_config)
@@ -974,6 +1024,20 @@ url = "http://127.0.0.1:{worker_port}"
         observations["per_call_overhead_samples_s"] = dict(proxy=proxy_times, direct=direct_times, exec_true=exec_times)
         print("PER-CALL OVERHEAD (informational): " + ", ".join(f"{k} {v * 1000:.2f} ms" for k, v in overhead.items()))
 
+        # The original connection must correctly exclude a second writer before capture.
+        # Read a SQLite result through the same authenticated application route.
+        def sqlite_call(sandbox, operation):
+            code, _, body = proxy_call(sandbox, path="/sqlite/" + operation)
+            value = json.loads(body)
+            assert code == 200 and "error" not in value, (code, value)
+            assert value["inode"] == value["cached_inode"], value
+            return value
+        if not args.init_argv:
+            before_sqlite = sqlite_call(source, "locks")
+            assert not before_sqlite["second_writer_admitted"] and before_sqlite["lock_error"] == 5, before_sqlite
+            assert before_sqlite["rows"] == ["captured"]
+            observations["sqlite_source_before"] = before_sqlite
+
         # Live traffic during capture: the source answers except while frozen.
         probe = availability_probe(source, "capture")
         stop_freezer = threading.Event()
@@ -998,13 +1062,16 @@ url = "http://127.0.0.1:{worker_port}"
         assert availability["successes_during_capture"] > 0 and availability["longest_without_answer_s"] < timings["capture_s"], availability
         warm = session / "templates" / "image-warm"
         warm_manifest = json.loads((warm / "manifest.json").read_text())
-        assert warm_manifest["schema_version"] == 3 and len(warm_manifest["layers"]) == 1 and not (warm / "upper.tar").exists()
-        observations["warm_artifacts"] = {"checkpoint.tar": (warm / "checkpoint.tar").stat().st_size, "sealed_layer": warm_manifest["layers"][0]}
+        assert warm_manifest["schema_version"] == 5 and warm_manifest["layers"] == [] and not (warm / "writable.ext4").exists()
+        with tarfile.open(warm / "checkpoint.tar") as packed:
+            upper = packed.getmember("./writable.ext4")
+            assert upper.size == warm_manifest["writable_mib"] << 20 and upper.sparse
+        observations["warm_artifacts"] = {"checkpoint.tar": (warm / "checkpoint.tar").stat().st_size, "upper_logical_bytes": upper.size}
         source_after, timings["source_http_after_capture_s"], _ = wait_http(source, 10)
         print(f"PASS capture {timings['capture_s']:.2f}s without stopping the source: freezer {availability['frozen_s']:.3f}s; "
               f"{availability['successes_during_capture']} probe answers during it, longest client-visible gap {availability['longest_without_answer_s']:.3f}s, "
               f"slowest answer {availability['slowest_answer_s']:.3f}s; "
-              f"checkpoint {observations['warm_artifacts']['checkpoint.tar']} bytes, sealed layer {warm_manifest['layers'][0]['bytes']} bytes")
+              f"joint sparse checkpoint {observations['warm_artifacts']['checkpoint.tar']} bytes, ext4 logical size {upper.size} bytes")
 
         child, timings["warm_restore_s"] = create("image-warm")
         cache, cache_state = checkpoint_cache(session, "image-warm")
@@ -1025,6 +1092,24 @@ url = "http://127.0.0.1:{worker_port}"
         assert checkpoint_cache(session, "image-warm") == (cache, cache_state), "checkpoint cache was re-extracted or written"
         second_first, _, _ = wait_http(second, 10)
         assert args.expect_body in second_first["body"] and execute(second, ["cat", MARKER]) == nonce
+        if not args.init_argv:
+            for sandbox in (source, child, second):
+                assert sqlite_call(sandbox, "status")["rows"] == ["captured"]
+            results = {}
+            for sandbox, branch in ((source, "source"), (child, "first"), (second, "second")):
+                result = sqlite_call(sandbox, "write/" + branch)
+                assert result["rows"] == ["captured", branch], result
+                results[branch] = result
+            for sandbox, branch in ((source, "source"), (child, "first"), (second, "second")):
+                assert sqlite_call(sandbox, "status")["rows"] == ["captured", branch]
+            observations["sqlite_retained_delete_connection"] = results
+            observations["upper_storage"] = {branch: upper_observation(session, sandbox) for branch, sandbox in (("source", source), ("first", child), ("second", second))}
+            print("PASS stock sqlite3 retained DELETE connection writes after capture; source and two copies keep independent rows/inodes")
+            locks = {branch: sqlite_call(sandbox, "locks") for sandbox, branch in ((source, "source"), (child, "first"), (second, "second"))}
+            assert not locks["source"]["second_writer_admitted"]
+            assert all(locks[b]["second_writer_admitted"] and locks[b]["cached_device"] != locks[b]["device"] for b in ("first", "second")), locks
+            observations["tested_limitation_sqlite_lock_sharing"] = locks
+            print("TESTED LIMITATION (not a fidelity pass): changed device numbers split old/new SQLite connection lock bookkeeping")
         result = expect(request(controller_port, f"/v1/sandboxes/{second}", token, method="DELETE"), 200)
         assert result["state"] == "deleted"
         gone(second)

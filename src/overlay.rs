@@ -43,7 +43,7 @@ fn directory_types(path: &Path) -> Result<()> {
     result
 }
 
-// Round-trip the user and trusted attributes needed by copy-up and sealed-layer metadata.
+// Round-trip the user and trusted attributes retained by copy-up and upper-image cloning.
 fn attributes(path: &Path) -> Result<()> {
     let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| "invalid_overlay_path")?;
     for name in [c"user.sandbox-probe", c"trusted.overlay.sandbox-probe"] {
@@ -65,9 +65,8 @@ fn mount_probe(probe: &Path, volatile: bool) -> std::result::Result<(), i32> {
     else { Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)) }
 }
 
-// In a tracked helper, qualify the real upper backing directory and ordinary overlay first, then
-// try volatile on fresh upper/work directories (containers/storage v1.57.0 checkSupportVolatile,
-// Apache-2.0). Only EINVAL/EOPNOTSUPP selects ordinary overlays; all other failures stop startup.
+// Qualify the actual private ext4 backing directory and ordinary overlay in a tracked helper.
+// Volatile mode is disabled: filesystem freezes must include all sandbox writes.
 pub fn probe(probe: &Path) -> Result<bool> {
     for name in ["lower", "upper", "work", "mount", "directory"] { crate::storage::private_dir(&probe.join(name))?; }
     fs::write(probe.join("file"), b"probe").map_err(|_| "overlay_probe_write_failed")?;
@@ -85,20 +84,5 @@ pub fn probe(probe: &Path) -> Result<bool> {
         || fs::read(probe.join("lower/file")).map_err(|_| "overlay_probe_read_failed")? != b"lower"
     { return Err("overlay_probe_content_mismatch"); }
     crate::mounts::unmount(&probe.join("mount"))?;
-    for name in ["upper", "work"] {
-        crate::storage::remove_private(&probe.join(name))?;
-        crate::storage::private_dir(&probe.join(name))?;
-    }
-    match mount_probe(probe, true) {
-        Ok(()) => {
-            // New kernels display the same requested volatile behavior as fsync=volatile.
-            if !crate::mounts::inventory()?.iter().any(|m| m.point == probe.join("mount") && m.super_options.iter().any(|o| o == "volatile" || o == "fsync=volatile")) {
-                return Err("overlay_volatile_not_applied");
-            }
-            crate::mounts::unmount(&probe.join("mount"))?;
-            Ok(true)
-        }
-        Err(libc::EINVAL | libc::EOPNOTSUPP) => Ok(false),
-        Err(_) => Err("overlay_volatile_probe_failed"),
-    }
+    Ok(false)
 }

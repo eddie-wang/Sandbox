@@ -3,8 +3,8 @@
 These describe implemented code paths and serialized metadata. The bounded local
 fixture passed on one approved host; this is **not general isolation or checkpoint
 portability qualification**. Only native Linux runc + CRIU is supported.
-No alternate runtime adapters, plugin framework, per-container disk images or
-storage daemons are used.
+No alternate runtime adapters, plugin framework or storage daemons are used.
+Each sandbox has a private loop-mounted ext4 image for its OverlayFS upper/work.
 
 ## Ownership and filesystem layout
 
@@ -22,20 +22,24 @@ exclusive to that worker; operators must not share it between worker roots.
                                   replaced atomically; an unusable file means rehash)
   records/<sandbox-id>.json        atomic lifecycle records (schema 2; metadata only)
   private/<node>.<id>/
-    upper/ work/ rootfs/           ordinary directories; rootfs is OverlayFS; upper
-                                   starts empty for cold and warm sandboxes alike
+    writable.ext4                 sparse private ext4 image (default logical size 1 GiB)
+    loop                          private block-device node, mode 0600
+    upperfs/upper/ upperfs/work/   inside the private ext4 mount at upperfs/
+    rootfs/                       OverlayFS over the unchanged EROFS base
     config.json exec-<n>.json     worker-authored OCI input and one process file per
                                    running command (removed when it ends)
     criu.conf criu-work/          protected runtime/checkpoint work
-  layers/<sha256>.erofs            trusted immutable EROFS images: template bases and
-                                   sealed capture layers, content-addressed
+  private/upper-pool/<slot>/     idle warm copy: writable.ext4, loop and mounted upperfs
+  scratch/<mib>.ext4              immutable formatted cold image, one per capacity
+  scratch/<mib>.creating/         interrupted formatting, discarded on restart
+  layers/<sha256>.erofs            trusted immutable EROFS template bases, content-addressed
   lowers/<sha256>/                 shared read-only EROFS mounts of those layers
-  checkpoints/<manifest-sha256>/   node cache: CRIU images unpacked once per warm
-                                   template manifest, shared read-only by restores
+  checkpoints/<manifest-sha256>/   node cache: CRIU images and writable.ext4 verified once
+                                   per warm manifest, never mounted or written in place
   checkpoints/<sha256>.unpacking/  unpack in progress; removed on failure and at worker start
   templates/<template-id>/
     manifest.json manifest.sha256
-    checkpoint.tar                present only for warm templates
+    checkpoint.tar                warm only: CRIU images + sparse writable.ext4 (GNU pax tar)
     cpuinfo.img                   warm templates on x86-64: CRIU's CPU description
   staging/<template-id>/          unpublished capture; exclusively created by the
                                   one in-flight capture reserving that template ID;
@@ -58,8 +62,8 @@ API. Do not modify published artifacts, manifests or mounted images.
 All HTTP identifiers are validated components, never host paths. Fixed filenames
 and content hashes select artifacts. Ancestors are trusted, final artifact/record
 opens reject symlinks, and metadata/sizes/digests are checked before runtime use.
-User symlinks *inside* a sealed upper layer are legitimate workload state: they are
-stored as symlinks in the EROFS image and resolved only inside the sandbox's mount
+User symlinks *inside* an upper are legitimate workload state: they are
+stored in the ext4 image and resolved only inside the sandbox's mount
 namespace, never followed as administrator paths. The checkpoint archive is
 worker-produced and extracted by GNU tar with its default traversal/symlink
 protections. There is no user-supplied archive or executable host path.
@@ -68,21 +72,85 @@ Lower mounts are shared by digest and are read-only, nodev/nosuid. Only these sh
 EROFS images prefer file-backed mounts, selected by a tiny startup probe under the
 worker root lock. Unsupported kernels use the standard loop facility; a failed
 individual image never triggers fallback. Both forms verify mount flags and the
-image source before reuse or restart cleanup. Each sandbox gets sibling
-upper/work directories on the same supported local filesystem; OverlayFS uses
-`lowerdir=<sealed layers, newest first>:<base>` and
-`index=off,metacopy=off,redirect_dir=off,xino=off,nodev,nosuid`. No lower layer is
-writable and no private block device is added. A capture seals the source's upper
-directory into a new immutable EROFS layer (see below); a child mounts it as a lower
-with its own fresh empty upper, so nothing is copied per create.
+image source before reuse or restart cleanup. EROFS file-backed base mounts remain loop-free.
+Each sandbox gets its own ext4 image and private loop device, with `upper` and `work`
+inside `upperfs`. OverlayFS uses `lowerdir=<base>` and
+`index=off,metacopy=off,redirect_dir=off,xino=off,nodev,nosuid` (never `volatile`).
+Cold create copies a cached formatted scratch image; restore copies the immutable captured image. The
+unchanged base and cloned inode tables preserve upper-file inode numbers and hardlinks.
+
+**Writable quota and format.** `writable_mib` in the cold template defaults to 1024
+(1 GiB), range 64–65536 MiB; captures retain it. The image must also fit the
+worker's `max_artifact_bytes`: operators using the 1 GiB default must set that limit
+to at least 1073741824 (older example configurations use a smaller limit). This is a logical filesystem capacity,
+including metadata, not reserved host space. It comfortably accommodates a 450 MiB
+uncompressed upper; compression of an EROFS base is not a guide to upper capacity.
+Sparse files can still exhaust host disk space, which operators must monitor.
+Following containerd blockfile, each requested cold capacity is formatted once in
+a staged scratch entry, synced and atomically published; concurrent creates wait
+for that entry and later creates/restarts copy it. Scratch images are never mounted
+or changed. Interrupted formatting is discarded before readiness.
+The formatter is `mkfs.ext4 -q -F -b 4096 -m 0 -E lazy_itable_init=0,lazy_journal_init=0`:
+4 KiB blocks, no root-reserved capacity, and completed inode/journal initialization.
+Ext4 retains its normal journal; mounts use `nodev,nosuid,noatime,errors=remount-ro`.
+GNU `cp --reflink=auto --sparse=always` clones whole filesystems without rebuilding inodes;
+copies are synced before mounting or publication. Image file caches are discarded
+with `POSIX_FADV_DONTNEED` after copying; `LOOP_CONFIGURE` requires and verifies
+`AUTOCLEAR|DIRECT_IO`, so ordinary sandbox I/O does not double-cache the backing image.
+
+**Ready-copy pool.** `native.upper_pool_size` defaults to 32 (range 0–32, zero disables).
+One bounded background worker prepares copies of the most recently requested warm
+manifest: verified cache image copied, direct-I/O loop attached, ext4 mounted. Ready
+copies are tagged by manifest digest in memory. A create claims only an exact match;
+an empty or mismatched pool uses the synchronous path without waiting for refill.
+Requests for another template replace unused older entries; there is no unbounded
+per-template multiplication. This adapts the existing ready-slot/synchronous-fallback
+network pool, not a new service. It does not speed the very first empty-pool burst.
+
+Each pool directory exists and its parent is synced before allocation. Handoff renames
+that whole directory under the sandbox's already-durable record, syncing both parents;
+a slot cannot refill until handoff finishes. Failed cleanup retains ownership and blocks
+pool use. Restart discards every idle/interrupted pool entry before readiness. Shutdown
+joins the refiller before normally releasing its mounts/loops. Pool files live beneath
+`private/` so existing disk accounting includes idle copies; their logical capacity can
+total `upper_pool_size × writable_mib`, with allocated space proportional to copied data.
+Operator disk quotas must include these copies, scratch, templates and cache.
+
+**Loop ownership.** Allocation uses `/dev/loop-control` and `LOOP_CTL_GET_FREE`,
+retrying allocation races within the helper deadline. A worker-owned private 0600
+block node (major 7, returned minor) avoids dependence on the host/pod's static
+`/dev/loopN` inventory. No global device nodes are added or removed. The open loop
+handle is retained through mounting. Cleanup verifies backing device/inode and mount
+identity, thaws interrupted captures, unmounts without lazy detach, detaches only its
+own association, waits for release, then removes the private image/node. A reused
+loop is never detached. Durable sandbox records precede allocation and restart
+reconciliation uses the same teardown. Preflight checks ext4 and loop-control;
+startup actively mounts an ext4/loop/overlay probe and fails closed if unavailable.
+
+Design references (fresh Rust integration, not copied third-party source):
+- [GNU tar sparse formats](https://www.gnu.org/software/tar/manual/html_node/sparse.html):
+  pax sparse format 1.0, hole maps and default SEEK_DATA/SEEK_HOLE detection. GNU
+  [cp sparse copies](https://www.gnu.org/software/coreutils/manual/html_node/cp-invocation.html)
+  preserve holes, using reflinks where supported.
+- Linux v6.12 `fs/ext4/ioctl.c:806–857` and `include/uapi/linux/ext4.h`:
+  shutdown with NOLOGFLUSH aborts journal work; repeated shutdown is harmless.
+  xfstests `src/godown.c` opens a mount and issues the same no-log-flush ioctl.
+  The kernel's `Documentation/admin-guide/ext4.rst` describes the ext4 ioctl interface.
+- AgentENV `src/sandbox/container/sandbox.rs:256–300,480–504`: private block-backed
+  ext4 and pause/freeze/restack/thaw before CRIU leave-running.
+- containerd v2.0.0 `plugins/snapshots/blockfile/blockfile.go:374–416,451–479`:
+  copy a parent/scratch image and sync it; `core/mount/losetup_linux.go:48–60,89–116,170–193`:
+  loop-control allocation, atomic configure, autoclear/direct-I/O and busy retries.
+- Apptainer v1.4.2 `pkg/util/loop/loop.go:184–245,360–368,436–447`: create missing
+  loop block nodes when a container has a static `/dev`. Sandbox confines nodes to
+  its private directory, rather than modifying `/dev`.
 
 **Verified once per node.** A create checks only the manifest digest sidecar and
 fields at admission. The create job then fully hashes each layer image this worker
 does not already trust, before handing the mounts to the shared-lower thread (which
 never hashes and refuses an untrusted layer). Creates hash in parallel on their own
 operation threads; a per-digest turn makes two creates of the same new layer hash
-it once, and creates whose layers are trusted never wait behind a hash. A capture
-marks the layer it publishes as verified. Each result is kept as digest, size and
+it once, and creates whose layers are trusted never wait behind a hash. Each result is kept as digest, size and
 the image file's identity when hashed (device, inode, size, modification and change
 time, read from the hashed file before and after reading it), and saved atomically
 to `verified-layers.json`. A layer is trusted, in memory or after a restart, only
@@ -94,7 +162,9 @@ group/others cannot write, at most 16 MiB and well-formed; otherwise every layer
 hashed again. A known digest whose manifest size differs is rejected. Mount flags
 and backing image are checked on every use.
 
-A warm template's `checkpoint.tar` is fully hashed and unpacked once into
+A warm template's joint `checkpoint.tar` is fully hashed once, including GNU tar's
+sparse map and all stored image data. Holes are not stored or hashed as logical zero
+bytes; integrity still covers every archive byte. The archive is sparsely unpacked into
 `checkpoints/<manifest-sha256>/` under a per-key turn: concurrent restores of the
 same manifest wait for that unpack and later ones reuse the directory. GNU tar does
 not sync what it writes, so the worker starts write-back of each extracted file,
@@ -103,33 +173,40 @@ then syncs those files and directories (not the unrelated host filesystem) befor
 truncated images under the final name. A failed unpack removes its `.unpacking`
 directory (after all helpers drained); start-up removes any left by a crash. The
 renamed directory is the "verified" record and survives worker restarts. CRIU only
-reads the images; the gate checks the cache is unchanged by restores. Published
+reads its images; each restore copies the cached ext4 image to its own private image; the gate checks the cache is unchanged by restores. Published
 artifacts must still never be modified in place: the cache directory is not
 re-checked, and a layer changed in a way that keeps its identity (only possible by
 resetting the clock or with raw device writes) is not re-detected.
 
-Deletion checks mountinfo before recursive private removal, never uses lazy unmount
-or broad recursive mount deletion, and never deletes shared templates/images.
+After workload drain, deletion verifies the owned ext4 mount/loop identity and uses
+`EXT4_IOC_SHUTDOWN` with `EXT4_GOING_FLAGS_NOLOGFLUSH` before unmounting overlay/ext4.
+These private copies are disposable: dirty data and journal work are discarded, not
+flushed. This is never used on the source during capture, on scratch or cached images.
+Normal (not lazy) unmount, loop release and unlink must finish before reservations
+are released; failures retain ownership for retry. Deletion checks mountinfo before
+recursive private removal and never deletes shared templates/images.
 Shared lowers are unmounted only after all owned workloads have been cleaned during
 shutdown/reconciliation; images/templates/checkpoint caches are retained indefinitely. Cache eviction,
-artifact deletion API, S3 transfer and disk quotas are not implemented. Operators
+artifact deletion API and S3 transfer are not implemented. Per-sandbox writable
+capacity is bounded by the ext4 image; shared artifact/cache disk quotas are not implemented. Operators
 must provision an appropriately bounded dedicated filesystem/quota and monitor free
 space. A filesystem failure stops admission; old durable ownership still permits
 termination/cleanup.
 
-## Manifest v3
+## Manifest v5
 
 Strict JSON fields (unknown fields are rejected):
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Exactly `3`; v1/v2 (per-create `upper.tar`) templates are rejected, not silently migrated |
+| `schema_version` | Exactly `5`; all older templates (including raw-image and sealed-EROFS uppers) are rejected, not silently migrated |
 | `template_id`, `generation` | Validated immutable publication ID and worker-generated capture-generation ID |
 | `runtime` | Exactly `runc_criu` |
 | `compatibility` | Architecture, exact kernel release, exact runc and CRIU version output, init digest, fixed mount/network/seccomp layout version (no CPU fingerprint; see `cpuinfo`) |
 | `base` | `{ "sha256": "...", "bytes": ... }` for `layers/<digest>.erofs` |
-| `layers` | Sealed capture layers above the base, newest first, each a descriptor for `layers/<digest>.erofs`; empty for cold, 1–16 for warm (a capture of a warm child adds one) |
-| `checkpoint` | Null for cold, or the descriptor of `checkpoint.tar` (CRIU images) from the same frozen instant as `layers[0]` |
+| `layers` | Must be empty; warm snapshots no longer change the immutable lower stack |
+| `writable_mib` | Ext4 image logical capacity, default 1024 MiB; must match the captured image length |
+| `checkpoint` | Null for cold, or the SHA-256/byte-count descriptor of `checkpoint.tar`: CRIU images and sparse `writable.ext4` from the same frozen instant |
 | `cpuinfo` | Null for cold; for warm templates on x86-64, the descriptor of `cpuinfo.img`, CRIU's description of the capturing host's CPU (`criu cpuinfo dump`, written just before the freeze). On other architectures CRIU writes none and the field is null |
 | `init_argv` | Trusted absolute in-container executable + argv; not an OCI config/host executable |
 | `memory_mib`, `vcpus` | Cold: optional create defaults (1–1,048,576 MiB, 1–4,096); warm: required, exact captured resources |
@@ -144,7 +221,7 @@ Strict JSON fields (unknown fields are rejected):
 restored processes map it), `layout`. The OCI network-policy digest annotation is
 preserved during normalization; the init's host path is normalized like the other
 worker-local paths. `layout` is
-`erofs-sealed-layers-v3-cni-ptp-static-v1-mtu<value>-tcp-established-pmtu-v1-seccomp-v5-moby-28.3.3-nocaps-tini-v1-conmon-null-v1`
+`erofs-ext4-upper-v5-sparse-tar-cni-ptp-static-v1-mtu<value>-tcp-established-pmtu-v1-seccomp-v5-moby-28.3.3-nocaps-tini-v1-conmon-null-v1`
 where `<value>` is the configured MTU (1500 without network configuration).
 Pre-CNI templates, templates with another MTU, and the former default-allow seccomp
 layout are rejected. The current profile is the generated Docker deny-by-default
@@ -183,15 +260,10 @@ run on a bounded operation pool. Capture follows the AgentENV container backend 
 0. Before the freeze, `criu cpuinfo dump` writes the host's CPU description as
    `cpuinfo.img` into the staging directory (x86-64; see `cpuinfo` above).
 1. `runc pause` freezes the source's cgroup.
-2. While frozen: read each task's `/proc/<pid>/maps` for a `[uprobes]` mapping (left
-   by a host tracing/security agent), `syncfs` the overlay and build an EROFS image
-   of the upper directory with `mkfs.erofs` (uncompressed; overlay whiteouts,
-   opaque-directory xattrs, ownership, modes and other xattrs kept). Disposable
-   uppers use OverlayFS `volatile` when the startup backing-directory probe succeeds: this sync detects prior
-   write-back errors without flushing the upper filesystem. The seal reads frozen
-   files through the page cache; the sealed image is synced before publication.
-   Only an unsupported volatile startup probe selects ordinary overlays. Later mount
-   failures fail closed without retrying or reusing potentially poisoned upper/work state.
+2. While processes are frozen, inspect their maps for uprobes, freeze the private
+   ext4 filesystem with `FIFREEZE`, sparse/reflink-copy `writable.ext4` to staging,
+   sync the copy and thaw ext4 with `FITHAW`. No inode table is rebuilt. Copy errors
+   still trigger thaw; restart cleanup also thaws a filesystem left frozen by a killed worker.
 3. `runc checkpoint --leave-running --tcp-established --ext-unix-sk --file-locks`,
    with `network-lock nftables` and `skip-in-flight` (plus `allow-uprobes` when step
    2 found uprobes) in the per-container CRIU config.
@@ -199,14 +271,15 @@ run on a bounded operation pool. Capture follows the AgentENV container backend 
    gates report the cgroup-freezer time inside it (CRIU briefly thaws the cgroup
    while the tasks stay ptrace-stopped, so freezer time slightly undercounts) and
    the longest gap a client or counter saw.
-5. Outside the window: hash the sealed layer, archive the images into
-   `checkpoint.tar` (GNU tar, numeric ownership/xattrs), write the manifest, publish
-   the layer as `layers/<sha256>.erofs` without replacing an existing file (same
-   digest = same content), then sync and atomically rename the staged template.
+5. Outside the window: GNU `tar --format=pax --sparse` packs the immutable image
+   copy together with the process images into `checkpoint.tar`; hash that archive,
+   write the manifest, sync and atomically rename the staged template. No raw image
+   hashing or live-image archiving occurs. Cross-node transfer includes the joint
+   archive, `cpuinfo.img`, manifest/sidecar and referenced EROFS base.
 
 On an ordinary failure the worker thaws the source and keeps it if runc reports it
 running; CRIU leaves dumped tasks alive, so a failed dump is not treated as
-terminating the source (the gate forces a dump failure with an undumpable file and
+terminating the source (the gate forces a dump-helper failure and
 checks the source keeps running). A `runc checkpoint` stopped at its command
 deadline or output limit gets the same AgentENV thaw-and-keep handling but its own
 code, `checkpoint_interrupted`: a killed CRIU can leave its network lock, sockets in
@@ -214,18 +287,16 @@ repair mode or parasite code behind in a source that runc still reports running,
 the caller decides whether to delete it (the gate stops the checkpoint helper until
 the deadline and checks the source keeps running). A source that stays frozen, is not
 running after the thaw, or was cancelled/expired, is deleted (the gate kills a
-source's processes during its dump and checks it is deleted). A source template
-already at 16 sealed layers is refused before the pause (`template_layer_limit`). A
-layer published before a later step failed stays in `layers/`
-(content-addressed, retained like every layer). Failed/stale staging is removed
-without touching live mounts or published templates.
+source's processes during its dump and checks it is deleted). Failed/stale staging
+is removed without touching live mounts or published templates. Chained captures
+replace the saved writable image, not the base, and add no EROFS layers.
 
 `skip-in-flight`: clients that connect while the source is frozen wait unaccepted in
 a listen backlog, which CRIU otherwise refuses to dump (observed in the image gate).
 The running source still serves them after the thaw; children never had them.
 
-Children mount the sealed layer(s) above the same base with a **new empty upper**
-and a fresh work directory. The worker writes a new OCI bundle/private cgroup and
+Children mount their own **copy of the captured ext4 image**, retaining the same
+upper/work relative layout, over the unchanged base. The worker writes a new OCI bundle/private cgroup and
 asks runc to restore into the new container ID from the node's shared checkpoint
 cache, with `--tcp-established --ext-unix-sk --file-locks --manage-cgroups-mode
 ignore` and restore-only `allow-uprobes`, `mntns-compat-mode` and `network-lock
@@ -245,18 +316,25 @@ is restored only on the child's side: its peer, the source slot's conntrack/NAT
 state and its SNAT address are not cloned, so that connection fails in the child on
 first use, while the source keeps it.
 
-**Sealed layers do not preserve host inode numbers.** The implementation keeps
-upper/lower roles stable and relies on the supported runc/CRIU mount/file reopening
-path (files open in the source reopen from the sealed lower and copy up on write),
-not on an assertion that inode changes are harmless. The real fixture holds lower
-and upper descriptors/mappings open, an ESTABLISHED loopback connection, and checks
-an in-memory random nonce and counter across capture and independent restore. It
-also checks the sealed layer itself: a whiteout for a deleted base file, and the
-modified base file with its owner, mode and a `user.` xattr. That targeted gate
-**passed with the local static fixture, runc 1.3.6 and CRIU 4.3**. It does not
-establish compatibility for arbitrary open/unlinked files, other workloads or
-hosts. Cross-node reconstruction and different CPU/kernel combinations are
-unqualified.
+**Inodes are preserved; device numbers are not.** The block clone retains upper
+inode numbers and hardlinks (including copied-up base files) without manufacturing
+an EROFS upper. `runtime_smoke.py` checks source/two-copy inode equality, hardlink
+writes and independent contents, chained capture and loop/image/mount cleanup on
+delete and killed-worker restart. `image_e2e.py` keeps a stock SQLite DELETE-journal
+connection open across capture and requires its next write in both copies to succeed
+without `SQLITE_READONLY_DBMOVED`, with source/copy row isolation.
+
+**Explicit tested limitation, not a fidelity pass:** SQLite's in-process lock sharing
+between a retained pre-capture connection and a newly opened post-restore connection
+is not preserved. SQLite keys that bookkeeping by both device and inode; each copy
+has a different device number. The image gate performs two `BEGIN IMMEDIATE`
+operations then rolls back without modifying pages: the source must reject the
+second writer with `SQLITE_BUSY`, while restored copies currently admit it. This
+limitation also existed before ext4 cloning. Inode preservation fixes DBMOVED, not
+full SQLite transaction fidelity; affected multi-connection workloads remain
+unqualified. No reconnect, WAL switch, application patch or error filtering is used.
+Arbitrary open/unlinked files, other workloads, cross-node reconstruction and
+different CPU/kernel combinations remain unqualified.
 
 ## Admission, operations and cleanup
 
@@ -384,7 +462,7 @@ empty delegated cgroup domain with cpu/memory/pids enabled. It does **not** writ
 xattr probe, run `criu check`, create a mount/namespace, enable a controller or prove
 runtime behavior. Under the root lock, before request threads, worker startup probes
 actual upper backing-directory d_type, user/trusted xattrs, ordinary overlay copy-up
-and hardlinks, volatile support and mount-data size. It also mounts/reads a tiny
+and hardlinks, private ext4/loop direct I/O and mount-data size. It also mounts/reads a tiny
 EROFS image to select file backing or loop fallback. Probes must clean up before
 readiness; interrupted owned probes are cleaned on restart. The cached worker
 preflight records `active_overlay_backing_features` and `overlay_volatile` (null in

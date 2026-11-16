@@ -2,7 +2,7 @@
 
 **Targeted functional gate passed on one explicitly approved Linux x86-64 host,
 with runc 1.3.6, conmon 2.1.10 and CRIU 4.3.** The real script exercised shared EROFS/private OverlayFS,
-capture without stopping the source (pause, sealed EROFS layer, `--leave-running`),
+capture without stopping the source (pause, frozen ext4 image copy, `--leave-running`),
 established loopback TCP and independent restored memory/file state, the node
 checkpoint cache, the reaping PID 1, concurrent, streamed and killed commands,
 waiting concurrent DELETEs, admission, per-command bounds that keep the sandbox,
@@ -23,9 +23,10 @@ An operator must separately provision and approve:
   shell with missing capabilities is not enough.
 - EROFS and OverlayFS **already available** in the kernel. File-backed EROFS needs
   Linux 6.12+ with `CONFIG_EROFS_FS_BACKED_BY_FILE`; older kernels need available
-  loop device nodes for the shared lowers. No module loading or package installation
+  loop device nodes for legacy shared lowers. Every writable upper requires loop-control,
+  ext4, device-node creation and direct I/O, tested actively at startup. No module loading or package installation
   is done by the service/script.
-- Trusted standard `runc`, **`conmon` 2.1.10**, `criu`, `mount`, `umount`, GNU `tar`, `mkfs.erofs`, `ip`,
+- Trusted standard `runc`, **`conmon` 2.1.10**, `criu`, `mount`, `umount`, GNU `tar`/`cp`, `mkfs.erofs`, `mkfs.ext4`, `ip`,
   `nft`, `iptables`, `iptables-save`, `iptables-restore`, `ip6tables-save`,
   `ip6tables-restore`, `gzip`, **CNI `ptp` and `static`** (protocol 1.0.0), and a **statically linked `tini`** (preflight rejects a
   dynamic one: it is bind-mounted read-only into every sandbox as PID 1, so it must run
@@ -45,7 +46,7 @@ An operator must separately provision and approve:
   user/trusted-xattr support; XFS needs ftype=1. Startup tests the backing directory,
   not a filesystem-family allowlist or kernel release. All ancestors must be owned by UID 0,
   not group/other writable and not symlinks. Give the root private permissions.
-  Supply operator disk capacity/quota; the worker does not implement disk quotas.
+  Supply operator disk capacity/quota; each writable ext4 image bounds private writes, but shared artifacts/cache still need operator quotas.
 - An operator-provided **pod-private mount namespace**: the covering mounts of the
   worker root and `/run` must be private (neither shared nor slave). Provide a trusted
   `/run/netns` directory inside this boundary. Startup never changes `/` or a host
@@ -64,7 +65,7 @@ Neither `preflight` nor startup enables controllers, creates the parent, changes
 host networking/firewall/sysctls, installs software, loads modules or invokes sudo.
 Read-only preflight is deliberately not an active CRIU/xattr/kernel capability test.
 Startup separately qualifies actual backing directories with bounded, tracked probes:
-ordinary overlay, d_type, user/trusted xattrs, copy-up/hardlinks, volatile support and
+private ext4/loop direct I/O, ordinary overlay, d_type, user/trusted xattrs, copy-up/hardlinks and
 mount-data length. Its cached preflight reports `active_overlay_backing_features`
 and `overlay_volatile`; read-only CLI preflight leaves the latter null. Real process
 checkpoint, restore, isolation and cleanup still require the gates below.
@@ -254,13 +255,15 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    the capture except while it is stopped (the cgroup-freezer time and the longest
    unchanged interval are recorded), and its loopback connection keeps working. A new container restores the same memory
    nonce, continues the loopback connection, sees the filesystem delta/whiteout, and
-   writes independently of the source. The published template has a sealed EROFS layer
-   and `checkpoint.tar` but no upper archive, plus the capturing host's `cpuinfo.img`
+   writes independently of the source. The published `checkpoint.tar` contains both a sparse
+   frozen `writable.ext4` and matching process images; corrupt archives fail verification
+   before unpack. The template also carries the capturing host's `cpuinfo.img`
    (its digest in the manifest); a copy whose `cpuinfo.img` requires a CPU feature no
    host has (extended-state bit 50) is refused by `criu cpuinfo check` as a pre-launch
-   `422 template_unavailable` with no ID, record or runtime state; the mounted layer holds a whiteout for
+   `422 template_unavailable` with no ID, record or runtime state; the cloned ext4 upper holds a whiteout for
    the deleted base file and the modified base file with its owner, mode and `user.`
-   xattr, and the child's upper starts empty. The child's restore unpacks the node
+   xattr. Source/two-copy inode numbers match; copied upper hardlinks remain linked
+   after independent branch writes. The child's restore unpacks the node
    checkpoint cache once; it is unchanged by that restore and reused unchanged by a
    later restore after a worker restart. A checkpoint that fails after the freeze
    (the test kills only its owned checkpoint helper) leaves the source running and
@@ -269,8 +272,7 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    worker kills it at the 30 s command deadline is `500 checkpoint_interrupted`, and
    that source is thawed and keeps running (its counter advances). A source whose
    processes the test kills while its `runc checkpoint` is stopped fails with `500
-   checkpoint_failed` and is deleted. A **chained capture** of the warm child (two
-   sealed layers) restores a grandchild with the same nonce, the child's file change, the source's
+   checkpoint_failed` and is deleted. A **chained capture** of the warm child (another ext4 image over the same base) restores a grandchild with the same nonce, the child's file change, the source's
    whiteout and a working loopback connection. Restored host PIDs must be in their
    own cgroups. This is a
    targeted file-identity check, not blanket CRIU compatibility for all
@@ -290,8 +292,8 @@ The script fails rather than substituting a fake runtime/result. It exercises:
    permission change makes the next create hash it again, and a same-size in-place
    corruption of an unmounted layer is `500 artifact_digest_mismatch`.
 7. One worker SIGKILL with a live owned source and an actually running blocking exec,
-   then restart using the same root: records, exec child cgroup, processes and private
-   mounts must reconcile. Retained warm artifacts
+   then restart using the same root: records, exec child cgroup, processes, private
+   mounts, loop devices and writable image files must reconcile. Retained warm artifacts
    must still restore after source cleanup/restart. A second crash occurs with a
    host checkpoint helper paused in its owned cgroup before exec. A trusted sleeping fixture
    holding a staging FD is explicitly placed in that leaf to stand in for a surviving
@@ -396,18 +398,19 @@ overlay mounts, guest/slot network, OCI spec, runc (including cgroup setup) and 
 `first_ready` is elapsed time to the running result, not application readiness;
 uncompleted steps are recorded as `failed_step` before recovery or cleanup, not
 charged to `kill`. Capture records thaw/running checks as `recovery`. Capture and
-delete similarly expose sealing/checkpoint/publication and cleanup steps. Status
+delete similarly expose filesystem freeze/copy/checkpoint/publication and cleanup steps. Status
 carries the bounded cumulative histograms described in [api.md](api.md).
 
 CPU checks run off the admission coordinator, with bounded queues and definitive
 answers cached; transient failures are retried. Older manifests containing
 `compatibility.cpu_features_sha256` must be republished (strict parsing rejects
-them). Runtime overlays use the startup-probed `volatile` mode; only EINVAL or
-EOPNOTSUPP from that tiny probe selects ordinary overlays, after an ordinary mount
-already succeeded. Permission/I/O/helper errors fail startup; later failed mounts
-never change mode or reuse a volatile work directory. Capture still freezes and seals matching files/processes and syncs
-the published layer. Lazy pages are not shipped: small-image experiments are not
-proof of reliable page-server ownership and restore under sustained load.
+them). Runtime overlays are ordinary, not volatile: their upper/work directories
+live on private ext4 images, so freeze includes all writes and unmount syncs only
+that sandbox's filesystem. Startup actively checks ext4/loop direct I/O and overlay
+features; failures never fall back to a weaker mode. Captures copy matching frozen
+filesystem/process state and durably publish both artifacts. Lazy pages are not
+shipped: small-image experiments are not proof of reliable page-server ownership
+and restore under sustained load.
 
 ### Init supervision and retained exit evidence
 
@@ -471,10 +474,10 @@ optional propagation fields are parsed separately. EROFS reuse checks source and
 flags; namespace-pin removal checks nsfs ownership and unmounts without ip's lazy
 DELETE. Busy teardown retains reservation until a real unmount succeeds. The local
 runtime gate includes escaped mount paths, transient and persistent busy holders,
-all OCI limits on cold/restored groups, and sealed hardlink identity. With `index=off`,
-a lower hardlink pair may split on copy-up; with `xino=off`, inode/device numbers are
-not generally stable. The gate records this behavior rather than changing options
-or promising arbitrary file-identity compatibility.
+all OCI limits on cold/restored groups, and cloned-upper hardlink/inode identity.
+A lower-only hardlink pair may still split on first copy-up with `index=off`. Ext4
+cloning preserves upper inodes, not per-copy device numbers; the SQLite old/new
+connection lock-sharing test is an explicit limitation, not a fidelity pass.
 
 Behavioral references: runc v1.3.6 `specconv/CreateCgroupConfig`, `criuApplyCgroups`
 and `rootfsParentMountPrivate`; containerd v2.2.0 `core/mount/mount_unix.go` and overlay
@@ -573,7 +576,7 @@ errors in cold/restored processes; it is not a general security qualification.
   capture while a surviving source is thawed; userfaultfd is now denied outright.
 - No S3 client, remote template transport, signed publisher provenance or two-node
   qualification. The local digest-bound layout is the serialized transfer boundary.
-- No per-sandbox writable-disk quota, automatic artifact GC or tombstone pruning.
+- Private ext4 capacity limits are implemented; automatic artifact GC, shared-cache quotas and tombstone pruning are not.
 - The local privileged functional result does not establish production readiness,
   broad isolation, general workload suitability, performance or capacity. Independent
   review and per-deployment qualification are still required. The future two-node/512 GB
@@ -695,7 +698,8 @@ What the script does:
   - The image `Env` is passed to the workload through the image's `env(1)`
     (`--no-image-env` turns this off). The image `User` and `WorkingDir` are not
     applied: the worker always uses UID/GID 65534 and `/workspace`.
-- **Default workload.** `python3 -m http.server 8000 --bind 0.0.0.0`. Change it with
+- **Default workload.** A Python `http.server` with a retained stock SQLite DELETE-journal
+  connection and bounded fidelity-control routes. Directory listing behavior is unchanged. Change it with
   `--init-argv` (a JSON list), `--port`, `--http-path` and `--expect-body`. The
   template network is `tcp_allowlist` with that service port and the next one (for
   the WebSocket check) and no egress. The controller uses
@@ -723,12 +727,17 @@ What the script does:
      capture except while it is stopped; a host-side watch of its cgroup freezer
      measures the freezer time, and the longest client-visible gap (slightly longer,
      since CRIU thaws and refreezes the cgroup) is recorded too. It must still
-     be running and answering afterward. The template has one sealed layer and no
-     upper archive.
+     be running and answering afterward. Its joint sparse `checkpoint.tar` holds the
+     matching frozen `writable.ext4` and process images under one archive checksum.
   4. Create a child from the warm template (the first restore on the node unpacks
      the checkpoint cache) and call its HTTP server on a fresh connection. The marker
      must be present in the child. A second child restores from the unchanged cache,
-     answers and is deleted.
+     answers and is deleted. Before deletion, the source and both children write through
+     their retained SQLite connections, with matching inodes and independent rows, no
+     `SQLITE_READONLY_DBMOVED`. A rollback-only two-writer control records the known
+     **limitation, not a pass**: changed device numbers split retained/new-connection
+     lock bookkeeping in copies, while the source returns SQLITE_BUSY. Custom
+     `--init-argv` workloads skip these Python-specific fixture checks.
   5. Write a file in the child that must not appear in the source, and check
      that the pid/mnt/net namespaces are distinct.
   6. Delete both. No runc state, private state, cgroups or guest namespaces may

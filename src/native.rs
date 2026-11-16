@@ -43,6 +43,7 @@ pub struct Native {
     unpacked: Condvar,
     // State of each pooled routing slot this worker built (see network.rs); never held across I/O.
     pub(crate) slots: Mutex<BTreeMap<usize, crate::network::SlotState>>,
+    pub(crate) upper_pool: crate::upper::UpperPool,
     // CRIU's answer, by cpuinfo.img digest, to whether this host's CPU can run a warm template's
     // processes (see cpu_check); only definitive answers are kept, never a failed check.
     cpu_checks: Mutex<BTreeMap<String, bool>>,
@@ -172,7 +173,7 @@ fn remove_group(path: &Path) -> Result<()> {
     }
 }
 
-const TOOL_NAMES: &[&str] = &["runc", "conmon", "criu", "mount", "umount", "tar", "mkfs.erofs", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini", "ptp", "static"];
+const TOOL_NAMES: &[&str] = &["runc", "conmon", "criu", "mount", "umount", "tar", "mkfs.erofs", "mkfs.ext4", "cp", "ip", "nft", "iptables", "iptables-save", "iptables-restore", "ip6tables-save", "ip6tables-restore", "gzip", "tini", "ptp", "static"];
 
 // Decide whether a trusted tool is a statically linked ELF executable (no program interpreter), so
 // it runs inside any image's root filesystem. Unreadable or malformed files count as not static.
@@ -264,7 +265,8 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         add("operator_bridge_mtu", addresses.as_ref().is_some_and(|a| a[0]["mtu"].as_u64().is_some_and(|mtu| mtu >= network.mtu as u64)));
     }
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
-    for name in ["erofs", "overlay", "cgroup2"] { add(name, filesystems.lines().any(|l| l.split_whitespace().last() == Some(name))); }
+    for name in ["erofs", "overlay", "ext4", "cgroup2"] { add(name, filesystems.lines().any(|l| l.split_whitespace().last() == Some(name))); }
+    add("writable_loop_control", crate::upper::available());
     add("seccomp_filter", status.lines().any(|l| l.starts_with("Seccomp:")));
     let root_ok = config.is_some_and(|c| storage::trusted_directory(Path::new(&c.root)).is_ok());
     add("trusted_existing_root", root_ok);
@@ -292,7 +294,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
         let init = storage::artifact(Path::new(tools.get("tini")?), 1 << 26).ok()?;
         Some(Compatibility { architecture: std::env::consts::ARCH.to_owned(), kernel: fs::read_to_string("/proc/sys/kernel/osrelease").ok()?.trim().to_owned(),
             runc_version: version("runc")?, criu_version: version("criu")?,
-            init_sha256: init.sha256, layout: format!("erofs-sealed-layers-v3-cni-ptp-static-v1-mtu{}-tcp-established-pmtu-v1-seccomp-v5-moby-28.3.3-nocaps-tini-v1-conmon-null-v1",
+            init_sha256: init.sha256, layout: format!("erofs-ext4-upper-v5-sparse-tar-cni-ptp-static-v1-mtu{}-tcp-established-pmtu-v1-seccomp-v5-moby-28.3.3-nocaps-tini-v1-conmon-null-v1",
                 config.and_then(|c| c.network.as_ref()).map_or(1500, |n| n.mtu)) })
     })();
     add("compatibility_fingerprint", compatibility.is_some());
@@ -302,7 +304,7 @@ pub fn preflight(config: Option<&NativeConfig>) -> Preflight {
 
 impl Native {
     // Lock the root, drain old helpers and open durable monitor ownership before starting threads.
-    // Verify private mounts/storage and discard interrupted cache entries, rejecting unknown state.
+    // Verify private storage and discard interrupted checkpoint, scratch and idle-copy entries.
     // Probe EROFS and actual overlay features under the lock before advertising readiness.
     pub fn open(config: NativeConfig, report: Preflight) -> Result<Self> {
         if !report.ready { return Err("preflight_failed"); }
@@ -317,7 +319,7 @@ impl Native {
         // staging state. The reserved name cannot be a valid sandbox ID.
         let helpers = process::Helpers::open(Path::new(&config.cgroup_parent).join(format!(".helpers-{}", storage::digest(config.root.as_bytes()))))?;
         crate::mounts::prepare_boundary(root)?;
-        for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc", "checkpoints", "slots"] { storage::private_dir(&root.join(dir))?; }
+        for dir in ["records", "private", "layers", "templates", "staging", "lowers", "runc", "checkpoints", "slots", "scratch"] { storage::private_dir(&root.join(dir))?; }
         for entry in fs::read_dir(root.join("checkpoints")).map_err(|_| "checkpoint_cache_scan_failed")? {
             let entry = entry.map_err(|_| "checkpoint_cache_scan_failed")?;
             let name = entry.file_name().into_string().map_err(|_| "unknown_checkpoint_cache_state")?;
@@ -327,48 +329,61 @@ impl Native {
                 _ => return Err("unknown_checkpoint_cache_state"),
             }
         }
+        for entry in fs::read_dir(root.join("scratch")).map_err(|_| "scratch_scan_failed")? {
+            let entry = entry.map_err(|_| "scratch_scan_failed")?;
+            let name = entry.file_name().into_string().map_err(|_| "unknown_scratch_state")?;
+            if name.strip_suffix(".creating").is_some_and(|v| v.parse::<u64>().is_ok_and(|m| (64..=65536).contains(&m))) { storage::remove_private(&entry.path())?; }
+            else if !name.strip_suffix(".ext4").is_some_and(|v| v.parse::<u64>().is_ok_and(|m| (64..=65536).contains(&m))) { return Err("unknown_scratch_state"); }
+        }
         let verified = load_verified(root);
         let monitors = crate::monitor::Monitors::open(root, Path::new(&config.cgroup_parent))?;
         let mut native = Self { config, compatibility: report.compatibility.ok_or("compatibility_unavailable")?, tools, search_path, helpers, monitors, volatile_overlay: false, erofs: report.erofs, mounted_lowers: Mutex::new(BTreeSet::new()),
-            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), _lock: lock };
+            verified: Mutex::new(verified), layer_turns: Mutex::new(BTreeSet::new()), layer_turn_done: Condvar::new(), unpacking: Mutex::new(BTreeSet::new()), unpacked: Condvar::new(), slots: Mutex::new(BTreeMap::new()), cpu_checks: Mutex::new(BTreeMap::new()), upper_pool: crate::upper::UpperPool::default(), _lock: lock };
+        native.clear_upper_pool()?;
         native.volatile_overlay = native.probe_overlay()?;
         native.clear_erofs_probe()?;
         if !native.erofs.forced_loop { native.erofs.file_backed = Some(native.probe_file_erofs()?); }
         native.erofs.loop_devices = if native.erofs.file_backed == Some(true) { None } else { loop_capacity() };
         Ok(native)
     }
-    // Probe actual private storage with bounded helper lifetime, including restart cleanup. Check the
-    // longest supported lower stack too; a configuration that cannot fit it fails before readiness.
+    // Probe ext4-backed ordinary overlays with bounded helper lifetime and restart cleanup. Reject
+    // configurations whose longest sandbox paths cannot fit the mount-data size limit.
     fn probe_overlay(&self) -> Result<bool> {
         let probe = self.root().join("private/.overlay-probe");
         self.clear_overlay_probe(&probe)?;
         let private = self.private(&"x".repeat(129));
-        crate::overlay::options(&vec![self.lower(&"0".repeat(64)).display().to_string(); storage::MAX_LAYERS + 1],
-            &private.join("upper"), &private.join("work"), true)?;
+        crate::overlay::options(&[self.lower(&"0".repeat(64)).display().to_string()],
+            &private.join("upperfs/upper"), &private.join("upperfs/work"), false)?;
         storage::exclusive_private_dir(&probe)?;
-        let result = self.helpers.run(&format!("/proc/{}/exe", std::process::id()),
-            &["internal-overlay-probe".into(), probe.display().to_string()], Duration::from_secs(self.config.command_timeout_seconds),
+        let result = self.prepare_upper(&probe, 64, None).and_then(|_| self.helpers.run(&format!("/proc/{}/exe", std::process::id()),
+            &["internal-overlay-probe".into(), probe.join("upperfs").display().to_string()], Duration::from_secs(self.config.command_timeout_seconds),
             4096, false, &self.search_path, None).and_then(|out| match (out.interrupted, out.exit_code) {
                 (false, Some(0)) => Ok(true), (false, Some(2)) => Ok(false),
                 _ => { process::log_failure("overlay probe", "overlay_probe_failed", out.exit_code, &out.stderr); Err("overlay_probe_failed") }
-            });
+            }));
         self.clear_overlay_probe(&probe)?;
         result
     }
-    // Remove only an owned overlay probe whose mount has the exact expected source and directories.
+    // Remove only an owned ext4/overlay probe, also checking shutdown support before readiness.
     // Retain backing files on unexpected mounts or incomplete helper/unmount cleanup.
     fn clear_overlay_probe(&self, probe: &Path) -> Result<()> {
         self.helpers.ensure_healthy()?;
-        let target = probe.join("mount");
+        let target = probe.join("upperfs/mount");
         let mounts = crate::mounts::inventory()?;
-        let owned: Vec<_> = mounts.iter().filter(|m| m.point.starts_with(probe)).collect();
+        let owned: Vec<_> = mounts.iter().filter(|m| m.point.starts_with(&target)).collect();
         if !owned.is_empty() {
             if owned.len() != 1 || owned[0].point != target || owned[0].filesystem != "overlay" || owned[0].source != Path::new("overlay")
-                || ![format!("upperdir={}", probe.join("upper").display()), format!("workdir={}", probe.join("work").display()),
-                    format!("lowerdir={}", probe.join("lower").display())].iter().all(|o| owned[0].super_options.contains(o))
+                || ![format!("upperdir={}", probe.join("upperfs/upper").display()), format!("workdir={}", probe.join("upperfs/work").display()),
+                    format!("lowerdir={}", probe.join("upperfs/lower").display())].iter().all(|o| owned[0].super_options.contains(o))
             { return Err("unexpected_overlay_probe_mount"); }
             self.unmount(&target)?;
         }
+        if storage::mounted(&probe.join("upperfs"))? {
+            self.upper_helper("thaw", probe)?;
+            self.upper_helper("discard", probe)?;
+            self.unmount(&probe.join("upperfs"))?;
+        }
+        if probe.exists() { self.upper_helper("detach", probe)?; }
         storage::remove_private(probe)
     }
     // Unmount in a tracked deadline-bound helper with errno-specific busy retry, then prove nothing
@@ -477,11 +492,12 @@ impl Native {
         self.template_usable(&m)?;
         Ok((m, digest))
     }
-    // Require the template's network policy to be operator-approved and its process limit to match this
-    // worker's configuration.
+    // Require operator-approved networking, the configured process limit and a writable image within
+    // the worker's per-artifact size bound.
     fn template_usable(&self, m: &Manifest) -> Result<()> {
         self.network_policy(&m.network)?;
         if m.pids_max != self.config.pids_max { return Err("incompatible_pids_limit"); }
+        if m.writable_mib << 20 > self.config.max_artifact_bytes { return Err("incompatible_writable_limit"); }
         Ok(())
     }
     // Return CRIU's remembered answer for a CPU description (by cpuinfo.img digest), if it gave one.
@@ -577,20 +593,6 @@ impl Native {
         if changed { let _ = self.save_verified(); }
         Ok(())
     }
-    // Remember a layer this worker just hashed and published, with the identity of its published image,
-    // so restores never rehash it; save the state file. A known digest with a different size is
-    // rejected.
-    pub fn mark_verified(&self, layer: &Artifact) -> Result<()> {
-        let file = storage::artifact_identity(&self.layer_image(&layer.sha256), self.config.max_artifact_bytes)?;
-        if file.size != layer.bytes { return Err("artifact_digest_mismatch"); }
-        {
-            let mut verified = self.verified.lock().unwrap_or_else(PoisonError::into_inner);
-            if verified.get(&layer.sha256).is_some_and(|known| known.bytes != layer.bytes) { return Err("artifact_digest_mismatch"); }
-            verified.insert(layer.sha256.clone(), VerifiedLayer { sha256: layer.sha256.clone(), bytes: layer.bytes, file });
-        }
-        let _ = self.save_verified();
-        Ok(())
-    }
     // Atomically replace the state file with the current verified-layer set (root-owned, 0600). Writers
     // take turns; each writes the newest set, and the set's lock is not held during the write.
     fn save_verified(&self) -> Result<()> {
@@ -598,7 +600,7 @@ impl Native {
         let layers = self.verified.lock().unwrap_or_else(PoisonError::into_inner).values().cloned().collect();
         process::atomic_json(&self.root().join(VERIFIED_STATE), &VerifiedState { schema_version: VERIFIED_STATE_SCHEMA, layers })
     }
-    // Mount one immutable EROFS layer (a template base or a sealed capture layer) if needed. The create
+    // Mount one immutable EROFS base if needed. The create
     // job verified it first (see verify_layers); an untrusted layer is refused, never hashed here. Check
     // the mount flags and backing image on every use, including reuse of an existing mount, and
     // remember the layer as mounted. Use the startup-selected source type; never fallback per image.
@@ -680,8 +682,31 @@ impl Native {
         let mounted = self.mounted_lowers.lock().unwrap_or_else(PoisonError::into_inner);
         layers.iter().all(|layer| mounted.contains(&layer.sha256))
     }
-    // Return shared read-only CRIU images keyed by manifest digest. The first restore verifies and
-    // unpacks the archive, syncs its files, then publishes it atomically; failures remove staging.
+    // Like containerd blockfile's scratch image, format each cold capacity once, then copy it.
+    // Publish only a synced image; failed formatting leaves no reusable image and restart removes staging.
+    pub(crate) fn scratch_image(&self, mib: u64) -> Result<PathBuf> {
+        let _turn = KeyTurn::take(&self.unpacking, &self.unpacked, &format!("scratch-{mib}"));
+        let directory = self.root().join("scratch");
+        let ready = directory.join(format!("{mib}.ext4"));
+        if ready.exists() {
+            if storage::artifact_identity(&ready, mib << 20)?.size != mib << 20 { return Err("invalid_scratch_image"); }
+            return Ok(ready);
+        }
+        let stage = directory.join(format!("{mib}.creating"));
+        storage::remove_private(&stage)?;
+        storage::exclusive_private_dir(&stage)?;
+        let result = (|| {
+            let image = stage.join("writable.ext4");
+            self.format_upper(&image, mib)?;
+            fs::rename(&image, &ready).map_err(|_| "scratch_publish_failed")?;
+            File::open(&directory).and_then(|f| f.sync_all()).map_err(|_| "scratch_sync_failed")?;
+            Ok(ready)
+        })();
+        let cleanup = self.helpers.ensure_healthy().and_then(|_| storage::remove_private(&stage));
+        match result { Ok(path) => cleanup.map(|_| path), Err(error) => { cleanup?; Err(error) } }
+    }
+    // Return shared read-only CRIU and ext4 images keyed by manifest digest. The first restore verifies
+    // the joint sparse archive, unpacks and syncs its files, then publishes atomically; failures remove staging.
     // Concurrent restores wait for this unpack; later restores reuse the durable directory.
     pub fn checkpoint_images(&self, manifest: &Manifest, key: &str) -> Result<PathBuf> {
         let archive = manifest.checkpoint.as_ref().ok_or("checkpoint_missing")?;
@@ -697,6 +722,9 @@ impl Native {
         let unpacked = (|| {
             storage::verify(&template.join("checkpoint.tar"), archive, self.config.max_artifact_bytes)?;
             storage::extract(self.tool("tar")?, &template.join("checkpoint.tar"), &staging, self.config.command_timeout_seconds, &self.search_path, &self.helpers)?;
+            let image = staging.join("writable.ext4");
+            if storage::artifact_identity(&image, manifest.writable_mib << 20)?.size != manifest.writable_mib << 20 { return Err("invalid_writable_image"); }
+            crate::upper::sync_image(&image)?;
             // tar does not sync what it writes. Every extracted file and directory is synced before the
             // rename makes the cache entry trusted; only those, not the whole host filesystem (whose
             // unrelated write-back could take seconds).
@@ -711,18 +739,19 @@ impl Native {
         File::open(&cache).and_then(|f| f.sync_all()).map_err(|_| "checkpoint_cache_sync_failed")?;
         Ok(ready)
     }
-    // Build a sandbox: private directories, an overlay root whose lowers are the template's verified
-    // sealed layers above its base, with a fresh empty upper, plus its resource group, network and
+    // Build a sandbox with a private ext4 upper/work image over the unchanged verified EROFS base,
+    // claiming a ready warm copy when available, otherwise copying the cache/scratch, plus its network and
     // execution specification. Then use conmon for cold start or shared-image restore and
     // confirm it runs, timing each step. Partial state is left for the caller's cleanup.
     pub fn prepare(&self, request: &SandboxSpec, manifest: &Manifest, images: Option<&Path>, network_slot: Option<usize>, expires_at: u64, cancelled: &std::sync::atomic::AtomicBool, phases: &mut Phases) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         let id = &request.sandbox_id;
         let private = self.private(id);
-        storage::private_dir(&private)?;
-        for name in ["upper", "work", "rootfs", "criu-work"] { storage::private_dir(&private.join(name))?; }
-        // The upper root is the merged root directory, for cold and warm sandboxes alike.
-        fs::set_permissions(private.join("upper"), fs::Permissions::from_mode(0o755)).map_err(|_| "upper_permissions_failed")?;
+        let pooled = if let Some(images) = images { self.take_upper(&private, images)? } else { false };
+        if !pooled {
+            storage::private_dir(&private)?;
+            self.prepare_upper(&private, manifest.writable_mib, images)?;
+        }
+        for name in ["rootfs", "criu-work"] { storage::private_dir(&private.join(name))?; }
         if images.is_some() != manifest.checkpoint.is_some() { return Err("checkpoint_images_missing"); }
         if manifest.checkpoint.is_some() && (manifest.memory_mib != Some(request.memory_mib) || manifest.vcpus != Some(request.vcpus)) { return Err("incompatible_checkpoint_resources"); }
         phases.mark("rootfs_dirs");
@@ -737,11 +766,8 @@ impl Native {
             }
             lowers.push(lower.display().to_string());
         }
-        // Topmost sealed layer first. Work/upper are ordinary private sibling directories. The upper
-        // is disposable (a crash or delete removes it; a capture seals it from the page cache), so a
-        // volatile overlay skips syncing it: otherwise unmounting it syncs the whole host filesystem
-        // that holds it, waiting behind unrelated write-back.
-        let options = crate::overlay::options(&lowers, &private.join("upper"), &private.join("work"), self.volatile_overlay)?;
+        // Ordinary overlays sync only this sandbox's ext4, never the unrelated host filesystem.
+        let options = crate::overlay::options(&lowers, &private.join("upperfs/upper"), &private.join("upperfs/work"), false)?;
         // A later mount failure never changes the probed mode or retries a possibly poisoned workdir.
         self.command("mount", vec!["--internal-only".into(), "-t".into(), "overlay".into(), "overlay".into(), "-o".into(),
             format!("nodev,nosuid,{options}"), private.join("rootfs").display().to_string()])?;
@@ -856,18 +882,6 @@ impl Native {
         }
         Ok(false)
     }
-    // While frozen, check overlay write-back errors and seal its upper from the page cache into EROFS,
-    // preserving whiteouts, opacity, owners, modes and attributes. On a volatile overlay sync writes
-    // nothing back; the sealed image itself is synced at publication. Time both steps.
-    pub fn seal_upper(&self, id: &str, image: &Path, phases: &mut Phases) -> Result<()> {
-        let rootfs = File::open(self.private(id).join("rootfs")).map_err(|_| "rootfs_unavailable")?;
-        if unsafe { libc::syncfs(rootfs.as_raw_fd()) } != 0 { return Err("upper_sync_failed"); }
-        phases.mark("upper_sync");
-        self.command("mkfs.erofs", vec!["--quiet".into(), image.display().to_string(), self.private(id).join("upper").display().to_string()])
-            .map_err(|_| "upper_seal_failed")?;
-        phases.mark("seal");
-        Ok(())
-    }
     // Checkpoint the paused source through runc and leave it running afterwards. Save process images,
     // established TCP connections, external Unix sockets and file locks, with the network locked during
     // the dump; skip connections not yet accepted, and allow uprobes mappings only when the caller found
@@ -944,12 +958,14 @@ impl Native {
     }
     // Tear down owned resources: kill the workload/execs, drain its monitor and save exit/OOM
     // evidence before deleting runc state or its group, then return its network slot
-    // to the pool and remove its guest network, unmount its root and delete private files, timing
-    // each step. Stop at the first failure so the caller can retry.
+    // to the pool, discard the disposable ext4 copy without journal flush, normally unmount overlay/ext4,
+    // detach its loop and delete files. Stop at the first failure, retaining ownership for retry.
     pub fn cleanup(&self, id: &str, network_slot: Option<usize>, phases: &mut Phases) -> Result<()> {
         self.helpers.ensure_healthy()?;
         // A durable record must exist before any of these resources are created.
         self.monitors.stop_startup(id)?;
+        // Restart can interrupt a frozen capture; thaw before waiting for killed tasks to exit.
+        if storage::mounted(&self.private(id).join("upperfs"))? { self.upper_helper("thaw", &self.private(id))?; }
         let cgroup = Path::new(&self.config.cgroup_parent).join(id);
         if cgroup.exists() {
             fs::write(cgroup.join("cgroup.kill"), "1").map_err(|_| "cgroup_kill_failed")?;
@@ -981,15 +997,20 @@ impl Native {
         phases.mark("network_release");
         let private = self.private(id);
         let rootfs = private.join("rootfs");
+        // Shut down before overlay unmount can ask its upper to write dirty data back.
+        if storage::mounted(&private.join("upperfs"))? { self.upper_helper("discard", &private)?; }
         if storage::mounted(&rootfs)? { self.unmount(&rootfs)?; }
         phases.mark("rootfs_umount");
+        if storage::mounted(&private.join("upperfs"))? { self.unmount(&private.join("upperfs"))?; }
+        if private.exists() { self.upper_helper("detach", &private)?; }
+        phases.mark("upper_release");
         storage::remove_private(&private)?;
         phases.mark("private_remove");
         Ok(())
     }
     // Remove empty monitor ownership, then drain and remove host-command resource groups.
     pub fn remove_helpers(&self) -> Result<()> { self.monitors.remove().and_then(|_| self.helpers.remove()) }
-    // Unmount known shared layer mounts (bases and sealed capture layers) after helper cleanup is
+    // Unmount known shared base mounts after helper cleanup is
     // healthy, verifying each mount before removal.
     pub fn unmount_lowers(&self) -> Result<()> {
         self.helpers.ensure_healthy()?;
@@ -1006,7 +1027,7 @@ impl Native {
     }
 }
 
-// One job's exclusive turn on a key: a checkpoint cache key (restores unpacking it), a layer digest
+// One job's exclusive turn on a key: a checkpoint/scratch cache key, a layer digest
 // (creates hashing it) or the verified-state write. Waiting releases the set's lock, so no lock is
 // held while the holder works; dropping the turn wakes the waiters.
 struct KeyTurn<'a> { keys: &'a Mutex<BTreeSet<String>>, changed: &'a Condvar, key: String }

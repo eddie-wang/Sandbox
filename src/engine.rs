@@ -88,8 +88,7 @@ struct Job { record: Record, action: Action, cancelled: Arc<AtomicBool>, phases:
 // or capture), whether it is the delete cleanup (which has no reply of its own; waiting DELETEs are
 // answered when it completes), the template name a capture reserves, its cancel flag and its reply.
 struct Flight { slot: usize, restore: bool, delete: bool, template: Option<String>, cancelled: Arc<AtomicBool>, reply: Option<Reply> }
-// Mount these shared layers, already verified by the create job: a template's sealed layers and its
-// base.
+// Mount the shared immutable base, already verified by the create job.
 struct Lower { layers: Vec<storage::Artifact>, done: mpsc::Sender<Result<()>> }
 // Concurrent DELETE requests waiting for one sandbox's cleanup (and kill requests waiting for one
 // command's end); more are refused as busy.
@@ -109,7 +108,7 @@ fn answer(reply: Option<Reply>, result: Result<Outcome>) { if let Some(reply) = 
 
 impl Handle {
     // Fail closed if disabled or preflight fails; otherwise reconcile and start admission, operation,
-    // lower-mount, CPU-check and expiry/monitor watchers. Work survives HTTP disconnects. Shutdown waits for
+    // lower-mount, CPU-check, idle-upper refill and expiry/monitor watchers. Shutdown waits for
     // jobs, commands and per-sandbox cleanup, then removes shared mounts and the slot pool. Startup
     // records active EROFS/overlay checks separately from read-only CLI prerequisites.
     pub fn start(config: &WorkerConfig, mut report: Preflight) -> Result<Self> {
@@ -181,6 +180,7 @@ impl Handle {
         }
         drop(lower_tx);
         engine.publish();
+        native.start_upper_pool()?;
         let watchdog_stop = Arc::new(AtomicBool::new(false));
         let stop = watchdog_stop.clone();
         let view = snapshot.clone();
@@ -229,8 +229,8 @@ impl Handle {
                 if engine.stopping.is_some() && engine.flights.is_empty() && engine.execs.is_empty() && engine.cpu_waiters.is_empty()
                     && engine.records.iter().all(|(id, r)| !r.reserved() || engine.stop_attempted.contains(id)) {
                     let cleanup = if !engine.records.values().any(Record::reserved) {
-                        engine.native.unmount_lowers().and_then(|_| engine.native.remove_slot_pool()).and_then(|_| engine.native.remove_helpers())
-                    } else { Err("private_cleanup_failed") };
+                        engine.native.stop_upper_pool().and_then(|_| engine.native.unmount_lowers()).and_then(|_| engine.native.remove_slot_pool()).and_then(|_| engine.native.remove_helpers())
+                    } else { let _ = engine.native.stop_upper_pool(); Err("private_cleanup_failed") };
                     let durable = process::atomic_json(&engine.native.root().join("worker-status.json"), &serde_json::json!({"cleanup_error":cleanup.err()}));
                     let _ = engine.stopping.take().unwrap().send(cleanup.and(durable));
                     break;
@@ -693,7 +693,7 @@ impl Runner<'_> {
         if let Err(e) = result { self.record.error = Some(e.into()); }
     }
     // Save ownership, recheck the manifest/CPU, verify untrusted layers, obtain shared lower mounts
-    // and cached checkpoint images, then start or restore, timing each step. Already-mounted layers
+    // and cached checkpoint images, request ready-copy refill, then start or restore. Already-mounted layers
     // skip the lower queue but are still checked in prepare. Time the failed step separately before
     // cleanup, retaining its error and final state.
     fn create(&mut self) -> Result<Outcome> {
@@ -719,7 +719,7 @@ impl Runner<'_> {
             self.phases.mark("lower_mount");
             self.active()?;
             let images = if manifest.checkpoint.is_some() { Some(self.native.checkpoint_images(&manifest, &digest)?) } else { None };
-            if images.is_some() { self.phases.mark("checkpoint_cache"); }
+            if images.is_some() { self.phases.mark("checkpoint_cache"); self.native.request_uppers(&manifest, &digest); }
             self.active()?;
             self.native.prepare(&self.record.request, &manifest, images.as_deref(), self.record.network_slot, self.record.expires_at, &self.cancelled, &mut self.phases)
         })();
@@ -733,8 +733,8 @@ impl Runner<'_> {
             }
         }
     }
-    // Capture in AgentENV order: save CPU info, freeze, seal files, checkpoint leaving it running,
-    // thaw, archive and publish matching state. Time failed steps and recovery apart from cleanup.
+    // Capture in AgentENV order: pause, freeze/copy/thaw ext4, checkpoint leaving it running,
+    // resume, then sparse-archive/hash the immutable copy with process images and request idle copies.
     // Even an interrupted dump keeps a running source; frozen, dead or cancelled sources are deleted.
     // Success means a published template and running source.
     fn capture(&mut self, request: CaptureRequest, generation: String) -> Result<Outcome> {
@@ -750,47 +750,42 @@ impl Runner<'_> {
             self.active()?;
             if destination.exists() { return Err("template_already_exists"); }
             let (mut manifest, _) = self.native.template_manifest(&self.record.request.template_id)?;
-            if manifest.layers.len() >= storage::MAX_LAYERS { return Err("template_layer_limit"); }
             storage::exclusive_private_dir(&stage)?;
             stage_owned = true;
             // Saved before the freeze so it does not lengthen the frozen window.
             let cpuinfo = self.native.save_cpuinfo(&stage)?;
             let images = stage.join("images"); storage::private_dir(&images)?;
-            let sealed = stage.join("layer.erofs");
+            let writable_image = images.join("writable.ext4");
             self.phases.mark("cpuinfo");
-            // Frozen window: the sealed files and the process images describe one instant.
+            // Frozen window: the cloned filesystem and process images describe one instant.
             paused = true;
             self.native.pause(&id)?;
             self.phases.mark("freeze");
             let uprobes = self.native.uprobes_present(&id)?;
-            self.native.seal_upper(&id, &sealed, &mut self.phases)?;
+            self.native.capture_upper(&id, &writable_image, &mut self.phases)?;
             self.native.checkpoint(&id, &images, uprobes)?;
             self.phases.mark("checkpoint");
             self.native.resume(&id)?;
             paused = false;
             self.phases.mark("thaw");
-            let layer = storage::artifact(&sealed, max)?;
-            self.phases.mark("layer_hash");
             storage::archive(self.native.tool("tar")?, &images, &stage.join("checkpoint.tar"), self.native.config.command_timeout_seconds, &self.native.search_path, &self.native.helpers)?;
             self.phases.mark("archive");
             manifest.template_id = request.template_id.clone(); manifest.generation = generation.clone();
-            manifest.layers.insert(0, layer.clone());
             manifest.checkpoint = Some(storage::artifact(&stage.join("checkpoint.tar"), max)?);
             manifest.cpuinfo = cpuinfo;
             manifest.memory_mib = Some(self.record.request.memory_mib); manifest.vcpus = Some(self.record.request.vcpus);
             manifest.oci_config_sha256 = Some(self.native.spec_digest(&id)?);
             storage::write_manifest(&stage, &manifest)?;
+            let cache_key = storage::artifact(&stage.join("manifest.json"), 65536)?.sha256;
             storage::remove_private(&images)?;
             self.phases.mark("manifest");
             self.active()?;
-            // Content-addressed and hashed just above: restores never rehash it on this node.
-            storage::publish_layer(&sealed, &self.native.root().join("layers"), &layer, max)?;
-            self.native.mark_verified(&layer)?;
             fs::File::open(&stage).and_then(|f| f.sync_all()).map_err(|_| "template_sync_failed")?;
             fs::rename(&stage, &destination).map_err(|_| "template_publish_failed")?;
             stage_owned = false;
             fs::File::open(destination.parent().ok_or("invalid_template_path")?).and_then(|f| f.sync_all()).map_err(|_| "template_sync_failed")?;
             self.phases.mark("publish");
+            self.native.request_uppers(&manifest, &cache_key);
             Ok(())
         })();
         if result.is_err() { self.phases.mark("failed_step"); }
@@ -798,8 +793,9 @@ impl Runner<'_> {
         // resume error is not final: runc state decides (a paused source is not running).
         // As in AgentENV, an interrupted dump is handled the same way; its own error code
         // tells the caller, who may delete a source that a killed dump could have degraded.
-        if paused { let _ = self.native.resume(&id); }
-        let recovery = self.active().and_then(|_| self.native.ensure_running(&id));
+        let filesystem_recovery = if paused { self.native.upper_helper("thaw", &self.native.private(&id)) } else { Ok(()) };
+        if paused && filesystem_recovery.is_ok() { let _ = self.native.resume(&id); }
+        let recovery = filesystem_recovery.and_then(|_| self.active()).and_then(|_| self.native.ensure_running(&id));
         self.phases.mark("recovery");
         if recovery.is_ok() { self.record.state = "running".into(); } else { self.delete(); }
         let cleanup = if stage_owned { self.native.helpers.ensure_healthy().and_then(|_| storage::remove_private(&stage)) } else { Ok(()) };

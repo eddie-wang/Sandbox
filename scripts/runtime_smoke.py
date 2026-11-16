@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import tarfile
 import time
 
 import socket
@@ -53,12 +54,12 @@ def publish_layer(root, image):
     return dict(sha256=digest.hexdigest(), bytes=target.stat().st_size)
 
 
-# Returns a cold (no checkpoint, no sealed layers) schema-3 template manifest the
+# Returns a cold (no checkpoint, no sealed layers) schema-5 template manifest the
 # worker accepts: fixed UID/GID 65534, the given base layer, init argv, network
 # policy and defaults.
 def cold_manifest(template_id, compatibility, base, init_argv, network, memory_mib, vcpus, pids_max):
-    return dict(schema_version=3, template_id=template_id, generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
-                base=base, layers=[], checkpoint=None, init_argv=init_argv, memory_mib=memory_mib, vcpus=vcpus, pids_max=pids_max,
+    return dict(schema_version=5, template_id=template_id, generation="cold-v1", runtime="runc_criu", compatibility=compatibility,
+                base=base, layers=[], writable_mib=1024, checkpoint=None, init_argv=init_argv, memory_mib=memory_mib, vcpus=vcpus, pids_max=pids_max,
                 oci_config_sha256=None, network=network, uid=65534, gid=65534)
 
 
@@ -187,10 +188,10 @@ def loop_backings():
 
 
 # Check every shared lower's source against the selected mode and record loop backing counts. A
-# file-backed worker must use no loop for any image in its root, including the startup probe.
+# file-backed worker must use no loop for EROFS; private ext4 uppers always use direct-I/O loops.
 def erofs_observation(root, status):
     loops = loop_backings()
-    owned = {name: image for name, image in loops.items() if image.lstrip("/").startswith(str(root).lstrip("/") + "/")}
+    owned = {name: image for name, image in loops.items() if image.lstrip("/").startswith(str(root).lstrip("/") + "/") and image.endswith(".erofs")}
     sources = []
     for line in Path("/proc/self/mountinfo").read_text().splitlines():
         fields = line.split()
@@ -209,6 +210,21 @@ def erofs_observation(root, status):
     else:
         assert status["loop_devices"] is not None, status
     return dict(status=status, loop_backings_total=len(loops), owned_loop_backings=owned, lower_sources=sources)
+
+
+# Check a live upper's private node, backing path and direct-I/O setting; report sparse disk cost.
+def upper_observation(root, sandbox):
+    private = root / "private" / sandbox
+    image = private / "writable.ext4"
+    loops = [name for name, backing in loop_backings().items() if "/" + backing.lstrip("/") == str(image)]
+    assert len(loops) == 1, loops
+    name = loops[0]
+    node = (private / "loop").stat()
+    assert stat.S_ISBLK(node.st_mode) and node.st_uid == 0 and stat.S_IMODE(node.st_mode) == 0o600
+    assert os.major(node.st_rdev) == 7 and os.minor(node.st_rdev) == int(name.removeprefix("loop"))
+    assert (Path("/sys/block") / name / "loop/dio").read_text().strip() == "1"
+    info = image.stat()
+    return dict(loop=name, direct_io=True, logical_bytes=info.st_size, allocated_bytes=info.st_blocks * 512)
 
 
 # Check mountinfo decoding with escaped and non-UTF-8 paths and optional propagation fields.
@@ -236,7 +252,7 @@ def mount_inventory_gate(binary, root, worker_config):
     print("PASS mountinfo octal/non-UTF-8 paths, propagation fields and mounted-descendant refusal")
 
 
-# Run real lifecycle, rejection, bounds and restart gates with at most three live containers.
+# Run real lifecycle, sparse-archive integrity, ready-copy ownership and restart gates (at most three containers).
 # Check mounts/storage, OCI limits, syscall policy on cold/restored copies, conmon and CNI ownership.
 # --network adds policy networking and the app proxy with a small-call latency bound.
 # Retain the root and observations; require no owned state to remain.
@@ -293,6 +309,7 @@ vcpus = 1
 max_sandboxes = 3
 max_concurrent_restores = 2
 [native]
+upper_pool_size = 2
 enabled = true
 root = {json.dumps(str(root))}
 cgroup_parent = {json.dumps(str(cgroup))}
@@ -302,7 +319,7 @@ pids_max = 64
 max_records = 96
 max_concurrent_operations = 4
 max_execs_per_sandbox = 3
-max_artifact_bytes = 67108864
+max_artifact_bytes = 1073741824
 command_timeout_seconds = 30
 ''')
     if args.network:
@@ -355,7 +372,7 @@ url = "http://127.0.0.1:{worker_port}"
     for name in ("copied", "removed"):
         (rootfs / "workspace" / name).write_text("immutable-base")
         (rootfs / "workspace" / name).chmod(0o666)
-    # Copy-up and the sealed capture layer must keep this extended attribute.
+    # Copy-up and upper-image cloning must keep this extended attribute.
     os.setxattr(rootfs / "workspace" / "copied", "user.sandbox-test", b"base-xattr")
     (rootfs / "seed").write_bytes(b"seed\n" + bytes(4091))
     subprocess.run(["cc", "-static", "-O2", "-Wall", "-Wextra", "-Werror", str(Path(__file__).with_name("fixture.c")), "-o", str(rootfs / "fixture")], check=True, timeout=60)
@@ -443,10 +460,13 @@ url = "http://127.0.0.1:{worker_port}"
     def get(sandbox):
         return expect(request(controller_port, f"/v1/sandboxes/{sandbox}", token, timeout=4), 200)
 
-    # Require no private directory, workload/monitor group or runc state; retained exit files are OK.
+    # Require no private directory, image, loop, mount, workload/monitor group or runc state.
     def gone(sandbox):
         assert not (root / "private" / sandbox).exists() and not (cgroup / sandbox).exists() and not (root / "runc" / sandbox).exists()
         assert not (monitors / sandbox).exists()
+        image = str(root / "private" / sandbox / "writable.ext4")
+        eventually(lambda: not any(("/" + p.lstrip("/")).startswith(image) for p in loop_backings().values()), timeout=5)
+        assert not any(line.split()[4].startswith(str(root / "private" / sandbox) + "/") for line in Path("/proc/self/mountinfo").read_text().splitlines())
 
     # Check that conmon owns init in a durable group, never a host-helper leaf, with null init stdio.
     def monitor_identity(sandbox):
@@ -664,7 +684,9 @@ url = "http://127.0.0.1:{worker_port}"
                 slot_reset(f"{owned_prefix}s-{i}")
             pool_identities = slot_identities()
         # Omitted resources come from the cold template defaults (64 MiB, 1 vCPU).
-        source = create()
+        # This source spans the complete lifecycle suite, including deliberate 30-second failures.
+        # TTL behavior is checked separately with the short-lived expiring sandbox.
+        source = create(ttl=600)
         observations["conmon_cold_pid"] = monitor_identity(source)
         assert (cgroup / source / "memory.max").read_text().strip() == "67108864"
         assert (cgroup / source / "memory.oom.group").read_text().strip() == "1"
@@ -1359,7 +1381,7 @@ url = "http://127.0.0.1:{worker_port}"
         # The source keeps running during capture except while frozen (pause to resume).
         stop_watch = threading.Event()
         watchers = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        watcher = watchers.submit(watch_counter, root / "private" / source / "upper" / "workspace" / "counter", stop_watch)
+        watcher = watchers.submit(watch_counter, root / "private" / source / "upperfs" / "upper" / "workspace" / "counter", stop_watch)
         freezer = watchers.submit(watch_frozen, cgroup / source / "cgroup.events", stop_watch)
         capture_started = time.monotonic()
         # Freeze only the owned helper subtree to make concurrent staging observable.
@@ -1385,11 +1407,27 @@ url = "http://127.0.0.1:{worker_port}"
         assert source_nonce == nonce and current >= before
         # The source's loopback connection kept working across its own checkpoint.
         assert loopback(source) > source_trips
-        # The capture sealed the upper into a content-addressed EROFS layer; no upper archive.
+        # The capture preserved the ext4 block image over the unchanged EROFS base.
         warm_manifest = json.loads((root / "templates" / "warm" / "manifest.json").read_text())
-        layer = warm_manifest["layers"][0]["sha256"]
-        assert warm_manifest["schema_version"] == 3 and len(warm_manifest["layers"]) == 1 and (root / "layers" / f"{layer}.erofs").is_file()
-        assert sorted(p.name for p in (root / "templates" / "warm").iterdir()) == ["checkpoint.tar", "cpuinfo.img", "manifest.json", "manifest.sha256"]
+        assert warm_manifest["schema_version"] == 5 and warm_manifest["layers"] == []
+        archive = root / "templates" / "warm" / "checkpoint.tar"
+        with tarfile.open(archive) as packed:
+            upper = packed.getmember("./writable.ext4")
+            assert upper.size == warm_manifest["writable_mib"] << 20 and upper.sparse
+        assert archive.stat().st_size < upper.size // 4, "sparse holes must not enter the hashed archive"
+        assert sorted(p.name for p in archive.parent.iterdir()) == ["checkpoint.tar", "cpuinfo.img", "manifest.json", "manifest.sha256"]
+        # A tampered joint archive must fail before unpack, with no reusable cache or live resources.
+        damaged = write_template(root, dict(warm_manifest, template_id="damaged-archive"))
+        shutil.copyfile(archive, damaged / "checkpoint.tar")
+        shutil.copyfile(archive.parent / "cpuinfo.img", damaged / "cpuinfo.img")
+        with (damaged / "checkpoint.tar").open("r+b") as broken:
+            broken.seek(-1, os.SEEK_END)
+            broken.write(b"x")
+        rejected = expect(create_call(dict(template_id="damaged-archive", ttl_seconds=60)), 500, "artifact_digest_mismatch")
+        gone(rejected["sandbox_id"])
+        key = (damaged / "manifest.sha256").read_text().strip()
+        assert not (root / "checkpoints" / key).exists() and not (root / "checkpoints" / (key + ".unpacking")).exists()
+        observations["sparse_archive"] = dict(logical_bytes=upper.size, archive_bytes=archive.stat().st_size, corruption_rejected=True)
         # CRIU's own CPU check (not an exact feature match) decides warm compatibility. A copy of the
         # template whose saved CPU description CRIU rejects here is refused before launch, so a
         # controller would try another node; no ID, record or runtime state is created.
@@ -1420,9 +1458,8 @@ url = "http://127.0.0.1:{worker_port}"
         assert execute(child, "read", "copied") == "source-private"
         missing = expect(exec_call(child, ["/fixture", "read", "removed"], timeout_ms=2000, max_output_bytes=1024), 200)
         assert missing["exit_code"] != 0 and not missing["interrupted"] and missing["sandbox_state"] == "running"
-        # Sealed layer, as mounted read-only on the host: a whiteout for the deleted base file and the
-        # modified base file with its ownership, mode and extended attribute.
-        sealed = root / "lowers" / layer / "workspace"
+        # A cloned upper retains whiteouts, hardlinks, owners, modes and extended attributes.
+        sealed = root / "private" / child / "upperfs/upper/workspace"
         whiteout = sealed.joinpath("removed").lstat()
         assert stat.S_ISCHR(whiteout.st_mode) and whiteout.st_rdev == 0
         modified = sealed.joinpath("copied").lstat()
@@ -1432,18 +1469,30 @@ url = "http://127.0.0.1:{worker_port}"
         assert execute(child, "read", "hardlink") == "source-private"
         child_files = root / "private" / child / "rootfs/workspace"
         assert (child_files / "copied").stat().st_ino == (child_files / "hardlink").stat().st_ino
-        observations["hardlink_preserved_in_sealed_layer"] = True
+        observations["hardlink_preserved_in_ext4_copy"] = True
         assert os.getxattr(root / "private" / child / "rootfs" / "workspace" / "copied", "user.sandbox-test") == b"base-xattr"
-        assert not (root / "private" / child / "upper" / "workspace" / "copied").exists(), "child upper must start empty"
-        observations["sealed_layer"] = {"sha256": layer, "whiteout": True, "modified_owner_mode_xattr": True}
+        source_files = root / "private" / source / "rootfs/workspace"
+        for name in ("copied", "hardlink", "counter", "loopback"):
+            assert (source_files / name).stat().st_ino == (child_files / name).stat().st_ino, name
+        observations["ext4_copy"] = {"archive": warm_manifest["checkpoint"], "whiteout": True, "modified_owner_mode_xattr": True, "upper_inodes_preserved": True}
         warm_cache, warm_cache_state = checkpoint_cache(root, "warm")
         assert not any(p.name.endswith(".unpacking") for p in (root / "checkpoints").iterdir())
         execute(child, "write", "copied", "child-private")
         assert execute(source, "read", "copied") == "source-private"
-        # index=off intentionally permits lower hardlink identity to split on copy-up.
-        assert execute(child, "read", "hardlink") == "source-private"
-        assert (child_files / "copied").stat().st_ino != (child_files / "hardlink").stat().st_ino
-        observations["index_off_copy_up_splits_lower_hardlink"] = True
+        assert execute(child, "read", "hardlink") == "child-private"
+        assert (child_files / "copied").stat().st_ino == (child_files / "hardlink").stat().st_ino
+        second_copy = create("warm")
+        assert execute(second_copy, "read", "copied") == "source-private"
+        second_files = root / "private" / second_copy / "rootfs/workspace"
+        for name in ("copied", "hardlink", "counter", "loopback"):
+            assert (source_files / name).stat().st_ino == (second_files / name).stat().st_ino
+        execute(second_copy, "write", "hardlink", "second-private")
+        assert execute(second_copy, "read", "copied") == "second-private"
+        assert execute(child, "read", "hardlink") == "child-private" and execute(source, "read", "hardlink") == "source-private"
+        observations["upper_storage"] = {branch: upper_observation(root, sandbox) for branch, sandbox in (("source", source), ("first", child), ("second", second_copy))}
+        assert len({v["loop"] for v in observations["upper_storage"].values()}) == 3
+        remove(second_copy)
+        observations["independent_copies_preserve_hardlinks_and_inodes"] = True
         observations["restored_namespace_identities"] = {}
         for namespace in ("pid", "mnt", "net", "ipc", "uts", "cgroup"):
             identities = [os.readlink(f"/proc/{pid}/ns/{namespace}") for pid in (host_pid(source), host_pid(child), os.getpid())]
@@ -1460,13 +1509,12 @@ url = "http://127.0.0.1:{worker_port}"
             observations["source_listening_socket_and_fresh_egress"] = network_gate(source)
         # CRIU only read the shared images while restoring the child.
         assert checkpoint_cache(root, "warm")[1] == warm_cache_state
-        print("PASS capture without stopping the source (stopped only while frozen and dumped), sealed EROFS layer with whiteout/xattr, "
+        print("PASS capture without stopping the source (stopped only while frozen and dumped), cloned ext4 with whiteout/xattr, "
               "warm restore with established loopback TCP, independent child; an interrupted dump keeps a running source, a dead source is deleted")
-        # Chained capture: capturing the warm child seals its own changes as a second layer above the
-        # source's; a grandchild restores from that two-layer template.
+        # A chained capture clones the child filesystem without changing its immutable base.
         captured(child, "chained")
         chained_manifest = json.loads((root / "templates" / "chained" / "manifest.json").read_text())
-        assert len(chained_manifest["layers"]) == 2 and chained_manifest["layers"][1]["sha256"] == layer, chained_manifest["layers"]
+        assert chained_manifest["layers"] == [] and chained_manifest["checkpoint"] != warm_manifest["checkpoint"]
         assert chained_manifest["base"] == warm_manifest["base"]
         assert get(child)["state"] == "running" and execute(child, "read", "copied") == "child-private"
         grandchild = create("chained")
@@ -1482,8 +1530,8 @@ url = "http://127.0.0.1:{worker_port}"
         execute(grandchild, "write", "copied", "grandchild-private")
         assert execute(child, "read", "copied") == "child-private"
         remove(grandchild)
-        observations["chained_capture"] = dict(layers=[l["sha256"] for l in chained_manifest["layers"]], grandchild_roundtrips=grandchild_trips)
-        print("PASS chained capture of a warm child and restore from the two-layer template (counter, files, whiteout, loopback TCP)")
+        observations["chained_capture"] = dict(checkpoint=chained_manifest["checkpoint"], grandchild_roundtrips=grandchild_trips)
+        print("PASS chained capture of a warm child and restore from the cloned-block template (counter, files, whiteout, loopback TCP)")
         if args.network:
             child_slot = slot_of(child)
             assert tracked_connections(child_slot) > 0
@@ -1532,7 +1580,7 @@ url = "http://127.0.0.1:{worker_port}"
         state_info = state_file.lstat()
         assert stat.S_ISREG(state_info.st_mode) and state_info.st_uid == 0 and stat.S_IMODE(state_info.st_mode) == 0o600
         saved = {entry["sha256"]: entry for entry in json.loads(state_file.read_text())["layers"]}
-        for descriptor in (probe_bases["probe"], probe_bases["probe-small"], manifest["base"], warm_manifest["layers"][0]):
+        for descriptor in (probe_bases["probe"], probe_bases["probe-small"], manifest["base"]):
             image = root / "layers" / f"{descriptor['sha256']}.erofs"
             assert saved[descriptor["sha256"]]["bytes"] == descriptor["bytes"] and saved[descriptor["sha256"]]["file"] == file_identity(image), descriptor
         observations["layer_verification"] = dict(first_use_two_creates_read_bytes=first_use_read, probe_bytes=probe_bytes, saved_layers=len(saved))
@@ -1662,6 +1710,10 @@ url = "http://127.0.0.1:{worker_port}"
         # reused, not re-extracted.
         assert checkpoint_cache(root, "warm") == (warm_cache, warm_cache_state)
         observations["checkpoint_cache_reused_after_restart"] = str(warm_cache.name)
+        # Wait for both background copies before deliberately freezing the helper subtree.
+        pool = root / "private/upper-pool"
+        eventually(lambda: len(list(pool.glob("*/upperfs/upper"))) == 2 and not any(helpers.glob("command-*")), timeout=30)
+        observations["ready_upper_pool"] = {p.name: upper_observation(root, "upper-pool/" + p.name) for p in pool.iterdir()}
         # Crash during a host checkpoint command, not just workload exec.
         (helpers / "cgroup.freeze").write_text("1")
         capture_thread, _ = in_background(lambda: capture(retained, "interrupted-warm"))
@@ -1688,6 +1740,7 @@ url = "http://127.0.0.1:{worker_port}"
         assert get(retained)["state"] == "deleted"
         gone(retained)
         assert not stage.exists() and not (root / "templates" / "interrupted-warm").exists()
+        assert not list((root / "private/upper-pool").iterdir()), "restart must discard idle and interrupted pool entries"
         assert not any(helpers.glob("command-*"))
         observations["restart_host_helper"]["drained_before_ready"] = True
         if args.network:

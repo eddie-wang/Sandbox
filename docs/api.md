@@ -287,10 +287,10 @@ capture reports that error and the template ID stays unusable (capture returns
 `directory_create_failed`) until the worker restarts and reconciles staging.
 
 Capture **does not stop the source** (AgentENV pattern): the worker freezes it with
-`runc pause`, seals its upper directory into a content-addressed EROFS layer, takes a
+`runc pause`, freezes/copies/thaws its private ext4 image, takes a
 CRIU checkpoint with `--leave-running` (established TCP, external Unix sockets and
-file locks included) and thaws it, then archives the images and publishes the
-manifest. The source is unavailable only from the pause to the resume (the real-image
+file locks included) and thaws it, then sparsely archives the immutable upper copy
+and process images together, hashes that archive and publishes the manifest. The source is unavailable only from the pause to the resume (the real-image
 gate reports the cgroup-freezer time and the longest gap a client saw, which is
 somewhat longer because CRIU briefly thaws the cgroup while the tasks stay stopped;
 both grow with the upper's size and the process memory); clients connecting
@@ -300,10 +300,8 @@ A `runc checkpoint` stopped at its command deadline or 64 KiB output limit is
 handled the same way but answers `500 checkpoint_interrupted`, so callers can tell:
 a dump killed midway may leave CRIU's network lock, repaired sockets or parasite code
 in a source that still runs, and a caller may delete it. A source that stays frozen,
-is not running after the thaw, or was cancelled/expired is deleted. A source
-template that already has 16
-sealed layers is refused before the pause (`409 template_layer_limit`; the source
-keeps running). Failure publishes no template.
+is not running after the thaw, or was cancelled/expired is deleted. Chained captures
+copy the writable image over the same base, without adding layers. Failure publishes no template.
 Established connections, including outbound ones, do not block capture. Loopback
 connections continue in children; a child's copy of a connection to an external
 peer fails on first use because the peer and the source slot's conntrack/NAT state
@@ -314,7 +312,7 @@ user-facing pause, fork or S3 operation.
 ### Networking
 
 Create has no caller-authored network field: callers select an immutable template.
-Manifest v3 specifies either `{"mode":"isolated"}` (loopback only, no external links) or:
+Manifest v5 specifies either `{"mode":"isolated"}` (loopback only, no external links) or:
 
 ```json
 {"mode":"tcp_allowlist","egress":[{"ip":"198.51.100.20","port":8443}],"service_ports":[8080]}
@@ -431,7 +429,7 @@ and selects loop mounts for fallback validation. Loop exhaustion returns static
 `erofs_loop_devices_exhausted` (500, not a pre-launch failover refusal).
 
 `/v1/preflight` also records `active_overlay_backing_features` in its checks and
-`overlay_volatile` (a boolean after the active startup probe, null in read-only CLI
+`overlay_volatile` (false for ext4-backed ordinary overlays, null in read-only CLI
 preflight). It reports no active success for a disabled backend.
 
 Runtime `ready:true` means explicit experimental enablement, read-only prerequisites,

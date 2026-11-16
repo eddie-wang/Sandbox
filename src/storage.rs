@@ -30,6 +30,8 @@ pub struct Manifest {
     pub compatibility: Compatibility,
     pub base: Artifact,
     pub layers: Vec<Artifact>,
+    #[serde(default = "crate::upper::default_mib")]
+    pub writable_mib: u64,
     pub checkpoint: Option<Artifact>,
     // A warm template's CPU description written by `criu cpuinfo dump` on the capturing host
     // (cpuinfo.img, x86-64 only); each worker checks it with `criu cpuinfo check` before restoring.
@@ -44,11 +46,9 @@ pub struct Manifest {
     pub gid: u32,
 }
 
-// Manifest format this worker reads and writes: sealed EROFS capture layers listed in `layers`.
-// Other versions (such as schema 2 with a per-create upper archive) are rejected, not migrated.
-pub const MANIFEST_SCHEMA: u32 = 3;
-// Sealed capture layers a template may stack above its base (chained captures add one each).
-pub const MAX_LAYERS: usize = 16;
+// Warm archives contain both sparse ext4 and process images under one verified digest.
+// Earlier raw-image and rebuilt-upper templates are rejected.
+pub const MANIFEST_SCHEMA: u32 = 5;
 // Whether warm templates carry CRIU's CPU description (cpuinfo.img). CRIU writes one for x86-64 only.
 pub const CPUINFO_SAVED: bool = cfg!(target_arch = "x86_64");
 
@@ -171,8 +171,8 @@ pub fn verify_identified(path: &Path, expected: &Artifact, max: u64) -> Result<F
 
 // Load a template manifest with bounded manifest-only checks (digest sidecar, strict fields, exact
 // host compatibility of architecture, kernel, runc, CRIU, init and layout), cheap enough for every
-// create. The CPU check of a warm template is done by the worker (Native::cpu_compatible). Artifact
-// contents are not read. Return the manifest and its digest, which keys the node's checkpoint cache.
+// create, rejecting old raw-image manifests. The worker checks warm CPU compatibility separately.
+// Return the manifest and its digest, which keys the node's verified checkpoint cache.
 pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Result<(Manifest, String)> {
     if !valid_id(id) { return Err("invalid_template_id"); }
     let dir = root.join("templates").join(id);
@@ -189,8 +189,8 @@ pub fn load_manifest(root: &Path, id: &str, compatibility: &Compatibility) -> Re
     if m.schema_version != MANIFEST_SCHEMA || m.template_id != id || !valid_id(&m.generation)
         || m.runtime != "runc_criu" || &m.compatibility != compatibility
         || !m.network.valid() || m.uid != 65534 || m.gid != 65534
-        // A warm template has its sealed upper layer(s) and checkpoint from one capture.
-        || warm == m.layers.is_empty() || m.layers.len() > MAX_LAYERS
+        // Warm archives pair block and process images; the immutable base never changes.
+        || !m.layers.is_empty() || !(64..=65536).contains(&m.writable_mib)
         // Warm templates require exact resources; cold ones may declare create defaults.
         || (warm && (m.memory_mib.is_none() || m.vcpus.is_none()))
         || m.memory_mib.is_some_and(|v| !(1..=1_048_576).contains(&v)) || m.vcpus.is_some_and(|v| !(1..=4_096).contains(&v))
@@ -211,25 +211,6 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
         .open(dir.join("manifest.sha256")).map_err(|_| "manifest_digest_write_failed")?;
     file.write_all(format!("{hash}\n").as_bytes()).and_then(|_| file.sync_all()).map_err(|_| "manifest_digest_write_failed")?;
     File::open(dir).and_then(|f| f.sync_all()).map_err(|_| "manifest_sync_failed")
-}
-
-// Move a freshly sealed layer into the content-addressed store as layers/<sha256>.erofs without ever
-// replacing a published file. If that digest is already published, check the existing file fully
-// and drop the new copy. Sync the file and the store directory.
-pub fn publish_layer(staged: &Path, layers: &Path, layer: &Artifact, max: u64) -> Result<()> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-    let target = layers.join(format!("{}.erofs", layer.sha256));
-    fs::set_permissions(staged, fs::Permissions::from_mode(0o600)).map_err(|_| "artifact_permissions_failed")?;
-    File::open(staged).and_then(|f| f.sync_all()).map_err(|_| "artifact_sync_failed")?;
-    let from = CString::new(staged.as_os_str().as_bytes()).map_err(|_| "invalid_layer_path")?;
-    let to = CString::new(target.as_os_str().as_bytes()).map_err(|_| "invalid_layer_path")?;
-    // A loop-mounted layer must never be replaced underneath its mount.
-    if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) } != 0 {
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) { return Err("layer_publish_failed"); }
-        verify(&target, layer, max)?;
-        fs::remove_file(staged).map_err(|_| "layer_publish_failed")?;
-    }
-    File::open(layers).and_then(|f| f.sync_all()).map_err(|_| "layer_sync_failed")
 }
 
 // Archive one filesystem tree with ownership, extended attributes, ACLs and sparse files preserved.

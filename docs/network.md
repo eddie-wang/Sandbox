@@ -54,7 +54,7 @@ ends and CNI veth ends are set explicitly; guest and CNI-host MTUs are checked
 before launch. The layout fingerprint includes this MTU. External routing and avoiding pool overlap with other workers/peers are
 operator responsibilities. The worker never repairs global routing/firewall/sysctls.
 
-Manifest v3 contains the policy. `isolated` creates no external links: the worker
+Manifest v5 contains the policy. `isolated` creates no external links: the worker
 still creates and owns the sandbox's guest netns (same ownership marker, names,
 cleanup and restart reconciliation as networked sandboxes), but brings up only
 loopback in it, adds no veth, address or route, attaches it to no router slot, and
@@ -228,6 +228,6 @@ See the [API](api.md#app-proxy) and the
 [disposable qualification recipe](runtime.md#disposable-network-qualification).
 
 Remaining work: per-create bounded policy selection, broader workload compatibility,
-hardened-host/network deployment qualification, cross-node restore, disk quotas,
+hardened-host/network deployment qualification, cross-node restore, shared-artifact disk quotas,
 S3 transport and agreed capacity/latency qualification. None is implied by this
 local implementation or its targeted fixture results.
